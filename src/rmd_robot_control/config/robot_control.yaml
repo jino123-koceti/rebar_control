@@ -9,7 +9,7 @@ unified_control_node:
     max_position: 1800.0    # 최대 위치 (도)
     min_position: -1800.0  # 최소 위치 (도)
     max_velocity: 100.0   # 최대 속도 (도/초)
-    position_tolerance: 1.0  # 위치 허용 오차 (도)
+    position_tolerance: 1.0  # 위치 허용 오차 (도) - 주행/조인트 목표 판정 정밀도 향상
     # CMD_VEL 모터 (0x141, 0x142)
     left_motor_id: 0x141
     right_motor_id: 0x142
@@ -37,6 +37,6 @@ position_control_node:
     max_position: 1800.0    # 최대 위치 (도)
     min_position: -1800.0  # 최소 위치 (도)
     max_velocity: 100.0   # 최대 속도 (도/초)
-    position_tolerance: 1.0  # 위치 허용 오차 (도)
+    position_tolerance: 1.0  # 위치 허용 오차 (도) - 주행/조인트 목표 판정 정밀도 향상
 
 

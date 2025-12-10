@@ -24,9 +24,11 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'teleop_node = rebar_control.teleop_node:main',
             'iron_md_teleop = rebar_control.iron_md_teleop_node:main',
             'safety_monitor = rebar_control.safety_monitor:main',
+            'precise_speed_logger = rebar_control.precise_speed_logger:main',
+            'precision_navigation_node = rebar_control.precision_navigation_node:main',
+            'cmd_vel_relay = rebar_control.cmd_vel_relay:main',
         ],
     },
 )

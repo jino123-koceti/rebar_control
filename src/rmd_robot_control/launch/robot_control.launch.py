@@ -33,21 +33,7 @@ def generate_launch_description():
         description='시뮬레이션 시간 사용 여부'
     )
     
-    # CMD_VEL 제어 노드
-    cmd_vel_control_node = Node(
-        package='rmd_robot_control',
-        executable='cmd_vel_control_node',
-        name='cmd_vel_control_node',
-        output='screen',
-        parameters=[config_file, {'use_sim_time': LaunchConfiguration('use_sim_time')}],
-        remappings=[
-            ('cmd_vel', '/cmd_vel'),
-            ('joint_states', '/joint_states'),
-            ('motor_status', '/cmd_vel_motor_status')
-        ]
-    )
-    
-    # 위치제어 노드
+    # 통합 제어 노드 (CMD_VEL + 위치제어)
     position_control_node = Node(
         package='rmd_robot_control',
         executable='position_control_node',
@@ -55,8 +41,8 @@ def generate_launch_description():
         output='screen',
         parameters=[config_file, {'use_sim_time': LaunchConfiguration('use_sim_time')}],
         remappings=[
-            ('joint_states', '/position_joint_states'),
-            ('motor_status', '/position_motor_status')
+            ('joint_states', '/joint_states'),
+            ('motor_status', '/motor_status')
         ]
     )
     
@@ -81,7 +67,6 @@ def generate_launch_description():
         can_interface_arg,
         use_sim_time_arg,
         start_message,
-        cmd_vel_control_node,
         position_control_node,
         joint_state_publisher
     ])

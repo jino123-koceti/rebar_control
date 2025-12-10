@@ -1,0 +1,49 @@
+
+# Build artifacts
+build/
+install/
+log/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Temporary files
+*.tar.gz
+*.zip
+
+# Test and analysis scripts
+analyze_*.sh
+plot_*.py
+scan_*.py
+monitor_*.sh
+
+# Setup scripts
+setup_*.sh
+complete_setup.sh
+fix_*.sh
+build_*.sh
+check_*.sh
+
+# Service files
+*.service
+
+# Downloaded manuals
+*.pdf
+
+# External packages (reference only)
+src/tire_roller/
+src/smc-linux-*/
+src/smc-linux-*.tar.gz
+src/rebar_motor_control-main/
+src/downloads/
+src/test_code/
+
+# Device documentation
+rmd_can_protocol/
+
+# Temporary test files
+test_gmsl_camera.py
+src/seengrip_code.py
+src/simplemodbus.py

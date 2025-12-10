@@ -1,0 +1,36 @@
+# ZED 카메라 Depth 설정 (근거리 최적화)
+# https://www.stereolabs.com/docs/ros2/zed_node/#depth-parameters
+
+/**:
+  ros__parameters:
+    # Depth 모드 설정
+    depth:
+      depth_mode: 'NEURAL'  # NEURAL (최고 품질, 느림), ULTRA, QUALITY, PERFORMANCE
+      depth_stabilization: 1  # 0~100, 값이 클수록 안정적이지만 지연 증가
+      openni_depth_mode: false  # OpenNI 호환 모드 (mm 단위, 16-bit)
+      
+      # 깊이 범위 (미터 단위)
+      min_depth: 0.1  # 최소 깊이 (ZED X Mini 최소값)
+      max_depth: 2.0  # 최대 깊이 (철근 작업 범위)
+      
+      # 품질 설정
+      depth_confidence: 50  # 0~100, 낮을수록 더 많은 픽셀 허용 (노이즈 증가)
+      depth_texture_conf: 50  # 0~100, 질감 신뢰도 임계값
+      
+    # 비디오 설정
+    video:
+      resolution: 'HD720'  # HD2K, HD1080, HD720, VGA
+      grab_frame_rate: 15  # FPS
+      
+    # 위치 추적 비활성화 (성능 향상)
+    pos_tracking:
+      pos_tracking_enabled: false
+      
+    # 매핑 비활성화
+    mapping:
+      mapping_enabled: false
+      
+    # 센서 데이터 비활성화 (불필요)
+    sensors:
+      sensors_image_sync: false
+      sensors_pub_rate: 0.0

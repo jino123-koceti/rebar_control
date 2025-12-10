@@ -59,14 +59,14 @@
 |------|------|----------|------|
 | **Pololu 18v7** | /dev/ttyACM0 | USB (SmcCmd) | 트리거 선형 액추에이터 |
 | **Seengrip 그리퍼** | /dev/ttyUSB0 | Modbus RTU (115200) | 그립 열기/닫기 (0-2000) |
-| **EZI-IO** | 192.168.0.2:502 | Modbus TCP | 리미트 센서 (옵션) |
-
+| **EZI-IO** | 192.168.0.2:502 | Modbus TCP | 근접센서?  |
+             | 192.168.0.3:502 | Modbus TCP | 리미트 센서 
 ---
 
 ## ROS2 패키지 구조
 
 ```
-/home/test/ros2_ws/src/
+/home/koceti/ros2_ws/src/
 ├── rmd_robot_control/          # RMD 모터 제어 패키지
 │   ├── position_control_node.py  # 통합 제어 노드 (7개 모터)
 │   ├── can_manager.py            # CAN 버스 관리
@@ -229,7 +229,7 @@ wait
 
 ### 1. `iron_md_teleop_node` (리모콘 입력 노드)
 
-**파일**: `/home/test/ros2_ws/src/rebar_control/rebar_control/iron_md_teleop_node.py`
+**파일**: `/home/koceti/ros2_ws/src/rebar_control/rebar_control/iron_md_teleop_node.py`
 
 #### 주요 기능
 - CAN3에서 Iron-MD 리모콘 메시지 수신
@@ -252,13 +252,15 @@ Emergency_Stop_Active: 비상 정지 활성화
 TX_Connected: 리모콘 연결 상태
 ```
 
-#### 조이스틱 매핑
-| 입력 | 출력 토픽 | 대상 모터 | 설명 |
-|------|----------|----------|------|
-| AN3 (세로) | `/cmd_vel` linear.x | 0x141, 0x142 | 전진/후진 |
-| AN3 (가로) | `/cmd_vel` angular.z | 0x141, 0x142 | 좌우 회전 |
-| AN1 | `/joint_2/position` | 0x144 | X축 이동 |
-| AN2 | `/joint_3/position` | 0x145 | Y축 이동 |
+#### 조이스틱 매핑 (실제 리모콘 조작 기준)
+| 입력 | 출력 토픽 | 대상 모터 | 설명 | 코드 매핑 |
+|------|----------|----------|------|-----------|
+| AN3 (조이스틱 3) | `/cmd_vel` linear.x | 0x141, 0x142 | 전진/후진 | angular 변수 (모터 180도 장착) |
+| AN4 (조이스틱 4) | `/cmd_vel` angular.z | 0x141, 0x142 | 좌우 회전 | linear 변수 (모터 180도 장착) |
+| AN1 | `/joint_2/position` | 0x144 | X축 이동 | - |
+| AN2 | `/joint_3/position` | 0x145 | Y축 이동 | - |
+
+> **Note**: 드라이브 모터(0x141, 0x142)가 180도 틀어져 장착되어 코드상 AN3/AN4 매핑이 역전되어 있습니다.
 
 #### 스위치 매핑
 | 스위치 | 동작 | 대상 | 설명 |
@@ -286,7 +288,7 @@ def control_loop(self):
 
 ### 2. `position_control_node` (통합 모터 제어 노드)
 
-**파일**: `/home/test/ros2_ws/src/rmd_robot_control/rmd_robot_control/position_control_node.py`
+**파일**: `/home/koceti/ros2_ws/src/rmd_robot_control/rmd_robot_control/position_control_node.py`
 
 #### 주요 기능
 - **7개 RMD 모터** 통합 제어
@@ -345,7 +347,7 @@ def safe_brake_release(self):
 
 ### 3. `pololu_node` (트리거 액추에이터)
 
-**파일**: `/home/test/ros2_ws/src/pololu_ros2/pololu_ros2/pololu_node.py`
+**파일**: `/home/koceti/ros2_ws/src/pololu_ros2/pololu_ros2/pololu_node.py`
 
 #### 주요 기능
 - Pololu 18v7 Simple Motor Controller 제어
@@ -370,7 +372,7 @@ stop():           set_speed(0)      # 정지
 
 ### 4. `seengrip_node` (그리퍼 제어)
 
-**파일**: `/home/test/ros2_ws/src/seengrip_ros2/seengrip_ros2/seengrip_node.py`
+**파일**: `/home/koceti/ros2_ws/src/seengrip_ros2/seengrip_ros2/seengrip_node.py`
 
 #### 주요 기능
 - Seengrip 그리퍼 Modbus RTU 제어
@@ -397,7 +399,7 @@ close_gripper(): set_position(2000)  # 완전 닫힘
 ### 1. 통합 제어 시작
 
 ```bash
-cd /home/test/ros2_ws
+cd /home/koceti/ros2_ws
 ./integrated_control.sh
 ```
 
@@ -451,13 +453,13 @@ ros2 service call /safe_brake_lock std_srvs/srv/Trigger
 
 ### 3. 조작 방법
 
-#### 주행 (AN3 조이스틱)
+#### 주행 (AN3/AN4 조이스틱) - 실제 리모콘 조작 기준
 ```
-AN3 세로 → 전진/후진
-AN3 가로 → 좌우 회전
+AN3 조이스틱 → 전진/후진 (코드상 angular 변수, 모터 180도 장착)
+AN4 조이스틱 → 좌우 회전 (코드상 linear 변수, 모터 180도 장착)
 
 예: 전진하면서 우회전
-  - AN3 세로 위로 + AN3 가로 오른쪽
+  - AN3 위로 (전진) + AN4 오른쪽 (우회전)
   → cmd_vel: linear.x=0.5, angular.z=0.3
   → 0x141 (좌): 빠르게, 0x142 (우): 느리게
 ```
@@ -554,7 +556,7 @@ ros2 topic list
 
 #### 주행만 테스트
 ```bash
-cd /home/test/ros2_ws
+cd /home/koceti/ros2_ws
 source install/setup.bash
 ros2 run rmd_robot_control position_control_node &
 ros2 topic pub /cmd_vel geometry_msgs/Twist "{linear: {x: 0.3}, angular: {z: 0.0}}" -r 10
@@ -662,7 +664,7 @@ SmcCmd --stop
 ls -l /dev/ttyUSB*
 
 # 테스트 스크립트 실행
-cd /home/test/ros2_ws
+cd /home/koceti/ros2_ws
 python3 test_seengrip_simplemodbus.py
 ```
 
@@ -707,3 +709,41 @@ CAN2 전송 → RMD 모터 (0x141-0x147)
 - `MOTOR_CONTROL_GUIDE.md` - Pololu/Seengrip 개별 제어
 - `CAN_REMOTE_CONTROL_적용완료.md` - CAN 리모콘 설정
 - `MOTOR_CONTROL_GUIDE.md` - 모터 제어 가이드
+
+
+## 자동 실행 서비스 설정
+
+### 서비스 설치
+```bash
+cd /home/koceti/ros2_ws
+./setup_autostart.sh
+```
+
+### 서비스 관리
+```bash
+# 서비스 시작
+sudo systemctl start robot-control.service
+
+# 서비스 중지
+sudo systemctl stop robot-control.service
+
+# 서비스 상태 확인
+sudo systemctl status robot-control.service
+
+# 서비스 로그 확인
+sudo journalctl -u robot-control.service -f
+
+# 서비스 비활성화 (부팅 시 자동 실행 안함)
+sudo systemctl disable robot-control.service
+
+# 서비스 다시 활성화
+sudo systemctl enable robot-control.service
+sudo systemctl start robot-control.service
+```
+
+### 서비스 설정 파일
+- 위치: `/etc/systemd/system/robot-control.service`
+- 실행 스크립트: `/home/koceti/ros2_ws/integrated_control_debug.sh`
+- 로그 위치: `/var/log/robot_control/control_*.log`
+
+# 진동하는 모터 왼쪽(0x141)

@@ -1,6 +1,6 @@
 #!/bin/bash
 # 로봇 제어 시스템 로그 관리 (자동 정리)
-# cron으로 매일 실행: 0 2 * * * /home/test/ros2_ws/cleanup_logs.sh
+# cron으로 매일 실행: 0 2 * * * /home/koceti/ros2_ws/cleanup_logs.sh
 
 LOG_DIR="/var/log/robot_control"
 DAYS_TO_KEEP=7  # 7일 이상 된 로그 삭제

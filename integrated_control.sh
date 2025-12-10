@@ -6,7 +6,7 @@ echo "통합 제어 시스템 시작"
 echo "=========================================="
 echo ""
 
-cd /home/test/ros2_ws
+cd /home/koceti/ros2_ws
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 

@@ -126,14 +126,16 @@ ros2 run rebar_control iron_md_teleop
 
 ## 🎮 리모콘 매핑 (Iron-MD)
 
-### 조이스틱 (Analog)
+### 조이스틱 (Analog) - 실제 리모콘 조작 기준
 
-| Joystick | Function | Motor | Range |
-|----------|----------|-------|-------|
-| AN3 | 전후진 | 0x141, 0x142 | -1.0 ~ 1.0 |
-| AN4 | 좌우 회전 | 0x141, 0x142 | -1.0 ~ 1.0 |
-| AN1 | X축 이동 | 0x144 | ±200 dps |
-| AN2 | Y축 이동 | 0x145 | ±200 dps |
+| Joystick | Function | Motor | Range | Code Mapping |
+|----------|----------|-------|-------|--------------|
+| AN3 | 전후진 | 0x141, 0x142 | -1.0 ~ 1.0 | angular 변수 (모터 180도 장착) |
+| AN4 | 좌우 회전 | 0x141, 0x142 | -1.0 ~ 1.0 | linear 변수 (모터 180도 장착) |
+| AN1 | X축 이동 | 0x144 | ±200 dps | - |
+| AN2 | Y축 이동 | 0x145 | ±200 dps | - |
+
+> **Note**: 드라이브 모터(0x141, 0x142)가 180도 틀어져 장착되어 코드상 AN3/AN4 매핑이 역전되어 있습니다.
 
 ### 버튼 (Digital)
 
@@ -237,9 +239,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=test
-WorkingDirectory=/home/test/ros2_ws
-ExecStart=/home/test/ros2_ws/integrated_control_debug.sh
+User=koceti
+WorkingDirectory=/home/koceti/ros2_ws
+ExecStart=/home/koceti/ros2_ws/integrated_control_debug.sh
 Restart=always
 
 [Install]

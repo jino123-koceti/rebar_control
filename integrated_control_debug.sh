@@ -19,7 +19,7 @@ log_msg "========== 철근 결속 로봇 제어 시스템 시작 =========="
 log_msg "로그 파일: $LOG_FILE"
 
 # ROS2 환경 설정
-cd /home/test/ros2_ws
+cd /home/koceti/ros2_ws
 source /opt/ros/humble/setup.bash 2>/dev/null
 source install/setup.bash 2>/dev/null
 log_msg "ROS2 환경 설정 완료"

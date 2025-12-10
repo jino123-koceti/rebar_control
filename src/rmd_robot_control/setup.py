@@ -24,11 +24,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'cmd_vel_control_node = rmd_robot_control.cmd_vel_control_node:main',
             'position_control_node = rmd_robot_control.position_control_node:main',
-            'robot_control_node = rmd_robot_control.robot_control_node:main',
-            'motor_test = rmd_robot_control.motor_test:main',
-            'safe_motor_test = rmd_robot_control.safe_motor_test:main',
             'robot_control_gui = rmd_robot_control.robot_control_gui:main',
         ],
     },

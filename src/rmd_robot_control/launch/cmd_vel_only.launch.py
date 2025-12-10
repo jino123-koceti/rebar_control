@@ -30,11 +30,11 @@ def generate_launch_description():
         description='시뮬레이션 시간 사용 여부'
     )
     
-    # CMD_VEL 제어 노드
-    cmd_vel_control_node = Node(
+    # 통합 제어 노드 (CMD_VEL 포함)
+    position_control_node = Node(
         package='rmd_robot_control',
-        executable='cmd_vel_control_node',
-        name='cmd_vel_control_node',
+        executable='position_control_node',
+        name='position_control_node',
         output='screen',
         parameters=[config_file, {'use_sim_time': LaunchConfiguration('use_sim_time')}],
         remappings=[
@@ -46,14 +46,14 @@ def generate_launch_description():
     
     # 시작 메시지
     start_message = LogInfo(
-        msg="CMD_VEL 제어 시스템 시작"
+        msg="CMD_VEL 제어 시스템 시작 (통합 노드 사용)"
     )
     
     return LaunchDescription([
         can_interface_arg,
         use_sim_time_arg,
         start_message,
-        cmd_vel_control_node
+        position_control_node
     ])
 
 

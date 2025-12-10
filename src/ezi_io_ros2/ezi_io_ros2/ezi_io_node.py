@@ -11,13 +11,32 @@ from rclpy.node import Node
 from std_msgs.msg import Bool
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 
-# FASTECH Plus-E 라이브러리
-library_path = "/home/test/python/PE/Library"
-sys.path.append(library_path)
+# FASTECH Plus-E 라이브러리 경로 설정
+# 환경 변수 또는 기본 경로 사용
+import os
+library_path = os.environ.get('FASTECH_LIBRARY_PATH', '/home/koceti/python/PE/Library')
 
-from FAS_EziMOTIONPlusE import *
-from MOTION_DEFINE import *
-from ReturnCodes_Define import *
+# 라이브러리 경로 추가
+if os.path.exists(library_path):
+    sys.path.append(library_path)
+else:
+    print(f"⚠️ WARNING: FASTECH 라이브러리 경로가 없습니다: {library_path}")
+    print(f"   환경 변수로 설정: export FASTECH_LIBRARY_PATH=/path/to/PE/Library")
+    print(f"   또는 코드에서 library_path를 수정하세요.")
+    sys.exit(1)
+
+try:
+    from FAS_EziMOTIONPlusE import *
+    from MOTION_DEFINE import *
+    from ReturnCodes_Define import *
+except ImportError as e:
+    print(f"❌ ERROR: FASTECH 라이브러리를 불러올 수 없습니다!")
+    print(f"   경로: {library_path}")
+    print(f"   에러: {e}")
+    print(f"   해결 방법:")
+    print(f"   1. FASTECH Plus-E 라이브러리를 {library_path}에 설치하세요")
+    print(f"   2. 또는 환경 변수 설정: export FASTECH_LIBRARY_PATH=/실제/경로")
+    sys.exit(1)
 
 
 class EziIoNode(Node):

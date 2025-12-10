@@ -8,18 +8,26 @@ CAN 통신:
 - 0x2E4 (740): 스위치 및 상태 (50ms)
 - 0x764 (1892): Heartbeat (300ms)
 
-조종기 매핑:
+조종기 매핑 (실제 리모콘 조작 기준):
 [아날로그 조이스틱 - 연속 제어]
-- Joystick_3 (AN3): 하부체 좌우회전 (0x141, 0x142) - 속도는 전후진의 1/2
-- Joystick_4 (AN4): 하부체 전후진 (0x141, 0x142)
+- Joystick_3 (AN3): 하부체 전후진 (0x141, 0x142) - linear 변수 사용 (좌우 모터가 180도 반대로 설치되어있음)
+  - AN3- -> 전진, AN3+ -> 후진
+- Joystick_4 (AN4): 하부체 좌우회전 (0x141, 0x142) - angular 변수 사용 (좌우 모터가 180도 반대로 설치되어 있어서)
+  - AN4+ -> CCW, AN4- -> CW 로 로봇이 움직임
 - Joystick_1 (AN1): 상부체 X축 속도 제어 (0x144)
 - Joystick_2 (AN2): 상부체 Y축 속도 제어 (0x145)
 
 [3단 스위치 - 토글형]
 - S19-S20: 모드 선택 (S19=Remote, S20=Automatic)
-- S17-S18: 횡이동 (S17=+360도, S18=-360도) 0x143
-- S21-S22: 작업 시퀀스 (S21=하강→닫힘, S22=트리거→열림→상승)
-- S23-S24: Yaw 회전 (S23=+30도, S24=-30도) 0x147
+- S17-S18: 
+  * S19(Remote 모드): 횡이동 (S17=+360도, S18=-360도) 0x143 (+-50mm씩 이동함)
+  * S20(Auto 모드): 그리퍼 제어 (S17=열림 g 5 600, S18=닫힘 g 5 -600)
+- S21-S22: 
+  * S19(Remote 모드): 작업 시퀀스 (S21=하강→닫힘, S22=트리거→상승→열림)
+  * S20(Auto 모드): 횡이동 회전 (S21=+2880도, S22=-2880도) 0x143 (+-400mm씩 이동함)
+- S23-S24: 
+  * S19(Remote 모드): Yaw 회전 (S23=+5도, S24=-5도) 0x147
+  * S20(Auto 모드): S23=XYZ호밍, S24=X +1181.85°, Y -189.4° 상대이동
 
 [일반 스위치]
 - S13: 브레이크 해제/잠금
@@ -36,6 +44,7 @@ import can
 import struct
 import threading
 import math
+import time
 
 
 class IronMDTeleopNode(Node):
@@ -44,16 +53,36 @@ class IronMDTeleopNode(Node):
     def __init__(self):
         super().__init__('iron_md_teleop')
         
+        # 파일 로그 설정 (INFO 이상 모든 로그 기록)
+        import logging
+        import os
+        self.file_logger = logging.getLogger('iron_md_teleop_file')
+        self.file_logger.setLevel(logging.INFO)  # INFO 이상 기록
+        # 기존 핸들러 제거 (중복 방지)
+        self.file_logger.handlers.clear()
+        # 파일 핸들러 추가
+        log_file = '/tmp/unified_control_debug.log'
+        fh = logging.FileHandler(log_file, mode='a', encoding='utf-8', delay=False)
+        fh.setLevel(logging.INFO)  # INFO 이상 기록
+        formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        fh.setFormatter(formatter)
+        self.file_logger.addHandler(fh)
+        self.file_log_file_handler = fh  # 나중에 flush를 위해 저장
+        self.file_logger.info("="*60)
+        self.file_logger.info("Iron-MD Teleop Node 시작")
+        self.file_logger.info("="*60)
+        self.file_log_file_handler.flush()  # 즉시 파일에 기록
+        
         # 파라미터 선언
         self.declare_parameter('can_interface', 'can3')  # Iron-MD 조종기용 can3
         self.declare_parameter('can_baudrate', 250000)
-        # 최대 속도 제한 (양쪽 모터 떨림 방지를 위해 낮춤)
-        self.declare_parameter('max_linear_speed', 0.3)  # 0.5 → 0.3 m/s
-        self.declare_parameter('max_angular_speed', 1.0)
+        # 최대 속도 제한 (Speed PID 게인 동기화 후 10배 증가, 각속도는 2배로 조정)
+        self.declare_parameter('max_linear_speed', 3.0)  # 0.3 → 3.0 m/s (10배)
+        self.declare_parameter('max_angular_speed', 2.0)  # 1.0 → 10.0 → 2.0 rad/s (10배→5분의1로 감소)
         self.declare_parameter('xyz_step_size', 10.0)  # degree, 10도 per command (조이스틱 연속 제어)
         self.declare_parameter('lateral_move_distance', 50.0)  # degree, 50도 per step (횡이동)
         self.declare_parameter('z_work_distance', 100.0)  # degree, 100도 for work sequence
-        self.declare_parameter('yaw_rotation_angle', 30.0)  # degrees, 30도
+        self.declare_parameter('yaw_rotation_angle', 5.0)  # degrees, 5도 (fine control)
         self.declare_parameter('trigger_duration', 0.5)  # seconds
         self.declare_parameter('gripper_open_position', 0)  # 그리퍼 열림
         self.declare_parameter('gripper_close_position', 2000)  # 그리퍼 닫힘
@@ -80,9 +109,14 @@ class IronMDTeleopNode(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.joint1_pub = self.create_publisher(Float64MultiArray, '/joint_1/position', 10)  # 0x143 Lateral (횡이동)
         self.joint2_pub = self.create_publisher(Float32, '/joint_2/speed', 10)  # 0x144 X-axis 속도
+        self.joint2_position_pub = self.create_publisher(Float64MultiArray, '/joint_2/position', 10)  # 0x144 X-axis 위치
         self.joint3_pub = self.create_publisher(Float32, '/joint_3/speed', 10)  # 0x145 Y-axis 속도
+        self.joint3_position_pub = self.create_publisher(Float64MultiArray, '/joint_3/position', 10)  # 0x145 Y-axis 위치
         self.joint4_pub = self.create_publisher(Float64MultiArray, '/joint_4/position', 10)  # 0x146 Z-axis (상하)
         self.joint5_pub = self.create_publisher(Float64MultiArray, '/joint_5/position', 10)  # 0x147 Yaw (회전)
+        # 주행 모터 위치 제어 퍼블리셔 (0x141, 0x142) - S20 모드에서 사용
+        self.left_wheel_position_pub = self.create_publisher(Float64MultiArray, '/motor_0x141/position', 10)
+        self.right_wheel_position_pub = self.create_publisher(Float64MultiArray, '/motor_0x142/position', 10)
         self.trigger_pub = self.create_publisher(Float32, '/motor_0/vel', 10)
         self.gripper_pos_pub = self.create_publisher(Float32, '/gripper/position', 10)
         self.gripper_cmd_pub = self.create_publisher(Int32, '/gripper/command', 10)
@@ -92,8 +126,8 @@ class IronMDTeleopNode(Node):
         self.joystick_data = {
             'AN1': 127,  # X축 (상부체)
             'AN2': 127,  # Y축 (상부체)
-            'AN3': 127,  # 주행 전후진 (하부체)
-            'AN4': 127,  # (예비)
+            'AN3': 127,  # 리모콘: 전후진 조작 → 코드: linear (좌우 모터 180도 반대 설치, AN3- = 전진, AN3+ = 후진)
+            'AN4': 127,  # 리모콘: 좌우회전 조작 → 코드: angular (좌우 모터 180도 반대 설치, AN4+ = CCW, AN4- = CW)
         }
         
         self.switch_data = {
@@ -118,8 +152,10 @@ class IronMDTeleopNode(Node):
             'y': 0.0,  # Y축 (0x145) - degree
             'z': 0.0,  # Z축 (0x146) - degree
             'yaw': 0.0,  # Yaw (0x147) - degree
+            'left_wheel': 0.0,  # 좌측 주행 모터 (0x141) - degree
+            'right_wheel': 0.0,  # 우측 주행 모터 (0x142) - degree
         }
-        
+        default_speed_dps = 704.0
         # 제어 모드
         self.control_mode = 'remote'  # 'remote' or 'automatic'
         
@@ -137,6 +173,11 @@ class IronMDTeleopNode(Node):
         
         # 마지막 발행 값 (중복 방지)
         self.last_cmd_sent = {'linear': 0.0, 'angular': 0.0}
+        
+        # 횡이동 명령 간격 제어 (과부하 방지)
+        self.last_lateral_command_time = 0.0
+        self.lateral_command_min_interval = 0.5  # 최소 0.5초 간격 (과부하 방지)
+        self.lateral_target_position = None  # 목표 위치 (이동 중 체크용)
         
         # 제어 루프 타이머 (20Hz)
         self.control_timer = self.create_timer(0.05, self.control_loop)
@@ -170,12 +211,43 @@ class IronMDTeleopNode(Node):
             lambda msg: self.motor_position_callback(msg, 'yaw'),
             10
         )
+        
+        # XY 스테이지 모터 위치 구독 (0x144 = X축, 0x145 = Y축)
+        self.motor_x_position_sub = self.create_subscription(
+            Float32,
+            '/motor_0x144_position',
+            lambda msg: self.motor_position_callback(msg, 'x'),
+            10
+        )
+        
+        self.motor_y_position_sub = self.create_subscription(
+            Float32,
+            '/motor_0x145_position',
+            lambda msg: self.motor_position_callback(msg, 'y'),
+            10
+        )
+
+        # 주행 모터 위치 구독 (0x141, 0x142) - S20 모드에서 사용
+        self.motor_0x141_position_sub = self.create_subscription(
+            Float32,
+            '/motor_0x141_position',
+            lambda msg: self.motor_position_callback(msg, 'left_wheel'),
+            10
+        )
+        
+        self.motor_0x142_position_sub = self.create_subscription(
+            Float32,
+            '/motor_0x142_position',
+            lambda msg: self.motor_position_callback(msg, 'right_wheel'),
+            10
+        )
 
         # EZI-IO 리미트 센서 구독
         self.limit_sensor_in00 = False  # IN00 상태 (Y축 원점 리미트, 0x145)
         self.limit_sensor_in01 = False  # IN01 상태 (Y축 최대 리미트, 0x145)
         self.limit_sensor_in02 = False  # IN02 상태 (X축 홈 리미트, 0x144)
         self.limit_sensor_in03 = False  # IN03 상태 (X축 최대 리미트, 0x144)
+        self.limit_sensor_in04 = False  # IN04 상태 (Yaw 홈 리미트, 0x147)
         self.limit_sensor_in05 = False  # IN05 상태 (Z축 상단 리미트)
         self.limit_sensor_in06 = False  # IN06 상태 (Z축 하단 리미트)
 
@@ -207,6 +279,13 @@ class IronMDTeleopNode(Node):
             10
         )
 
+        self.limit_sensor_in04_sub = self.create_subscription(
+            Bool,
+            '/limit_sensors/yaw_min',  # EZI-IO IN04 (Yaw 홈)
+            self.limit_sensor_in04_callback,
+            10
+        )
+
         self.limit_sensor_in05_sub = self.create_subscription(
             Bool,
             '/limit_sensors/z_min',  # EZI-IO IN05 (Z축 상단)
@@ -221,8 +300,22 @@ class IronMDTeleopNode(Node):
             10
         )
 
+        # 모터 목표 도달 알림 구독
+        self.motor_goal_reached_sub = self.create_subscription(
+            Int32,
+            '/motor_goal_reached',
+            self.motor_goal_reached_callback,
+            10
+        )
+
         # 초기 위치 읽기 완료 플래그
-        self.initial_position_read = {'lateral': False, 'z': False, 'yaw': False}
+        self.initial_position_read = {'lateral': False, 'z': False, 'yaw': False, 'x': False, 'y': False, 'left_wheel': False, 'right_wheel': False}
+        
+        # S20 모드에서 AN3 조이스틱 엣지 감지용
+        self.an3_prev_value = 127
+        self.an3_last_command_time = 0.0
+        self.an3_command_min_interval = 0.5  # 최소 명령 간격 (초)
+        self.an3_command_active = False  # 명령 실행 중 플래그 (중립 복귀까지 추가 명령 무시)
         
         # Z축 동작 상태
         self.z_moving_to_limit = False  # 상단 리미트까지 이동 중
@@ -244,6 +337,36 @@ class IronMDTeleopNode(Node):
         # 홈잉 속도 설정
         self.homing_speed_slow = 0.02  # 저속: 0.02 m/s (정밀 제어)
         self.homing_speed_medium = 0.05  # 중속: 0.05 m/s (빠른 이동)
+
+        # 스테이지 모터(0x144/0x145/0x147) 홈잉 상태
+        self.stage_homing_active = False  # 스테이지 홈잉 진행 중
+        self.stage_homing_phase = 1  # 호밍 단계: 1=1차 고속, 2=센서 이탈, 3=2차 저속
+        self.stage_x_homing_done = False  # X축 홈 도달 완료
+        self.stage_y_homing_done = False  # Y축 홈 도달 완료
+        self.stage_yaw_homing_done = False  # Yaw 홈 도달 완료
+        self.stage_x_homing_phase2_done = False  # X축 2차 호밍 완료
+        self.stage_y_homing_phase2_done = False  # Y축 2차 호밍 완료
+        self.stage_yaw_homing_phase2_done = False  # Yaw 2차 호밍 완료
+        self.stage_xy_homing_speed = 200.0  # XY 스테이지 1차 호밍 속도 (dps, 고속)
+        self.stage_xy_homing_speed_slow = 50.0  # XY 스테이지 2차 호밍 속도 (dps, 저속)
+        self.stage_yaw_homing_speed = 100.0  # Yaw 1차 호밍 속도 (dps)
+        self.stage_yaw_homing_speed_slow = 20.0  # Yaw 2차 호밍 속도 (dps, 저속)
+        
+        # 스테이지 홈 위치 저장 (엔코더 절대값)
+        self.home_x_encoder_position = None  # 홈잉 완료 시 X축 엔코더값 저장
+        self.home_y_encoder_position = None  # 홈잉 완료 시 Y축 엔코더값 저장
+        self.home_yaw_encoder_position = None  # 홈잉 완료 시 Yaw 엔코더값 저장
+        
+        # 자동 작업 시퀀스 상태 (S20→S24→Z축 작업)
+        self.work_sequence_active = False  # 작업 시퀀스 진행 중
+        self.work_sequence_step = 0  # 0: 대기, 1: XY이동완료, 2: Z하강중, 3: 트리거, 4: Z상승중
+        self.z_work_start_position = None  # Z축 작업 시작 위치 저장
+        
+        # 타이머 변수 초기화
+        self.encoder_display_timer = None  # 브레이크 해제 후 엔코더 출력용
+        self.homing_save_timer = None  # 홈잉 완료 후 홈 위치 저장용
+        self.stage_encoder_timer = None  # 스테이지 엔코더 출력용
+        self.work_sequence_timer = None  # 작업 시퀀스용
 
         # CAN 버스 초기화 (모든 데이터 구조 초기화 후)
         try:
@@ -268,14 +391,16 @@ class IronMDTeleopNode(Node):
         self.print_help()
     
     def print_help(self):
-        """조종기 매핑 도움말 (간소화)"""
-        self.get_logger().info('Iron-MD Remote Controller Mapping:')
-        self.get_logger().info('  AN4: Forward/Backward (0x141,0x142), AN3: Left/Right turn (0x141,0x142)')
+        """조종기 매핑 도움말 (실제 리모콘 조작 기준)"""
+        self.get_logger().info('Iron-MD Remote Controller Mapping (실제 조작):')
+        self.get_logger().info('  AN3: Forward/Backward (전후진, 좌우 모터 180도 반대 설치: AN3- = 전진, AN3+ = 후진)')
+        self.get_logger().info('  AN4: Left/Right turn (좌우회전, 좌우 모터 180도 반대 설치: AN4+ = CCW, AN4- = CW)')
         self.get_logger().info('  AN1: X-axis (0x144), AN2: Y-axis (0x145)')
         self.get_logger().info('  S17/S18: Lateral move ±360deg (0x143)')
         self.get_logger().info('  S21/S22: Work sequence (Z-axis + gripper)')
         self.get_logger().info('  S23/S24: Yaw rotation ±30deg (0x147)')
-        self.get_logger().info('  S13: Brake toggle, S14: Homing, S15: Reset position') 
+        self.get_logger().info('  S13: Brake toggle, S14: Homing')
+        self.get_logger().info('  Note: AN3 전후진 방향 반전 적용됨') 
     
     def can_receiver_thread(self):
         """CAN 메시지 수신 스레드"""
@@ -312,7 +437,7 @@ class IronMDTeleopNode(Node):
             if self.debug_mode:
                 self.get_logger().debug(
                     f'📊 조이스틱: AN1={data[0]:3d} AN2={data[1]:3d} '
-                    f'AN3={data[2]:3d} AN4={data[3]:3d}'
+                    f'AN3={data[2]:3d}(전후진) AN4={data[3]:3d}(좌우회전)'
                 )
     
     def parse_switch_status(self, data):
@@ -426,13 +551,14 @@ class IronMDTeleopNode(Node):
         
         # 제어 모드 확인
         self.update_control_mode()
-        
+
         if self.control_mode != 'remote':
-            # Automatic 모드일 경우 상위제어 패키지에 제어권 위임
+            # Automatic 모드일 경우 호밍 등의 특수 명령 처리
+            self.handle_auto_mode()
             return
         
         # Remote Control 모드
-        # 1. 주행 제어 (연속) - AN3
+        # 1. 주행 제어 (연속) - 리모콘: AN3=전후진, AN4=좌우회전 (좌우 모터 180도 반대 설치)
         self.handle_driving()
         
         # 2. XYZ 스테이지 (연속) - AN1, AN2
@@ -460,29 +586,675 @@ class IronMDTeleopNode(Node):
         """제어 모드 업데이트 (S19-S20)"""
         if self.switch_data['S19'] == 1:
             if self.control_mode != 'remote':
+                old_mode = self.control_mode
                 self.control_mode = 'remote'
-                self.get_logger().info('Remote Control mode')
+                self.get_logger().info(f'🔄 모드 전환: {old_mode} → Remote Control mode')
+                self.file_logger.info(f'🔄 모드 전환: {old_mode} → Remote Control mode')
+                self.file_log_file_handler.flush()
+                # S20에서 S19로 전환 시 주행 모터 위치 제어 중지
+                if old_mode == 'automatic':
+                    # 위치 제어 중지 (속도 제어 모드로 전환)
+                    # 위치는 실제 엔코더 값으로 유지 (리셋하지 않음)
+                    # self.current_positions['left_wheel'] = 0.0  # 제거: 모드 전환 시에도 실제 위치 유지
+                    # self.current_positions['right_wheel'] = 0.0  # 제거: 모드 전환 시에도 실제 위치 유지
+                    self.an3_command_active = False
+                    self.an3_prev_value = 127
+                    self.get_logger().info('🛑 S20→S19 전환: 주행 모터 위치 제어 중지 (위치 유지)')
+                    self.file_logger.info('🛑 S20→S19 전환: 주행 모터 위치 제어 중지 (위치 유지)')
+                    self.file_log_file_handler.flush()
         elif self.switch_data['S20'] == 1:
             if self.control_mode != 'automatic':
+                old_mode = self.control_mode
                 self.control_mode = 'automatic'
-                self.get_logger().info('🤖 Automatic Control 모드 (상위제어 대기)')
+                self.get_logger().info(f'🔄 모드 전환: {old_mode} → 🤖 Automatic Control 모드 (상위제어 대기)')
+                self.file_logger.info(f'🔄 모드 전환: {old_mode} → 🤖 Automatic Control 모드 (상위제어 대기)')
+                self.file_log_file_handler.flush()
+
+    def handle_auto_mode(self):
+        """S20 Automatic 모드에서 호밍 및 작업 시퀀스 처리"""
+        # AN3: 주행 모터(0x141, 0x142) ±1200도 회전 제어
+        self.handle_an3_drive_motor_rotation()
+        
+        # S17: 그리퍼 열기
+        if self.switch_pressed('S17'):
+            self.get_logger().info('[S17] 그리퍼 열기')
+            # 그리퍼 열기 명령: g 5 600 -> (5 << 12) | 600 = 0x5258 = 21080
+            from std_msgs.msg import Int32
+            open_cmd = Int32()
+            open_cmd.data = 21080  # Command 5, Speed +600 (g 5 600)
+            self.gripper_cmd_pub.publish(open_cmd)
+            self.get_logger().info('  -> Published /gripper/command: 21080 (g 5 600 - OPEN with speed)')
+
+        # S18: 그리퍼 닫기
+        if self.switch_pressed('S18'):
+            self.get_logger().info('[S18] 그리퍼 닫기')
+            # 그리퍼 닫기 명령: g 5 -600 -> (5 << 12) | (-600 & 0x0FFF) = 0x5DA8 = 23976
+            from std_msgs.msg import Int32
+            close_cmd = Int32()
+            close_cmd.data = 23976  # Command 5, Speed -600 (g 5 -600)
+            self.gripper_cmd_pub.publish(close_cmd)
+            self.get_logger().info('  -> Published /gripper/command: 23976 (g 5 -600 - CLOSE with speed)')
+
+        # S21: 횡이동 +2880도 회전 (0x143) - 과부하 방지를 위해 속도 낮춤 및 간격 체크
+        if self.switch_pressed('S21'):
+            # 명령 간 최소 간격 체크 (과부하 방지)
+            current_time = self.get_clock().now().nanoseconds / 1e9
+            time_since_last = current_time - self.last_lateral_command_time
+            
+            if time_since_last < self.lateral_command_min_interval:
+                self.get_logger().warning(f'횡이동 명령 간격 너무 짧음 ({time_since_last:.2f}s < {self.lateral_command_min_interval}s), 무시')
+                return
+            
+            # 이동 중인지 체크
+            if self.lateral_target_position is not None:
+                position_diff = abs(self.lateral_target_position - self.current_positions['lateral'])
+                if position_diff > 50.0:  # 50도 이상 차이면 이동 중으로 간주
+                    self.get_logger().warning(f'횡이동 모터 이동 중 (차이: {position_diff:.1f}도), 새 명령 무시')
+                    return
+            
+            prev_lateral = self.current_positions['lateral']
+            self.current_positions['lateral'] += 2880.0  # +2880도 (8회전)
+            self.lateral_target_position = self.current_positions['lateral']
+            self.last_lateral_command_time = current_time
+            self.get_logger().info(f'[S21] 횡이동 +2880° (0x143, {prev_lateral:.1f}° → {self.current_positions["lateral"]:.1f}°)')
+            self.publish_joint_position('lateral', self.joint1_pub, speed=100.0)  # 0x143 속도 낮춤 (과부하 방지: 200→100 dps)
+
+        # S22: 횡이동 -2880도 회전 (0x143) - 과부하 방지를 위해 속도 낮춤 및 간격 체크
+        if self.switch_pressed('S22'):
+            # 명령 간 최소 간격 체크 (과부하 방지)
+            current_time = self.get_clock().now().nanoseconds / 1e9
+            time_since_last = current_time - self.last_lateral_command_time
+            
+            if time_since_last < self.lateral_command_min_interval:
+                self.get_logger().warning(f'횡이동 명령 간격 너무 짧음 ({time_since_last:.2f}s < {self.lateral_command_min_interval}s), 무시')
+                return
+            
+            # 이동 중인지 체크
+            if self.lateral_target_position is not None:
+                position_diff = abs(self.lateral_target_position - self.current_positions['lateral'])
+                if position_diff > 50.0:  # 50도 이상 차이면 이동 중으로 간주
+                    self.get_logger().warning(f'횡이동 모터 이동 중 (차이: {position_diff:.1f}도), 새 명령 무시')
+                    return
+            
+            prev_lateral = self.current_positions['lateral']
+            self.current_positions['lateral'] -= 2880.0  # -2880도 (8회전)
+            self.lateral_target_position = self.current_positions['lateral']
+            self.last_lateral_command_time = current_time
+            self.get_logger().info(f'[S22] 횡이동 -2880° (0x143, {prev_lateral:.1f}° → {self.current_positions["lateral"]:.1f}°)')
+            self.publish_joint_position('lateral', self.joint1_pub, speed=100.0)  # 0x143 속도 낮춤 (과부하 방지: 200→100 dps)
+
+        # S23: 스테이지 XY 호밍 (IN01 & IN02까지 이동)
+        if self.switch_pressed('S23'):
+            if not self.stage_homing_active:
+                self.start_stage_homing()
+            else:
+                self.get_logger().warning('⚠️  스테이지 홈잉이 이미 진행 중입니다')
+
+        # S24: 작업 시퀀스 시작 (XY 이동 → Z 하강 → 트리거 → Z 상승)
+        if self.switch_pressed('S24'):
+            # 홈잉 완료 여부 확인
+            if self.home_x_encoder_position is None or self.home_y_encoder_position is None:
+                self.get_logger().warning('⚠️  XY축 홈잉을 먼저 완료해주세요 (S23)')
+            elif self.work_sequence_active:
+                self.get_logger().warning('⚠️  작업 시퀀스가 이미 진행 중입니다')
+            else:
+                self.start_work_sequence()
+
+        # 이전 스위치 상태 저장
+        self.prev_switches = self.switch_data.copy()
+    
+    def handle_an3_drive_motor_rotation(self):
+        """S20 모드에서 AN3로 주행 모터(0x141, 0x142) ±1200도 회전 제어 (엣지 트리거, 1회만 실행)"""
+        current_an3 = self.joystick_data['AN3']
+        current_time = self.get_clock().now().nanoseconds / 1e9
+        rotation_degrees = 1200.0
+        
+        # 명령 실행 중이면 AN3가 중립(127)으로 돌아올 때까지 대기
+        if self.an3_command_active:
+            # 중립 복귀 확인 (데드존: 120~134)
+            if 120 <= current_an3 <= 134:
+                self.an3_command_active = False
+                log_msg = f'[S20/AN3] ✅ 중립 복귀 감지 (AN3={current_an3}), 다음 명령 허용'
+                self.get_logger().info(log_msg)
+                self.file_logger.info(log_msg)  # 파일에도 저장
+                self.file_log_file_handler.flush()  # 즉시 파일에 기록
+            # 아직 명령 실행 중이므로 AN3 추가 명령만 무시 (다른 스위치는 계속 처리)
+            # FIX: return 제거 - 다른 스위치(S17, S19, S21 등)가 처리되도록 함
+            self.an3_prev_value = current_an3
+            return  # 엣지 감지는 건너뛰고 handle_auto_mode()의 다음 코드로 진행
+
+        # AN3 값 변화 감지 (엣지 트리거: 중립 → AN3- 또는 AN3+)
+        an3_changed = False
+        rotation_direction = 0  # 0: 없음, 1: +1200도, -1: -1200도
+
+        # AN3- 감지 (중립에서 앞으로 기울임: 127 → <100)
+        if 120 <= self.an3_prev_value <= 134 and current_an3 < 100:  # 중립에서 AN3-로 변화
+            an3_changed = True
+            rotation_direction = 1  # +1200도
+            log_msg = f'[S20/AN3] 🔍 엣지 감지: 중립({self.an3_prev_value}) → AN3-({current_an3}), +{rotation_degrees:.0f}° 회전 명령'
+            self.get_logger().info(log_msg)
+            self.file_logger.info(log_msg)  # 파일에도 저장
+            self.file_log_file_handler.flush()  # 즉시 파일에 기록
+        # AN3+ 감지 (중립에서 아래로 기울임: 127 → >154)
+        elif 120 <= self.an3_prev_value <= 134 and current_an3 > 154:  # 중립에서 AN3+로 변화
+            an3_changed = True
+            rotation_direction = -1  # -1200도
+            log_msg = f'[S20/AN3] 🔍 엣지 감지: 중립({self.an3_prev_value}) → AN3+({current_an3}), -{rotation_degrees:.0f}° 회전 명령'
+            self.get_logger().info(log_msg)
+            self.file_logger.info(log_msg)  # 파일에도 저장
+            self.file_log_file_handler.flush()  # 즉시 파일에 기록
+        
+        if an3_changed:
+            # 명령 간 최소 간격 체크
+            time_since_last = current_time - self.an3_last_command_time
+            if time_since_last < self.an3_command_min_interval:
+                self.get_logger().warning(f'[S20/AN3] ⚠️  명령 간격 너무 짧음 ({time_since_last:.2f}s < {self.an3_command_min_interval}s), 무시')
+                self.an3_prev_value = current_an3
+                return
+            
+            # 현재 위치에서 ±1200도 계산
+            left_current = self.current_positions['left_wheel']
+            right_current = self.current_positions['right_wheel']
+            left_target = left_current - (rotation_direction * rotation_degrees)  # 좌측 모터: 반대 방향
+            right_target = right_current + (rotation_direction * rotation_degrees)  # 우측 모터: 정방향
+
+            direction_str = f"+{rotation_degrees:.0f}°" if rotation_direction > 0 else f"-{rotation_degrees:.0f}°"
+            log_msg = (
+                f'[S20/AN3] 🎯 주행 모터 {direction_str} 회전 명령 (1회): '
+                f'0x141 {left_current:.1f}° → {left_target:.1f}° (변화: {-rotation_direction * rotation_degrees:.1f}°), '
+                f'0x142 {right_current:.1f}° → {right_target:.1f}° (변화: {rotation_direction * rotation_degrees:.1f}°)'
+            )
+            self.get_logger().info(log_msg)
+            self.file_logger.info(log_msg)  # 파일에도 저장
+            self.file_log_file_handler.flush()  # 즉시 파일에 기록
+            
+            # 위치 제어 명령 발행
+            msg_left = Float64MultiArray()
+            msg_left.data = [left_target, 704.0]  # [위치(도), 속도(dps)]
+            self.left_wheel_position_pub.publish(msg_left)
+            log_msg = f'[S20/AN3] 📤 0x141 위치 제어 명령 발행: 목표={left_target:.1f}°, 속도=704.0dps'
+            self.get_logger().info(log_msg)
+            self.file_logger.info(log_msg)  # 파일에도 저장
+            self.file_log_file_handler.flush()  # 즉시 파일에 기록
+            
+            msg_right = Float64MultiArray()
+            msg_right.data = [right_target, 704.0]  # [위치(도), 속도(dps)]
+            self.right_wheel_position_pub.publish(msg_right)
+            log_msg = f'[S20/AN3] 📤 0x142 위치 제어 명령 발행: 목표={right_target:.1f}°, 속도=704.0dps'
+            self.get_logger().info(log_msg)
+            self.file_logger.info(log_msg)  # 파일에도 저장
+            self.file_log_file_handler.flush()  # 즉시 파일에 기록
+
+            # 명령 실행 플래그 설정
+            # 주의: current_positions는 motor_position_callback에서 실제 엔코더 값으로 업데이트됨
+            # 목표값을 저장하지 않음 (실제 위치와 목표 위치가 다르면 다음 명령 계산이 틀어짐)
+            self.an3_last_command_time = current_time
+            self.an3_command_active = True  # 명령 실행 중 플래그 설정 (중립 복귀까지 추가 명령 무시)
+            log_msg = f'[S20/AN3] ✅ 명령 실행 완료, AN3 중립 복귀 대기 중... (현재 AN3={current_an3})'
+            self.get_logger().info(log_msg)
+            self.file_logger.info(log_msg)  # 파일에도 저장
+            self.file_log_file_handler.flush()  # 즉시 파일에 기록
+        
+        self.an3_prev_value = current_an3
+
+    def start_work_sequence(self):
+        """작업 시퀀스 시작: XY 이동 → Z 하강 → 트리거 → Z 상승"""
+        self.work_sequence_active = True
+        self.work_sequence_step = 1
+        
+        # Step 1: XY 이동
+        prev_x_pos = self.current_positions['x']
+        self.current_positions['x'] += 1181.85
+        
+        prev_y_pos = self.current_positions['y']
+        self.current_positions['y'] -= 189.4
+        
+        self.get_logger().info('🔧 ===== 작업 시퀀스 시작 =====')
+        self.get_logger().info(f'📍 Step 1: XY 스테이지 작업 위치로 이동')
+        self.get_logger().info(f'   X: {prev_x_pos:.2f}° → {self.current_positions["x"]:.2f}° (+1181.85°)')
+        self.get_logger().info(f'   Y: {prev_y_pos:.2f}° → {self.current_positions["y"]:.2f}° (-189.4°)')
+        
+        # 위치 제어 명령 전송
+        self.publish_joint_position('x', self.joint2_position_pub)
+        self.publish_joint_position('y', self.joint3_position_pub)
+        
+        # 3초 후 Z축 하강 시작 (XY 이동 완료 대기)
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+        self.work_sequence_timer = self.create_timer(3.0, self._work_sequence_step2_wrapper)
+    
+    def _work_sequence_step2_wrapper(self):
+        """작업 시퀀스 Step 2: Z축 하강"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+        
+        if not self.work_sequence_active or self.work_sequence_step != 1:
+            return
+        
+        self.work_sequence_step = 2
+        
+        # 현재 Z축 위치 저장
+        self.z_work_start_position = self.current_positions['z']
+        
+        # Z축 하강: 현재 위치 - 900° (2.5회전)
+        self.current_positions['z'] -= 900.0
+        
+        self.get_logger().info(f'📍 Step 2: Z축 하강 시작 (400dps)')
+        self.get_logger().info(f'   Z: {self.z_work_start_position:.2f}° → {self.current_positions["z"]:.2f}° (-900°)')
+        
+        # Z축 위치 제어 명령 전송 (속도 400dps 지정)
+        msg = Float64MultiArray()
+        msg.data = [self.current_positions['z'], 400.0]  # [위치, 속도]
+        self.joint4_pub.publish(msg)
+        
+        # Z축 하강 완료는 motor_goal_reached 토픽으로 자동 감지됨
+        # (motor_goal_reached_callback에서 Step 3 트리거 동작 시작)
+    
+    def _work_sequence_step3_wrapper(self):
+        """작업 시퀀스 Step 3: 트리거 동작"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+        
+        if not self.work_sequence_active or self.work_sequence_step != 2:
+            return
+        
+        self.work_sequence_step = 3
+        
+        self.get_logger().info(f'📍 Step 3: 트리거 동작 시작')
+        # trigger_pull() 완료 시 trigger_release()에서 자동으로 Step 4 호출됨
+        self.trigger_pull()
+    
+    def _work_sequence_step4_wrapper(self):
+        """작업 시퀀스 Step 4: Z축 상승 (원위치)"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+
+        if not self.work_sequence_active or self.work_sequence_step != 3:
+            return
+
+        self.work_sequence_step = 4
+
+        # Z축 상승: +900° (원래 위치로)
+        self.current_positions['z'] += 900.0
+
+        self.get_logger().info(f'📍 Step 4: Z축 상승 (원위치, 400dps)')
+        self.get_logger().info(f'   Z: {self.current_positions["z"] - 900.0:.2f}° → {self.current_positions["z"]:.2f}° (+900°)')
+
+        # Z축 위치 제어 명령 전송 (속도 400dps 지정)
+        msg = Float64MultiArray()
+        msg.data = [self.current_positions['z'], 400.0]  # [위치, 속도]
+        self.joint4_pub.publish(msg)
+
+        # Z축 상승 완료는 motor_goal_reached 토픽으로 자동 감지됨
+        # (motor_goal_reached_callback에서 Step 5 X축 이동 시작)
+
+    def _work_sequence_step5_wrapper(self):
+        """작업 시퀀스 Step 5: X축 원점방향 이동"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+
+        if not self.work_sequence_active or self.work_sequence_step != 4:
+            return
+
+        self.work_sequence_step = 5
+
+        # X축 원점방향으로 -920.59° 이동
+        prev_x_pos = self.current_positions['x']
+        self.current_positions['x'] -= 920.59
+
+        self.get_logger().info(f'📍 Step 5: X축 원점방향 이동 (400dps)')
+        self.get_logger().info(f'   X: {prev_x_pos:.2f}° → {self.current_positions["x"]:.2f}° (-920.59°)')
+
+        # X축 위치 제어 명령 전송
+        self.publish_joint_position('x', self.joint2_position_pub)
+
+        # X축 이동 완료는 motor_goal_reached 토픽으로 자동 감지됨
+        # (motor_goal_reached_callback에서 Step 6 Z축 하강 시작)
+
+    def _work_sequence_step6_wrapper(self):
+        """작업 시퀀스 Step 6: Z축 하강 (2차)"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+
+        if not self.work_sequence_active or self.work_sequence_step != 5:
+            return
+
+        self.work_sequence_step = 6
+
+        # 현재 Z축 위치 저장
+        self.z_work_start_position = self.current_positions['z']
+
+        # Z축 하강: 현재 위치 - 900° (2.5회전)
+        self.current_positions['z'] -= 900.0
+
+        self.get_logger().info(f'📍 Step 6: Z축 하강 (2차, 400dps)')
+        self.get_logger().info(f'   Z: {self.z_work_start_position:.2f}° → {self.current_positions["z"]:.2f}° (-900°)')
+
+        # Z축 위치 제어 명령 전송 (속도 400dps 지정)
+        msg = Float64MultiArray()
+        msg.data = [self.current_positions['z'], 400.0]  # [위치, 속도]
+        self.joint4_pub.publish(msg)
+
+        # Z축 하강 완료는 motor_goal_reached 토픽으로 자동 감지됨
+        # (motor_goal_reached_callback에서 Step 7 트리거 동작 시작)
+
+    def _work_sequence_step7_wrapper(self):
+        """작업 시퀀스 Step 7: 트리거 동작 (2차)"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+
+        if not self.work_sequence_active or self.work_sequence_step != 6:
+            return
+
+        self.work_sequence_step = 7
+
+        self.get_logger().info(f'📍 Step 7: 트리거 동작 (2차)')
+        # trigger_pull() 완료 시 trigger_release()에서 자동으로 Step 8 호출됨
+        self.trigger_pull()
+
+    def _work_sequence_step8_wrapper(self):
+        """작업 시퀀스 Step 8: Z축 상승 (2차, 완료)"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+
+        if not self.work_sequence_active or self.work_sequence_step != 7:
+            return
+
+        self.work_sequence_step = 8
+
+        # Z축 상승: +900° (원래 위치로)
+        self.current_positions['z'] += 900.0
+
+        self.get_logger().info(f'📍 Step 8: Z축 상승 (2차, 400dps)')
+        self.get_logger().info(f'   Z: {self.current_positions["z"] - 900.0:.2f}° → {self.current_positions["z"]:.2f}° (+900°)')
+
+        # Z축 위치 제어 명령 전송 (속도 400dps 지정)
+        msg = Float64MultiArray()
+        msg.data = [self.current_positions['z'], 400.0]  # [위치, 속도]
+        self.joint4_pub.publish(msg)
+
+        # Z축 상승 완료는 motor_goal_reached 토픽으로 자동 감지됨
+        # (motor_goal_reached_callback에서 Step 9 XYYaw 이동 시작)
+
+    def _work_sequence_step9_wrapper(self):
+        """작업 시퀀스 Step 9: X/Y/Yaw 3축 동시 이동 (3번째 작업 위치)"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+
+        if not self.work_sequence_active or self.work_sequence_step != 8:
+            return
+
+        self.work_sequence_step = 9
+
+        # X축: 현재 위치에서 -91.39° (홈 방향)
+        prev_x_pos = self.current_positions['x']
+        self.current_positions['x'] -= 91.39
+
+        # Y축: 현재 위치에서 -1036.58° (호밍 반대 방향)
+        prev_y_pos = self.current_positions['y']
+        self.current_positions['y'] -= 1036.58
+
+        # Yaw축: 현재 위치에서 -260°
+        prev_yaw_pos = self.current_positions['yaw']
+        self.current_positions['yaw'] -= 260.0
+
+        self.get_logger().info(f'📍 Step 9: X/Y/Yaw 3축 동시 이동 (3번째 작업 위치, 400dps)')
+        self.get_logger().info(f'   X: {prev_x_pos:.2f}° → {self.current_positions["x"]:.2f}° (-91.39°)')
+        self.get_logger().info(f'   Y: {prev_y_pos:.2f}° → {self.current_positions["y"]:.2f}° (-1036.58°)')
+        self.get_logger().info(f'   Yaw: {prev_yaw_pos:.2f}° → {self.current_positions["yaw"]:.2f}° (-260.0°)')
+
+        # 위치 제어 명령 전송 (3축 동시, 속도 400dps 명시)
+        # X축
+        msg_x = Float64MultiArray()
+        msg_x.data = [self.current_positions['x'], 400.0]
+        self.joint2_position_pub.publish(msg_x)
+        self.get_logger().info(f'📍 X: {self.current_positions["x"]:.2f}° (400dps)')
+
+        # Y축
+        msg_y = Float64MultiArray()
+        msg_y.data = [self.current_positions['y'], 400.0]
+        self.joint3_position_pub.publish(msg_y)
+        self.get_logger().info(f'📍 Y: {self.current_positions["y"]:.2f}° (400dps)')
+
+        # Yaw축
+        msg_yaw = Float64MultiArray()
+        msg_yaw.data = [self.current_positions['yaw'], 400.0]
+        self.joint5_pub.publish(msg_yaw)
+        self.get_logger().info(f'📍 Yaw: {self.current_positions["yaw"]:.2f}° (400dps)')
+
+        # 3축 이동 완료 확인을 위한 플래그 초기화
+        if not hasattr(self, 'step9_completed_motors'):
+            self.step9_completed_motors = set()
+        self.step9_completed_motors.clear()
+
+        # 모든 축 이동 완료는 motor_goal_reached 토픽으로 자동 감지됨
+        # (motor_goal_reached_callback에서 3축 모두 완료 시 Step 10 시작)
+
+    def _work_sequence_step10_wrapper(self):
+        """작업 시퀀스 Step 10: Z축 하강 (3차)"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+
+        if not self.work_sequence_active or self.work_sequence_step != 9:
+            return
+
+        self.work_sequence_step = 10
+
+        # 현재 Z축 위치 저장
+        self.z_work_start_position = self.current_positions['z']
+
+        # Z축 하강: 현재 위치 - 900° (2.5회전)
+        self.current_positions['z'] -= 900.0
+
+        self.get_logger().info(f'📍 Step 10: Z축 하강 (3차, 400dps)')
+        self.get_logger().info(f'   Z: {self.z_work_start_position:.2f}° → {self.current_positions["z"]:.2f}° (-900°)')
+
+        # Z축 위치 제어 명령 전송 (속도 400dps 지정)
+        msg = Float64MultiArray()
+        msg.data = [self.current_positions['z'], 400.0]  # [위치, 속도]
+        self.joint4_pub.publish(msg)
+
+        # Z축 하강 완료는 motor_goal_reached 토픽으로 자동 감지됨
+        # (motor_goal_reached_callback에서 Step 11 트리거 동작 시작)
+
+    def _work_sequence_step11_wrapper(self):
+        """작업 시퀀스 Step 11: 트리거 동작 (3차)"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+
+        if not self.work_sequence_active or self.work_sequence_step != 10:
+            return
+
+        self.work_sequence_step = 11
+
+        self.get_logger().info(f'📍 Step 11: 트리거 동작 (3차)')
+        # trigger_pull() 완료 시 trigger_release()에서 자동으로 Step 12 호출됨
+        self.trigger_pull()
+
+    def _work_sequence_step12_wrapper(self):
+        """작업 시퀀스 Step 12: Z축 상승 (3차, 완료)"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+
+        if not self.work_sequence_active or self.work_sequence_step != 11:
+            return
+
+        self.work_sequence_step = 12
+
+        # Z축 상승: +900° (원래 위치로)
+        self.current_positions['z'] += 900.0
+
+        self.get_logger().info(f'📍 Step 12: Z축 상승 (3차, 400dps)')
+        self.get_logger().info(f'   Z: {self.current_positions["z"] - 900.0:.2f}° → {self.current_positions["z"]:.2f}° (+900°)')
+
+        # Z축 위치 제어 명령 전송 (속도 400dps 지정)
+        msg = Float64MultiArray()
+        msg.data = [self.current_positions['z'], 400.0]  # [위치, 속도]
+        self.joint4_pub.publish(msg)
+
+        # Z축 상승 완료는 motor_goal_reached 토픽으로 자동 감지됨
+        # (motor_goal_reached_callback에서 Step 13으로 진행)
+
+    def _work_sequence_step13_wrapper(self):
+        """작업 시퀀스 Step 13: X/Y 2축 동시 이동 (4번째 작업 위치, Yaw 변화 없음)"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+
+        if not self.work_sequence_active or self.work_sequence_step != 12:
+            return
+
+        self.work_sequence_step = 13
+
+        # X축: 현재 위치에서 +884.22° (홈 방향)
+        prev_x_pos = self.current_positions['x']
+        self.current_positions['x'] += 884.22
+
+        # Y축: 현재 위치에서 -11.54° (호밍 반대 방향)
+        prev_y_pos = self.current_positions['y']
+        self.current_positions['y'] -= 11.54
+
+        self.get_logger().info(f'📍 Step 13: X/Y 2축 동시 이동 (4번째 작업 위치, 400dps)')
+        self.get_logger().info(f'   X: {prev_x_pos:.2f}° → {self.current_positions["x"]:.2f}° (+884.22°)')
+        self.get_logger().info(f'   Y: {prev_y_pos:.2f}° → {self.current_positions["y"]:.2f}° (-11.54°)')
+        self.get_logger().info(f'   Yaw: 변화 없음')
+
+        # 위치 제어 명령 전송 (2축 동시, 속도 400dps 명시)
+        # X축
+        msg_x = Float64MultiArray()
+        msg_x.data = [self.current_positions['x'], 400.0]
+        self.joint2_position_pub.publish(msg_x)
+        self.get_logger().info(f'📍 X: {self.current_positions["x"]:.2f}° (400dps)')
+
+        # Y축
+        msg_y = Float64MultiArray()
+        msg_y.data = [self.current_positions['y'], 400.0]
+        self.joint3_position_pub.publish(msg_y)
+        self.get_logger().info(f'📍 Y: {self.current_positions["y"]:.2f}° (400dps)')
+
+        # 2축 이동 완료 확인을 위한 플래그 초기화
+        if not hasattr(self, 'step13_completed_motors'):
+            self.step13_completed_motors = set()
+        self.step13_completed_motors.clear()
+
+        # 모든 축 이동 완료는 motor_goal_reached 토픽으로 자동 감지됨
+        # (motor_goal_reached_callback에서 2축 모두 완료 시 Step 14 시작)
+
+    def _work_sequence_step14_wrapper(self):
+        """작업 시퀀스 Step 14: Z축 하강 (4차)"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+
+        if not self.work_sequence_active or self.work_sequence_step != 13:
+            return
+
+        self.work_sequence_step = 14
+
+        # 현재 Z축 위치 저장
+        self.z_work_start_position = self.current_positions['z']
+
+        # Z축 하강: 현재 위치 - 900° (2.5회전)
+        self.current_positions['z'] -= 900.0
+
+        self.get_logger().info(f'📍 Step 14: Z축 하강 (4차, 400dps)')
+        self.get_logger().info(f'   Z: {self.z_work_start_position:.2f}° → {self.current_positions["z"]:.2f}° (-900°)')
+
+        # Z축 위치 제어 명령 전송 (속도 400dps 지정)
+        msg = Float64MultiArray()
+        msg.data = [self.current_positions['z'], 400.0]  # [위치, 속도]
+        self.joint4_pub.publish(msg)
+
+        # Z축 하강 완료는 motor_goal_reached 토픽으로 자동 감지됨
+        # (motor_goal_reached_callback에서 트리거 동작 시작)
+
+    def _work_sequence_step15_wrapper(self):
+        """작업 시퀀스 Step 15: 트리거 동작 (4차)"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+
+        if not self.work_sequence_active or self.work_sequence_step != 14:
+            return
+
+        self.work_sequence_step = 15
+
+        self.get_logger().info(f'📍 Step 15: 트리거 동작 (4차)')
+
+        # 트리거 당기기
+        self.trigger_pull()
+
+        # 트리거 완료 후 자동으로 Step 16 (Z축 상승)으로 진행
+        # (trigger_release()에서 처리)
+
+    def _work_sequence_step16_wrapper(self):
+        """작업 시퀀스 Step 16: Z축 상승 (4차, 완료)"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+
+        if not self.work_sequence_active or self.work_sequence_step != 15:
+            return
+
+        self.work_sequence_step = 16
+
+        # Z축 상승: +900° (원래 위치로)
+        self.current_positions['z'] += 900.0
+
+        self.get_logger().info(f'📍 Step 16: Z축 상승 (4차, 완료, 400dps)')
+        self.get_logger().info(f'   Z: {self.current_positions["z"] - 900.0:.2f}° → {self.current_positions["z"]:.2f}° (+900°)')
+
+        # Z축 위치 제어 명령 전송 (속도 400dps 지정)
+        msg = Float64MultiArray()
+        msg.data = [self.current_positions['z'], 400.0]  # [위치, 속도]
+        self.joint4_pub.publish(msg)
+
+        # Z축 상승 완료는 motor_goal_reached 토픽으로 자동 감지됨
+        # (motor_goal_reached_callback에서 작업 완료 처리)
+
+    def _work_sequence_complete_wrapper(self):
+        """작업 시퀀스 완료"""
+        if hasattr(self, 'work_sequence_timer') and self.work_sequence_timer:
+            self.work_sequence_timer.cancel()
+            self.work_sequence_timer = None
+        
+        if not self.work_sequence_active:
+            return
+        
+        self.get_logger().info('✅ ===== 작업 시퀀스 완료 =====')
+        self.work_sequence_active = False
+        self.work_sequence_step = 0
+        self.z_work_start_position = None
     
     def handle_driving(self):
-        """주행 제어 (AN3: 좌우회전, AN4: 전후진)"""
+        """주행 제어 (AN3: 전후진, AN4: 좌우회전) - 좌우 모터 180도 반대 설치로 인한 방향 보정"""
         # 홈잉 중일 때는 조이스틱 제어 무시
         if self.homing_active:
             return
 
-        # AN4: 전후진 (AN4+ = 전진, AN4- = 후진)
+        # AN3: 전후진 (좌우 모터가 180도 반대로 설치되어있음)
+        # AN3- -> 전진, AN3+ -> 후진
         linear = self.normalize_joystick(self.joystick_data['AN4'])
 
-        # AN3: 좌우회전 (AN3- = 좌회전, AN3+ = 우회전)
-        angular = self.normalize_joystick(self.joystick_data['AN3'])
+        # AN4: 좌우회전 (좌우 모터가 180도 반대로 설치되어 있어서)
+        # AN4+ -> CCW, AN4- -> CW 로 로봇이 움직임
+        angular = -self.normalize_joystick(self.joystick_data['AN3'])
         
         # 로그: 조이스틱 RAW 값 (DEBUG 모드만)
         if self.debug_mode and (abs(linear) > 0.01 or abs(angular) > 0.01):
             self.get_logger().debug(
-                f'Joystick: AN3={self.joystick_data["AN3"]}, AN4={self.joystick_data["AN4"]}, '
+                f'Joystick: AN3={self.joystick_data["AN3"]}(linear, 전후진: AN3-=전진), AN4={self.joystick_data["AN4"]}(angular, 좌우회전: AN4+=CCW), '
                 f'linear={linear:.3f}, angular={angular:.3f}'
             )
         
@@ -490,10 +1262,12 @@ class IronMDTeleopNode(Node):
         if (abs(linear - self.last_cmd_sent['linear']) > 0.01 or
             abs(angular - self.last_cmd_sent['angular']) > 0.01):
             twist = Twist()
-            # AN4(전후진): 기존 회전 속도 적용 (절반 속도)
-            twist.linear.x = linear * self.max_linear * 0.5
-            # AN3(좌우회전): 기존 전후진 속도 적용 (전체 속도)
-            twist.angular.z = angular * self.max_linear
+            # AN3(전후진): 전체 속도 (12.5% 감속) - AN3- = 전진, AN3+ = 후진 (좌우 모터 180도 반대 설치)
+            # 실제로는 AN4 값을 사용하지만 주석은 AN3로 표기 (좌우 모터 180도 반대 설치)
+            twist.linear.x = linear * self.max_linear * 0.125
+            # AN4(좌우회전): 각속도 - AN4+ = CCW, AN4- = CW (좌우 모터 180도 반대 설치)
+            # 실제로는 AN3 값을 사용하지만 주석은 AN4로 표기 (좌우 모터 180도 반대 설치)
+            twist.angular.z = angular * self.max_angular
             
             # 로그: ROS2 토픽 발행 (DEBUG 모드만)
             if self.debug_mode and (abs(linear) > 0.01 or abs(angular) > 0.01):
@@ -635,43 +1409,43 @@ class IronMDTeleopNode(Node):
         if self.switch_pressed('S17'):
             # 양의 방향 360도 회전
             self.current_positions['lateral'] += 360.0  # degree
-            self.publish_joint_position('lateral', self.joint1_pub)  # joint_1 = 0x143
+            self.publish_joint_position('lateral', self.joint1_pub, speed=150.0)  # 0x143 속도 낮춤 (과부하 방지)
             self.get_logger().info(f'>> 횡이동 +360도 (0x143, 누적: {self.current_positions["lateral"]:.1f}도)')
 
         elif self.switch_pressed('S18'):
             # 음의 방향 360도 회전
             self.current_positions['lateral'] -= 360.0  # degree
-            self.publish_joint_position('lateral', self.joint1_pub)  # joint_1 = 0x143
+            self.publish_joint_position('lateral', self.joint1_pub, speed=150.0)  # 0x143 속도 낮춤 (과부하 방지)
             self.get_logger().info(f'<< 횡이동 -360도 (0x143, 누적: {self.current_positions["lateral"]:.1f}도)')
 
     def handle_work_sequence(self):
-        """Z축 제어 (S21: 홈→하강→닫힘, S22: 트리거→열림→상승) 0x146"""
+        """Z축 작업 시퀀스 (S21: 하강→닫힘, S22: 트리거→상승→열림) 0x146 - S19(Remote) 모드 전용"""
         # 홈잉 중일 때는 Z축 제어 무시
         if self.homing_active:
             return
 
+        # S19(Remote) 모드에서만 S21/S22로 작업 시퀀스 제어
+        # S20(Auto) 모드에서는 S21/S22가 횡이동 회전으로 사용되므로 여기서 처리 안 함
+
         if self.switch_pressed('S21'):
             self.get_logger().info('[DEBUG] S21 button pressed detected!')
-            # S21 시퀀스 시작: 그리퍼 Home -> Z축 하강 -> 그리퍼 닫기
+            # S21 시퀀스: Z축 하강 → 그리퍼 닫기 (그리퍼는 이미 열려있다고 가정)
+            # 주의: S21 실행 전 그리퍼를 미리 열어놓아야 함!
             if not self.s21_sequence_active:
                 self.s21_sequence_active = True
                 self.s21_sequence_step = 0
 
-                # 1. 그리퍼 Home 명령
-                self.get_logger().info('[S21 Sequence] 1단계: Gripper Home command')
-                gripper_cmd = Int32()
-                gripper_cmd.data = 3  # DRV_CMD_HOME
-                self.gripper_cmd_pub.publish(gripper_cmd)
-                self.get_logger().info(f'  -> Published /gripper/command: {gripper_cmd.data} (HOME)')
-
-                # 2초 후 Z축 하강 (그리퍼 Home 완료 대기)
-                self.s21_sequence_timer = self.create_timer(2.0, self.s21_sequence_move_down)
+                self.get_logger().info('[S21 Sequence] Z축 하강 시작 (그리퍼 열린 상태 가정)')
+                self.get_logger().info('  ⚠️  그리퍼가 닫혀있다면 먼저 열어주세요!')
+                
+                # Z축 하강만 실행 (그리퍼는 건드리지 않음)
+                self.s21_sequence_move_down()
             else:
                 self.get_logger().warning('WARNING: S21 sequence already in progress')
 
         elif self.switch_pressed('S22'):
             self.get_logger().info('[DEBUG] S22 button pressed detected!')
-            # S22 시퀀스 시작: 트리거 -> 그리퍼 열기 -> Z축 상승
+            # S22 시퀀스: 트리거 → Z축 상승 → 그리퍼 열기(유지)
             if not self.s22_sequence_active:
                 self.s22_sequence_active = True
                 self.s22_sequence_step = 0
@@ -680,98 +1454,104 @@ class IronMDTeleopNode(Node):
                 self.get_logger().info('[S22 Sequence] 1단계: 트리거 동작 시작')
                 self.trigger_pull()
 
-                # 3초 후 그리퍼 열기 (트리거 완료 대기: 1초 당김 + 1초 되돌림 + 1초 여유)
-                self.s22_sequence_timer = self.create_timer(3.0, self.s22_sequence_open_gripper)
+                # 3초 후 Z축 상승 (트리거 완료 대기: 1초 당김 + 1초 되돌림 + 1초 여유)
+                self.s22_sequence_timer = self.create_timer(3.0, self.s22_sequence_move_up)
             else:
                 self.get_logger().warning('WARNING: S22 sequence already in progress')
     
     def s21_sequence_move_down(self):
-        """S21 시퀀스 2단계: Z축 하강"""
+        """S21 시퀀스: Z축 하강만 실행 (그리퍼는 건드리지 않음)"""
         if self.s21_sequence_timer:
             self.s21_sequence_timer.cancel()
             self.s21_sequence_timer = None
 
-        # 2단계: Z축 음의 방향 1.5회전 (540도) 하강
+        # Z축 하강 시작 (그리퍼는 이미 열려있다고 가정, 추가 명령 없음)
         self.z_moving_down = True
         self.z_moving_to_limit = False
-        self.current_positions['z'] -= 540.0  # degree
+        self.current_positions['z'] -= 900.0  # degree
         self.publish_joint_position('z', self.joint4_pub)  # joint_4 = 0x146
-        self.get_logger().info(f'[S21 Sequence] 2단계: Z축 -1.5회전(540°) 하강 (0x146, 누적: {self.current_positions["z"]:.1f}도)')
+        self.get_logger().info(f'[S21 Sequence] Z축 -약 2.5회전(900°) 하강 시작 (0x146, 누적: {self.current_positions["z"]:.1f}도)')
+        self.get_logger().info('  그리퍼는 열린 상태 유지 (명령 없음)')
 
-        # 3.5초 후 그리퍼 닫기 (하강 완료 대기: 1.5배 빠른 속도 고려)
-        self.s21_sequence_timer = self.create_timer(3.5, self.s21_sequence_gripper_close)
+        # 6.0초 후 그리퍼 닫기 (하강 완료 대기: 900도 하강 시간 고려, 150dps 속도 기준 약 6초)
+        self.s21_sequence_timer = self.create_timer(6.0, self.s21_sequence_gripper_close)
 
     def s21_sequence_gripper_close(self):
-        """S21 시퀀스 3단계: 그리퍼 완전히 닫기"""
+        """S21 시퀀스: 하강 완료 후 그리퍼 닫기"""
         if self.s21_sequence_timer:
             self.s21_sequence_timer.cancel()
             self.s21_sequence_timer = None
 
-        self.get_logger().info('[S21 Sequence] 3단계: Gripper close command')
+        self.get_logger().info('[S21 Sequence] 하강 완료 → 그리퍼 닫기')
 
-        # 그리퍼 완전히 닫기 (1.0 = 완전 닫힘)
-        gripper_msg = Float32()
-        gripper_msg.data = 1.0
-        self.gripper_pos_pub.publish(gripper_msg)
-        self.get_logger().info(f'  -> Published /gripper/position: {gripper_msg.data}')
+        # 그리퍼 닫기 명령: g 5 -600 -> 0x5DA8 = 23976
+        close_cmd = Int32()
+        close_cmd.data = 23976  # Command 5, Speed -600 (g 5 -600)
+        self.gripper_cmd_pub.publish(close_cmd)
+        self.get_logger().info('  -> Published /gripper/command: 23976 (g 5 -600 - CLOSE)')
 
         # 시퀀스 완료
         self.s21_sequence_active = False
         self.z_moving_down = False
-        self.get_logger().info('[S21 Sequence] Complete - Gripper stays closed')
-
-    def s22_sequence_open_gripper(self):
-        """S22 시퀀스 2단계: 그리퍼 완전히 열기"""
-        if self.s22_sequence_timer:
-            self.s22_sequence_timer.cancel()
-            self.s22_sequence_timer = None
-
-        self.get_logger().info('[S22 Sequence] 2단계: Gripper open command')
-
-        # 그리퍼 완전히 열기 (0.0 = 완전 열림)
-        gripper_msg = Float32()
-        gripper_msg.data = 0.0
-        self.gripper_pos_pub.publish(gripper_msg)
-        self.get_logger().info(f'  -> Published /gripper/position: {gripper_msg.data}')
-
-        # 2초 후 Z축 상승 (그리퍼 열림 완료 대기)
-        self.s22_sequence_timer = self.create_timer(2.0, self.s22_sequence_move_up)
+        self.get_logger().info('[S21 Sequence] ✅ Complete')
 
     def s22_sequence_move_up(self):
-        """S22 시퀀스 3단계: Z축 상승"""
+        """S22 시퀀스 2단계: Z축 상승"""
         if self.s22_sequence_timer:
             self.s22_sequence_timer.cancel()
             self.s22_sequence_timer = None
 
-        # 3단계: Z축 원점 리미트까지 상승
+        # 2단계: Z축 원점 리미트까지 상승
         self.z_moving_down = False
         self.z_moving_to_limit = True
         self.current_positions['z'] += 3600.0  # degree (충분히 큰 값)
         self.publish_joint_position('z', self.joint4_pub)  # joint_4 = 0x146
-        self.get_logger().info(f'[S22 Sequence] 3단계: Z-axis to home 리미트까지 상승 (0x146, IN05 감지 대기)')
+        self.get_logger().info(f'[S22 Sequence] 2단계: Z축 상승 시작 (0x146, IN05 감지 대기)')
 
-        # 시퀀스 완료
+        # 8초 후 그리퍼 열기 (Z축 상승 완료 대기)
+        self.s22_sequence_timer = self.create_timer(8.0, self.s22_sequence_open_gripper)
+
+    def s22_sequence_open_gripper(self):
+        """S22 시퀀스 3단계: 그리퍼 열기 (열린 상태 유지)"""
+        if self.s22_sequence_timer:
+            self.s22_sequence_timer.cancel()
+            self.s22_sequence_timer = None
+
+        self.get_logger().info('[S22 Sequence] 3단계: 그리퍼 열기')
+
+        # 그리퍼 열기 명령: g 5 600 -> 0x5258 = 21080
+        open_cmd = Int32()
+        open_cmd.data = 21080  # Command 5, Speed +600 (g 5 600)
+        self.gripper_cmd_pub.publish(open_cmd)
+        self.get_logger().info('  -> Published /gripper/command: 21080 (g 5 600 - OPEN)')
+
+        # 시퀀스 완료 (그리퍼는 열린 상태 유지)
         self.s22_sequence_active = False
-        self.get_logger().info('[S22 Sequence] Complete')
+        self.get_logger().info('[S22 Sequence] ✅ Complete - 그리퍼 열린 상태 유지')
 
     
     def handle_yaw_rotation(self):
-        """Yaw 회전 제어 (S23: +30°, S24: -30°) 0x147"""
+        """Yaw 회전 제어 (S23: +yaw_angle, S24: -yaw_angle) 0x147 - S19(Manual) 모드 전용"""
         # 홈잉 중일 때는 Yaw 제어 무시
         if self.homing_active:
             return
-        
+
+        # S19(Remote) 모드에서만 S23/S24로 Yaw 제어
+        # S20(Auto) 모드에서는 S23이 호밍으로 사용되므로 여기서 처리 안 함
+
         if self.switch_pressed('S23'):
-            # 양의 방향 30도 회전 (0x143과 동일한 방식)
+            # 양의 방향 30도 회전
+            prev_yaw = self.current_positions['yaw']
             self.current_positions['yaw'] += self.yaw_angle  # degree 단위 직접 처리
-            self.publish_joint_position('yaw', self.joint5_pub)  # joint_5 = 0x147
-            self.get_logger().info(f'↻  Yaw +30° (0x147, 누적: {self.current_positions["yaw"]:.1f}도)')
-        
+            self.get_logger().info(f'↻  Yaw +{self.yaw_angle:.1f}° (0x147, {prev_yaw:.1f}° → {self.current_positions["yaw"]:.1f}°)')
+            self.publish_joint_position('yaw', self.joint5_pub, show_log=False)  # joint_5 = 0x147
+
         elif self.switch_pressed('S24'):
-            # 음의 방향 30도 회전 (0x143과 동일한 방식)
+            # 음의 방향 30도 회전
+            prev_yaw = self.current_positions['yaw']
             self.current_positions['yaw'] -= self.yaw_angle  # degree 단위 직접 처리
-            self.publish_joint_position('yaw', self.joint5_pub)  # joint_5 = 0x147
-            self.get_logger().info(f'↺  Yaw -30° (0x147, 누적: {self.current_positions["yaw"]:.1f}도)')
+            self.get_logger().info(f'↺  Yaw -{self.yaw_angle:.1f}° (0x147, {prev_yaw:.1f}° → {self.current_positions["yaw"]:.1f}°)')
+            self.publish_joint_position('yaw', self.joint5_pub, show_log=False)  # joint_5 = 0x147
     
     def handle_brake_release(self):
         """브레이크 해제/잠금 토글 (S13) - 위치제어 모터 0x143-0x147"""
@@ -810,35 +1590,87 @@ class IronMDTeleopNode(Node):
 
                 # 브레이크 해제 시 초기 위치 읽기 플래그 리셋
                 if action_name == '해제':
-                    self.initial_position_read = {'lateral': False, 'z': False, 'yaw': False}
-                    self.get_logger().info('📍 모터 초기 위치 읽는 중... (1초 대기)')
+                    self.initial_position_read = {'lateral': False, 'z': False, 'yaw': False, 'x': False, 'y': False, 'left_wheel': False, 'right_wheel': False}
+                    self.get_logger().info('📍 모터 초기 위치 읽는 중... (1.5초 대기)')
+
+                    # 1.5초 후 엔코더 위치 출력 (수동 취소 방식)
+                    if hasattr(self, 'encoder_display_timer') and self.encoder_display_timer:
+                        self.encoder_display_timer.cancel()
+                    self.encoder_display_timer = self.create_timer(1.5, self._display_encoder_positions_wrapper)
             else:
                 self.get_logger().warning(f'WARNING: Brake {action_name} 실패: {response.message}')
         except Exception as e:
             self.get_logger().error(f'❌ 브레이크 {action_name} 서비스 오류: {e}')
 
     def motor_position_callback(self, msg: Float32, motor_type: str):
-        """모터 위치 콜백 (0x143: lateral, 0x146: z, 0x147: yaw)"""
-        # 항상 현재 위치 업데이트
-        if motor_type == 'lateral':
-            self.current_positions['lateral'] = msg.data
-            # 초기 위치 읽기 완료 로그 (한 번만)
+        """모터 위치 콜백 (0x143: lateral, 0x144: x, 0x145: y, 0x146: z, 0x147: yaw, 0x141: left_wheel, 0x142: right_wheel)"""
+        # 초기 위치만 읽고, 이후에는 피드백으로 위치를 덮어쓰지 않음 (누적 오류 방지)
+        if motor_type == 'left_wheel':
+            # 주행 모터 0x141 위치 업데이트 (S20 모드에서 사용)
+            prev_pos = self.current_positions['left_wheel']
+            self.current_positions['left_wheel'] = msg.data
+            log_msg = f'🔄 [S20/AN3] 0x141 위치 업데이트: {prev_pos:.1f}° → {msg.data:.1f}° (변화: {msg.data - prev_pos:.1f}°)'
+            self.get_logger().info(log_msg)
+            self.file_logger.info(log_msg)
+            self.file_log_file_handler.flush()
+        elif motor_type == 'right_wheel':
+            # 주행 모터 0x142 위치 업데이트 (S20 모드에서 사용)
+            prev_pos = self.current_positions['right_wheel']
+            self.current_positions['right_wheel'] = msg.data
+            log_msg = f'🔄 [S20/AN3] 0x142 위치 업데이트: {prev_pos:.1f}° → {msg.data:.1f}° (변화: {msg.data - prev_pos:.1f}°)'
+            self.get_logger().info(log_msg)
+            self.file_logger.info(log_msg)
+            self.file_log_file_handler.flush()
+        elif motor_type == 'lateral':
+            # 초기 위치 읽기 (브레이크 해제 직후 한 번만)
             if not self.initial_position_read[motor_type] and self.brake_released:
+                self.current_positions['lateral'] = msg.data
                 self.get_logger().info(f'✅ 0x143 (lateral) 초기 위치 읽기 완료: {msg.data:.1f}°')
                 self.initial_position_read[motor_type] = True
+        elif motor_type == 'x':
+            # 초기 위치 읽기 (브레이크 해제 or 호밍 완료 직후)
+            if not self.initial_position_read[motor_type]:
+                self.current_positions['x'] = msg.data
+                self.get_logger().info(f'✅ 0x144 (X축) 초기 위치 읽기 완료: {msg.data:.1f}°')
+                self.initial_position_read[motor_type] = True
+        elif motor_type == 'y':
+            # 초기 위치 읽기 (브레이크 해제 or 호밍 완료 직후)
+            if not self.initial_position_read[motor_type]:
+                self.current_positions['y'] = msg.data
+                self.get_logger().info(f'✅ 0x145 (Y축) 초기 위치 읽기 완료: {msg.data:.1f}°')
+                self.initial_position_read[motor_type] = True
         elif motor_type == 'z':
-            self.current_positions['z'] = msg.data
-            # 초기 위치 읽기 완료 로그 (한 번만)
-            if not self.initial_position_read[motor_type] and self.brake_released:
-                self.get_logger().info(f'✅ 0x146 (z) 초기 위치 읽기 완료: {msg.data:.1f}°')
+            # 초기 위치 읽기 (브레이크 해제 or 호밍 완료 직후)
+            if not self.initial_position_read[motor_type]:
+                self.current_positions['z'] = msg.data
+                self.get_logger().info(f'✅ 0x146 (Z축) 초기 위치 읽기 완료: {msg.data:.1f}°')
                 self.initial_position_read[motor_type] = True
         elif motor_type == 'yaw':
-            self.current_positions['yaw'] = msg.data
-            # 초기 위치 읽기 완료 로그 (한 번만)
-            if not self.initial_position_read[motor_type] and self.brake_released:
+            # 초기 위치 읽기 (브레이크 해제 or 호밍 완료 직후)
+            if not self.initial_position_read[motor_type]:
+                self.current_positions['yaw'] = msg.data
                 self.get_logger().info(f'✅ 0x147 (yaw) 초기 위치 읽기 완료: {msg.data:.1f}°')
                 self.initial_position_read[motor_type] = True
-    
+
+    def _display_encoder_positions_wrapper(self):
+        """엔코더 위치 출력 래퍼 (타이머 자동 취소)"""
+        if hasattr(self, 'encoder_display_timer') and self.encoder_display_timer:
+            self.encoder_display_timer.cancel()
+            self.encoder_display_timer = None
+        self.display_encoder_positions()
+
+    def display_encoder_positions(self):
+        """현재 엔코더 위치 출력 (브레이크 해제 후 자동 호출)"""
+        self.get_logger().info('=' * 60)
+        self.get_logger().info('📍 ===== 현재 모터 엔코더 위치 =====')
+        self.get_logger().info('=' * 60)
+        self.get_logger().info(f'  0x143 (횡이동): {self.current_positions["lateral"]:.2f}°')
+        self.get_logger().info(f'  0x144 (X축): {self.current_positions["x"]:.2f}°')
+        self.get_logger().info(f'  0x145 (Y축): {self.current_positions["y"]:.2f}°')
+        self.get_logger().info(f'  0x146 (Z축): {self.current_positions["z"]:.2f}°')
+        self.get_logger().info(f'  0x147 (Yaw): {self.current_positions["yaw"]:.2f}°')
+        self.get_logger().info('=' * 60)
+
     def limit_sensor_in05_callback(self, msg: Bool):
         """EZI-IO IN05 리미트 센서 콜백 (Z축 상단 리미트)"""
         prev_state = self.limit_sensor_in05
@@ -855,6 +1687,9 @@ class IronMDTeleopNode(Node):
             self.z_moving_to_limit = False
             # 0x146 모터에 긴급 정지 명령 전송 (CAN2를 통해)
             self.send_motor_emergency_stop(0x146)
+            # Z축 위치를 원점(0도)으로 리셋
+            self.current_positions['z'] = 0.0
+            self.get_logger().info('🏠 Z축 위치 원점(0°)으로 리셋')
     
     def limit_sensor_in06_callback(self, msg: Bool):
         """EZI-IO IN06 리미트 센서 콜백 (Z축 하단 리미트)"""
@@ -898,13 +1733,18 @@ class IronMDTeleopNode(Node):
             status = "ON (감지됨)" if self.limit_sensor_in01 else "OFF"
             self.get_logger().info(f'🟡 IN01 리미트 센서 (Y축 최대): {status}')
 
-        # 센서 ON되면 0x145 긴급 정지
+        # 스테이지 호밍 중이면 호밍 완료 체크
+        if self.stage_homing_active:
+            self.check_stage_homing_complete()
+            return
+
+        # 일반 동작 중 센서 ON되면 0x145 긴급 정지
         if self.limit_sensor_in01 and not prev_state:
             self.get_logger().warning('WARNING: IN01 detected! 0x145 긴급 정지')
             self.send_motor_emergency_stop(0x145)
 
     def limit_sensor_in02_callback(self, msg: Bool):
-        """EZI-IO IN02 리미트 센서 콜백 (X축 홈 리미트, 0x144 후진 제한)"""
+        """EZI-IO IN02 리미트 센서 콜백 (X축 홈 리미트, 0x144)"""
         prev_state = self.limit_sensor_in02
         self.limit_sensor_in02 = msg.data
 
@@ -913,12 +1753,17 @@ class IronMDTeleopNode(Node):
             status = "ON (감지됨)" if self.limit_sensor_in02 else "OFF"
             self.get_logger().info(f'🟢 IN02 리미트 센서 (X축 홈): {status}')
 
-        # 센서 ON되면 0x144 긴급 정지 (홈잉 중이 아닐 때)
-        if self.limit_sensor_in02 and not prev_state and not self.homing_active:
+        # 스테이지 호밍 중이면 호밍 완료 체크
+        if self.stage_homing_active:
+            self.check_stage_homing_complete()
+            return
+
+        # 일반 동작 중 센서 ON되면 0x144 긴급 정지
+        if self.limit_sensor_in02 and not prev_state:
             self.get_logger().warning('WARNING: IN02 detected! 0x144 긴급 정지')
             self.send_motor_emergency_stop(0x144)
 
-        # 홈잉 중일 때 센서 상태에 따라 처리
+        # 드라이브 모터 홈잉 중일 때 센서 상태에 따라 처리
         if not self.homing_active:
             return
 
@@ -959,7 +1804,7 @@ class IronMDTeleopNode(Node):
                 self.get_logger().info('🏠 홈잉 완료!')
 
     def limit_sensor_in03_callback(self, msg: Bool):
-        """EZI-IO IN03 리미트 센서 콜백 (X축 최대 리미트, 0x144 전진 제한)"""
+        """EZI-IO IN03 리미트 센서 콜백 (X축 최대 리미트, 0x144)"""
         prev_state = self.limit_sensor_in03
         self.limit_sensor_in03 = msg.data
 
@@ -968,10 +1813,105 @@ class IronMDTeleopNode(Node):
             status = "ON (감지됨)" if self.limit_sensor_in03 else "OFF"
             self.get_logger().info(f'🟡 IN03 리미트 센서 (X축 최대): {status}')
 
-        # 센서 ON되면 0x144 긴급 정지
+        # 일반 동작 중 센서 ON되면 0x144 긴급 정지
         if self.limit_sensor_in03 and not prev_state:
             self.get_logger().warning('WARNING: IN03 detected! 0x144 긴급 정지')
             self.send_motor_emergency_stop(0x144)
+
+    def limit_sensor_in04_callback(self, msg: Bool):
+        """EZI-IO IN04 리미트 센서 콜백 (Yaw 홈 리미트, 0x147)"""
+        prev_state = self.limit_sensor_in04
+        self.limit_sensor_in04 = msg.data
+
+        # 센서 상태 변화 시 로그 출력
+        if prev_state != self.limit_sensor_in04:
+            status = "ON (감지됨)" if self.limit_sensor_in04 else "OFF"
+            self.get_logger().info(f'🔵 IN04 리미트 센서 (Yaw 홈): {status}')
+
+        # 스테이지 호밍 중이면 호밍 완료 체크
+        if self.stage_homing_active:
+            self.check_stage_homing_complete()
+            return
+
+        # 일반 동작 중 센서 ON되면 0x147 긴급 정지
+        if self.limit_sensor_in04 and not prev_state:
+            self.get_logger().warning('WARNING: IN04 detected! 0x147 긴급 정지')
+            self.send_motor_emergency_stop(0x147)
+    
+    def motor_goal_reached_callback(self, msg):
+        """모터 목표 도달 콜백 - 작업 시퀀스 다음 단계 진행"""
+        motor_id = msg.data
+
+        # 작업 시퀀스 진행 중이 아니면 무시
+        if not self.work_sequence_active:
+            return
+
+        # Step 2 (Z축 하강 1차) 완료 → Step 3 (트리거 1차) 시작
+        if self.work_sequence_step == 2 and motor_id == 0x146:
+            self.get_logger().info('✅ Z축 하강 완료! 트리거 동작 시작')
+            self._work_sequence_step3_wrapper()
+
+        # Step 4 (Z축 상승 1차) 완료 → Step 5 (X축 이동) 시작
+        elif self.work_sequence_step == 4 and motor_id == 0x146:
+            self.get_logger().info('✅ Z축 상승 완료! X축 원점방향 이동 시작')
+            self._work_sequence_step5_wrapper()
+
+        # Step 5 (X축 이동) 완료 → Step 6 (Z축 하강 2차) 시작
+        elif self.work_sequence_step == 5 and motor_id == 0x144:
+            self.get_logger().info('✅ X축 이동 완료! Z축 하강 시작 (2차)')
+            self._work_sequence_step6_wrapper()
+
+        # Step 6 (Z축 하강 2차) 완료 → Step 7 (트리거 2차) 시작
+        elif self.work_sequence_step == 6 and motor_id == 0x146:
+            self.get_logger().info('✅ Z축 하강 완료 (2차)! 트리거 동작 시작 (2차)')
+            self._work_sequence_step7_wrapper()
+
+        # Step 8 (Z축 상승 2차) 완료 → Step 9 (XYYaw 3축 이동) 시작
+        elif self.work_sequence_step == 8 and motor_id == 0x146:
+            self.get_logger().info('✅ Z축 상승 완료 (2차)! X/Y/Yaw 3축 이동 시작')
+            self._work_sequence_step9_wrapper()
+
+        # Step 9 (XYYaw 3축 이동) - 3축 모두 완료 확인
+        elif self.work_sequence_step == 9:
+            if motor_id in [0x144, 0x145, 0x147]:  # X, Y, Yaw 모터
+                self.step9_completed_motors.add(motor_id)
+                self.get_logger().info(f'✅ 모터 0x{motor_id:03X} 이동 완료 ({len(self.step9_completed_motors)}/3)')
+
+                # 3축 모두 완료되면 Step 10으로 진행
+                if len(self.step9_completed_motors) == 3:
+                    self.get_logger().info('✅ X/Y/Yaw 3축 이동 완료! Z축 하강 시작 (3차)')
+                    self._work_sequence_step10_wrapper()
+
+        # Step 10 (Z축 하강 3차) 완료 → Step 11 (트리거 3차) 시작
+        elif self.work_sequence_step == 10 and motor_id == 0x146:
+            self.get_logger().info('✅ Z축 하강 완료 (3차)! 트리거 동작 시작 (3차)')
+            self._work_sequence_step11_wrapper()
+
+        # Step 12 (Z축 상승 3차) 완료 → Step 13 (XY 2축 이동) 시작
+        elif self.work_sequence_step == 12 and motor_id == 0x146:
+            self.get_logger().info('✅ Z축 상승 완료 (3차)! X/Y 2축 이동 시작')
+            self._work_sequence_step13_wrapper()
+
+        # Step 13 (XY 2축 이동) - 2축 모두 완료 확인
+        elif self.work_sequence_step == 13:
+            if motor_id in [0x144, 0x145]:  # X, Y 모터
+                self.step13_completed_motors.add(motor_id)
+                self.get_logger().info(f'✅ 모터 0x{motor_id:03X} 이동 완료 ({len(self.step13_completed_motors)}/2)')
+
+                # 2축 모두 완료되면 Step 14로 진행
+                if len(self.step13_completed_motors) == 2:
+                    self.get_logger().info('✅ X/Y 2축 이동 완료! Z축 하강 시작 (4차)')
+                    self._work_sequence_step14_wrapper()
+
+        # Step 14 (Z축 하강 4차) 완료 → Step 15 (트리거 4차) 시작
+        elif self.work_sequence_step == 14 and motor_id == 0x146:
+            self.get_logger().info('✅ Z축 하강 완료 (4차)! 트리거 동작 시작 (4차)')
+            self._work_sequence_step15_wrapper()
+
+        # Step 16 (Z축 상승 4차) 완료 → 전체 작업 완료
+        elif self.work_sequence_step == 16 and motor_id == 0x146:
+            self.get_logger().info('✅ Z축 상승 완료 (4차)! 전체 작업 완료')
+            self._work_sequence_complete_wrapper()
     
     def send_motor_emergency_stop(self, motor_id):
         """모터 긴급 정지 명령 전송 (0x81)"""
@@ -992,6 +1932,26 @@ class IronMDTeleopNode(Node):
             self.get_logger().info(f'🛑 모터 0x{motor_id:03X} 긴급 정지 명령 전송')
         except Exception as e:
             self.get_logger().error(f'❌ 긴급 정지 명령 전송 실패: {e}')
+    
+    def request_encoder_read(self, motor_id):
+        """모터 멀티턴 엔코더 읽기 명령 전송 (0x92)"""
+        try:
+            import can
+            # CAN2 버스로 멀티턴 엔코더 읽기 명령 전송
+            can_bus = can.interface.Bus(channel='can2', bustype='socketcan')
+            
+            # RMD 멀티턴 엔코더 읽기: 0x92
+            msg = can.Message(
+                arbitration_id=motor_id,
+                data=[0x92, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                is_extended_id=False
+            )
+            can_bus.send(msg)
+            can_bus.shutdown()
+            
+            self.get_logger().info(f'📍 모터 0x{motor_id:03X} 엔코더 읽기 명령 전송')
+        except Exception as e:
+            self.get_logger().error(f'❌ 엔코더 읽기 명령 전송 실패: {e}')
     
     def start_homing_sequence(self):
         """드라이브 모터 홈잉 시퀀스 시작"""
@@ -1074,9 +2034,9 @@ class IronMDTeleopNode(Node):
         """모터 에러 클리어 (0x9B)"""
         try:
             import can
-            
+
             can_bus = can.interface.Bus(channel='can2', bustype='socketcan')
-            
+
             # RMD 에러 클리어 명령: 0x9B
             msg = can.Message(
                 arbitration_id=motor_id,
@@ -1085,10 +2045,278 @@ class IronMDTeleopNode(Node):
             )
             can_bus.send(msg)
             can_bus.shutdown()
-            
-            self.get_logger().info(f'� 모터 0x{motor_id:03X} 에러 클리어')
+
+            self.get_logger().info(f'🔧 모터 0x{motor_id:03X} 에러 클리어')
         except Exception as e:
             self.get_logger().error(f'❌ 에러 클리어 실패: {e}')
+
+    def start_stage_homing(self):
+        """스테이지 XY + Yaw 2단계 호밍 시작 (S23 트리거)"""
+        self.get_logger().info('🏁 스테이지 XYZ 호밍 시작 (2단계)')
+        self.get_logger().info('  [1차] 고속 호밍: X축(200 dps), Y축(200 dps), Yaw(100 dps)')
+        self.get_logger().info('  → X축(0x144): +방향 이동 (IN02 감지까지)')
+        self.get_logger().info('  → Y축(0x145): -방향 이동 (IN01 감지까지)')
+        self.get_logger().info('  → Yaw(0x147): -방향 이동 (IN04 감지까지)')
+
+        self.stage_homing_active = True
+        self.stage_homing_phase = 1  # 1차 고속 호밍
+        self.stage_x_homing_done = False
+        self.stage_y_homing_done = False
+        self.stage_yaw_homing_done = False
+        self.stage_x_homing_phase2_done = False
+        self.stage_y_homing_phase2_done = False
+        self.stage_yaw_homing_phase2_done = False
+        
+        # 호밍 중 엔코더 피드백을 받기 위해 초기 위치 읽기 플래그 리셋
+        self.initial_position_read['x'] = False
+        self.initial_position_read['y'] = False
+        self.initial_position_read['yaw'] = False
+        self.initial_position_read['z'] = False
+
+        # 1차 고속 호밍: X축 +방향, Y축 -방향, Yaw -방향
+        self.move_stage_motor(0x144, +self.stage_xy_homing_speed)   # X축 +방향 (100 dps)
+        self.move_stage_motor(0x145, -self.stage_xy_homing_speed)   # Y축 -방향 (100 dps)
+        self.move_stage_motor(0x147, -self.stage_yaw_homing_speed)  # Yaw -방향 (10 dps)
+
+    def move_stage_motor(self, motor_id, speed_dps):
+        """스테이지 모터 속도 제어 (0xA2 Speed Control)"""
+        try:
+            import can
+            import struct
+
+            # 속도 제어 값 계산 (0.01 dps/LSB)
+            speed_control = int(speed_dps * 100)
+
+            can_bus = can.interface.Bus(channel='can2', bustype='socketcan')
+            msg = can.Message(
+                arbitration_id=motor_id,
+                data=[
+                    0xA2,  # Speed Control Command
+                    0x64,  # 100% max torque
+                    0x00,
+                    0x00,
+                    speed_control & 0xFF,
+                    (speed_control >> 8) & 0xFF,
+                    (speed_control >> 16) & 0xFF,
+                    (speed_control >> 24) & 0xFF
+                ],
+                is_extended_id=False
+            )
+            can_bus.send(msg)
+            can_bus.shutdown()
+
+            if self.debug_mode:
+                self.get_logger().debug(f'Motor 0x{motor_id:03X} speed: {speed_dps:.1f} dps')
+        except Exception as e:
+            self.get_logger().error(f'❌ 모터 0x{motor_id:03X} 속도 제어 실패: {e}')
+
+    def check_stage_homing_complete(self):
+        """스테이지 2단계 호밍 완료 확인"""
+        if not self.stage_homing_active:
+            return
+
+        # ========== 1단계: 고속 호밍 ==========
+        if self.stage_homing_phase == 1:
+            # X축 1차 홈 도달 확인 (IN02 ON)
+            if self.limit_sensor_in02 and not self.stage_x_homing_done:
+                self.get_logger().info('✅ [1차] X축(0x144) 홈 리미트(IN02) 감지!')
+                self.send_motor_emergency_stop(0x144)
+                self.stage_x_homing_done = True
+
+            # Y축 1차 홈 도달 확인 (IN01 ON)
+            if self.limit_sensor_in01 and not self.stage_y_homing_done:
+                self.get_logger().info('✅ [1차] Y축(0x145) 홈 리미트(IN01) 감지!')
+                self.send_motor_emergency_stop(0x145)
+                self.stage_y_homing_done = True
+
+            # Yaw 1차 홈 도달 확인 (IN04 ON)
+            if self.limit_sensor_in04 and not self.stage_yaw_homing_done:
+                self.get_logger().info('✅ [1차] Yaw(0x147) 홈 리미트(IN04) 감지!')
+                self.send_motor_emergency_stop(0x147)
+                self.stage_yaw_homing_done = True
+
+            # 3축 모두 1차 완료되면 → 2단계: 센서 이탈
+            if self.stage_x_homing_done and self.stage_y_homing_done and self.stage_yaw_homing_done:
+                self.get_logger().info('🔄 [2단계] 센서 이탈 중...')
+                self.stage_homing_phase = 2
+                
+                # 센서에서 벗어나기 (반대 방향으로 살짝 이동)
+                self.move_stage_motor(0x144, -30.0)  # X축 -방향 (30 dps, 0.5초)
+                self.move_stage_motor(0x145, +30.0)  # Y축 +방향 (30 dps)
+                self.move_stage_motor(0x147, +5.0)   # Yaw +방향 (5 dps)
+                
+                return
+
+        # ========== 2단계: 센서 이탈 확인 ==========
+        elif self.stage_homing_phase == 2:
+            # 각 축 센서 이탈 확인
+            x_cleared = not self.limit_sensor_in02
+            y_cleared = not self.limit_sensor_in01
+            yaw_cleared = not self.limit_sensor_in04
+            
+            # 모든 센서 이탈했으면 3단계 진입
+            if x_cleared and y_cleared and yaw_cleared:
+                self.get_logger().info('✅ [2단계] 모든 센서 이탈 완료')
+                
+                # 모터 정지
+                self.send_motor_emergency_stop(0x144)
+                self.send_motor_emergency_stop(0x145)
+                self.send_motor_emergency_stop(0x147)
+                
+                # 0.2초 후 3단계 시작
+                self.phase3_start_timer = self.create_timer(0.2, self._start_phase3_homing_wrapper)
+                self.stage_homing_phase = 2.5  # 대기 상태
+                
+            return
+
+        # ========== 3단계: 저속 정밀 호밍 ==========
+        elif self.stage_homing_phase == 3:
+            # X축 2차 홈 도달 확인 (IN02 ON)
+            if self.limit_sensor_in02 and not self.stage_x_homing_phase2_done:
+                self.get_logger().info('✅ [2차] X축(0x144) 홈 리미트(IN02) 정밀 감지!')
+                self.send_motor_emergency_stop(0x144)
+                self.stage_x_homing_phase2_done = True
+
+            # Y축 2차 홈 도달 확인 (IN01 ON)
+            if self.limit_sensor_in01 and not self.stage_y_homing_phase2_done:
+                self.get_logger().info('✅ [2차] Y축(0x145) 홈 리미트(IN01) 정밀 감지!')
+                self.send_motor_emergency_stop(0x145)
+                self.stage_y_homing_phase2_done = True
+
+            # Yaw 2차 홈 도달 확인 (IN04 ON)
+            if self.limit_sensor_in04 and not self.stage_yaw_homing_phase2_done:
+                self.get_logger().info('✅ [2차] Yaw(0x147) 홈 리미트(IN04) 정밀 감지!')
+                self.send_motor_emergency_stop(0x147)
+                self.stage_yaw_homing_phase2_done = True
+
+            # 3축 모두 2차 완료되면 → 호밍 완료
+            if self.stage_x_homing_phase2_done and self.stage_y_homing_phase2_done and self.stage_yaw_homing_phase2_done:
+                self.get_logger().info('🏠 스테이지 XY + Yaw 2단계 호밍 완료!')
+                self.stage_homing_active = False
+                
+                # 0.3초 대기 후 엔코더 읽기 시작 (모터가 안정화될 시간)
+                if hasattr(self, 'encoder_read_timer') and self.encoder_read_timer:
+                    self.encoder_read_timer.cancel()
+                self.encoder_read_timer = self.create_timer(0.3, self._start_encoder_read_wrapper)
+
+    def start_phase3_homing(self):
+        """3단계: 저속 정밀 호밍 시작"""
+        # 모터 정지
+        self.send_motor_emergency_stop(0x144)
+        self.send_motor_emergency_stop(0x145)
+        self.send_motor_emergency_stop(0x147)
+        time.sleep(0.1)
+        
+        self.get_logger().info('🔍 [3단계] 저속 정밀 호밍 시작')
+        self.get_logger().info('  → X축(50 dps), Y축(50 dps), Yaw(20 dps)')
+        
+        self.stage_homing_phase = 3
+        
+        # 저속으로 다시 센서 방향으로 이동
+        self.move_stage_motor(0x144, +self.stage_xy_homing_speed_slow)   # X축 +방향 (20 dps, 저속)
+        self.move_stage_motor(0x145, -self.stage_xy_homing_speed_slow)   # Y축 -방향 (20 dps, 저속)
+        self.move_stage_motor(0x147, -self.stage_yaw_homing_speed_slow)  # Yaw -방향 (5 dps, 저속)
+
+    def _start_phase3_homing_wrapper(self):
+        """3단계 호밍 시작 래퍼 (타이머 자동 취소)"""
+        if hasattr(self, 'phase3_start_timer') and self.phase3_start_timer:
+            self.phase3_start_timer.cancel()
+            self.phase3_start_timer = None
+        self.start_phase3_homing()
+
+    def _save_home_positions_wrapper(self):
+        """홈 위치 저장 래퍼 (타이머 자동 취소 및 엔코더 위치 출력)"""
+        if hasattr(self, 'homing_save_timer') and self.homing_save_timer:
+            self.homing_save_timer.cancel()
+            self.homing_save_timer = None
+        
+        # 현재 위치를 홈 위치로 저장 (실제 엔코더 절대값)
+        self.home_x_encoder_position = self.current_positions['x']
+        self.home_y_encoder_position = self.current_positions['y']
+        self.home_yaw_encoder_position = self.current_positions['yaw']
+        
+        self.get_logger().info(f'📍 홈 위치 저장:')
+        self.get_logger().info(f'  → X축 홈: {self.home_x_encoder_position:.2f}°')
+        self.get_logger().info(f'  → Y축 홈: {self.home_y_encoder_position:.2f}°')
+        self.get_logger().info(f'  → Z축: {self.current_positions["z"]:.2f}°')
+        self.get_logger().info(f'  → Yaw 홈: {self.home_yaw_encoder_position:.2f}°')
+        
+        # 엔코더 위치 출력
+        self.display_stage_encoder_positions()
+
+    def _display_stage_encoder_wrapper(self):
+        """스테이지 엔코더 출력 래퍼 (타이머 자동 취소)"""
+        if hasattr(self, 'stage_encoder_timer') and self.stage_encoder_timer:
+            self.stage_encoder_timer.cancel()
+            self.stage_encoder_timer = None
+        self.display_stage_encoder_positions()
+
+    def _start_encoder_read_wrapper(self):
+        """엔코더 읽기 시작 래퍼 (타이머 자동 취소)"""
+        if hasattr(self, 'encoder_read_timer') and self.encoder_read_timer:
+            self.encoder_read_timer.cancel()
+            self.encoder_read_timer = None
+        
+        # 직접 CAN으로 멀티턴 엔코더 읽기 (0x92)
+        self.get_logger().info('📍 엔코더 위치 읽는 중...')
+        # 1차 엔코더 읽기 명령 전송 (트리거용)
+        self.request_encoder_read(0x144)  # X축
+        time.sleep(0.20)
+        self.request_encoder_read(0x145)  # Y축
+        time.sleep(0.20)
+        self.request_encoder_read(0x146)  # Z축
+        time.sleep(0.20)
+        self.request_encoder_read(0x147)  # Yaw
+
+        # 2차 읽기를 0.5초 후 스케줄 (첫 읽기 트리거 이후 값 수신을 보장)
+        if hasattr(self, 'encoder_second_round_timer') and self.encoder_second_round_timer:
+            self.encoder_second_round_timer.cancel()
+        self.encoder_second_round_timer = self.create_timer(0.5, self._start_encoder_read_second_round_wrapper)
+
+    def _start_encoder_read_second_round_wrapper(self):
+        """엔코더 2차 읽기 래퍼 및 홈 저장 트리거"""
+        if hasattr(self, 'encoder_second_round_timer') and self.encoder_second_round_timer:
+            self.encoder_second_round_timer.cancel()
+            self.encoder_second_round_timer = None
+
+        self.get_logger().info('📍 엔코더 2차 읽기 시작...')
+
+        # 재차 플래그 리셋(안전) 및 2차 읽기 전송
+        self.initial_position_read['x'] = False
+        self.initial_position_read['y'] = False
+        self.initial_position_read['yaw'] = False
+        self.initial_position_read['z'] = False
+
+        self.request_encoder_read(0x144)
+        time.sleep(0.20)
+        self.request_encoder_read(0x145)
+        time.sleep(0.20)
+        self.request_encoder_read(0x146)
+        time.sleep(0.20)
+        self.request_encoder_read(0x147)
+
+        # 2.0초 후 홈 위치 저장 (엔코더 값이 업데이트될 시간)
+        if hasattr(self, 'homing_save_timer') and self.homing_save_timer:
+            self.homing_save_timer.cancel()
+        self.homing_save_timer = self.create_timer(2.0, self._save_home_positions_wrapper)
+        time.sleep(0.2)
+        self.request_encoder_read(0x147)  # Yaw
+    
+        # 2.5초 후 홈 위치 저장 (엔코더 값이 충분히 업데이트될 시간)
+        if hasattr(self, 'homing_save_timer') and self.homing_save_timer:
+            self.homing_save_timer.cancel()
+        self.homing_save_timer = self.create_timer(2.5, self._save_home_positions_wrapper)
+
+    def display_stage_encoder_positions(self):
+        """스테이지 엔코더 위치 출력 (호밍 완료 후)"""
+        self.get_logger().info('=' * 60)
+        self.get_logger().info('📍 ===== 스테이지 엔코더 위치 (호밍 후) =====')
+        self.get_logger().info('=' * 60)
+        self.get_logger().info(f'  0x144 (X축): {self.current_positions["x"]:.2f}° (홈위치)')
+        self.get_logger().info(f'  0x145 (Y축): {self.current_positions["y"]:.2f}° (홈위치)')
+        self.get_logger().info(f'  0x146 (Z축): {self.current_positions["z"]:.2f}°')
+        self.get_logger().info(f'  0x147 (Yaw): {self.current_positions["yaw"]:.2f}° (홈위치)')
+        self.get_logger().info('=' * 60)
 
     def handle_homing(self):
         """드라이브 모터 홈잉 (S14)"""
@@ -1109,7 +2337,7 @@ class IronMDTeleopNode(Node):
         
         try:
             import subprocess
-            SMC_CMD = '/home/test/ros2_ws/src/smc_linux/SmcCmd'
+            SMC_CMD = '/home/koceti/ros2_ws/src/smc_linux/SmcCmd'
             DEVICE = '#51FF-7406-4980-4956-3043-1287'  # Pololu 시리얼 넘버
             
             # Resume 명령으로 safe-start 해제
@@ -1152,7 +2380,7 @@ class IronMDTeleopNode(Node):
         """트리거 되돌림 (1초 후 호출)"""
         try:
             import subprocess
-            SMC_CMD = '/home/test/ros2_ws/src/smc_linux/SmcCmd'
+            SMC_CMD = '/home/koceti/ros2_ws/src/smc_linux/SmcCmd'
             DEVICE = '#51FF-7406-4980-4956-3043-1287'
 
             # Resume 명령으로 safe-start 해제 (정지 후 재시작을 위해 필요)
@@ -1195,7 +2423,7 @@ class IronMDTeleopNode(Node):
         """트리거 해제 (SmcCmd 사용)"""
         try:
             import subprocess
-            SMC_CMD = '/home/test/ros2_ws/src/smc_linux/SmcCmd'
+            SMC_CMD = '/home/koceti/ros2_ws/src/smc_linux/SmcCmd'
             DEVICE = '#51FF-7406-4980-4956-3043-1287'  # Pololu 시리얼 넘버
             
             # Stop motor
@@ -1214,20 +2442,52 @@ class IronMDTeleopNode(Node):
                 self.trigger_timer = None
 
             self.get_logger().info('🔫 트리거 해제')
+
+            # 작업 시퀀스 중이면 다음 단계(Z축 상승)로 진행
+            if self.work_sequence_active and self.work_sequence_step == 3:
+                self.get_logger().info('📍 트리거 완료 (1차), Z축 상승 시작')
+                self._work_sequence_step4_wrapper()
+            elif self.work_sequence_active and self.work_sequence_step == 7:
+                self.get_logger().info('📍 트리거 완료 (2차), Z축 상승 시작')
+                self._work_sequence_step8_wrapper()
+            elif self.work_sequence_active and self.work_sequence_step == 11:
+                self.get_logger().info('📍 트리거 완료 (3차), Z축 상승 시작')
+                self._work_sequence_step12_wrapper()
+            elif self.work_sequence_active and self.work_sequence_step == 15:
+                self.get_logger().info('📍 트리거 완료 (4차), Z축 상승 시작')
+                self._work_sequence_step16_wrapper()
+
         except Exception as e:
             self.get_logger().error(f'❌ 트리거 해제 실패: {e}')
 
-    def publish_joint_position(self, joint_name, publisher, show_log=True):
-        """관절 위치 명령 발행 (degree 단위)"""
+    def publish_joint_position(self, joint_name, publisher, show_log=True, speed=None):
+        """관절 위치 명령 발행 (degree 단위)
+        
+        Args:
+            joint_name: 관절 이름 ('lateral', 'x', 'y', 'z', 'yaw' 등)
+            publisher: ROS2 publisher
+            show_log: 로그 출력 여부
+            speed: 속도 값 (None이면 속도 없이 위치만 전송)
+        """
         msg = Float64MultiArray()
-        # 모든 축이 degree 단위로 통일 (0x143과 동일한 방식)
-        msg.data = [self.current_positions[joint_name]]
+        
+        # 속도가 지정된 경우 [위치, 속도] 형식으로 전송
+        if speed is not None:
+            msg.data = [self.current_positions[joint_name], speed]
+        else:
+            msg.data = [self.current_positions[joint_name]]
+        
         publisher.publish(msg)
         
         if show_log:
-            self.get_logger().info(
-                f'📍 {joint_name.upper()}: {self.current_positions[joint_name]:.2f}°'
-            )
+            if speed is not None:
+                self.get_logger().info(
+                    f'📍 {joint_name.upper()}: {self.current_positions[joint_name]:.2f}° @ {speed:.1f}°/s'
+                )
+            else:
+                self.get_logger().info(
+                    f'📍 {joint_name.upper()}: {self.current_positions[joint_name]:.2f}°'
+                )
     
     def send_lcd_brake_status(self):
         """Iron-MD LCD에 브레이크 상태 표시 (Page 1, Line 0)"""
