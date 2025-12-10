@@ -1,0 +1,16 @@
+# Goal
+float32 distance        # Target distance to move (m), positive=forward, negative=backward
+float32 max_velocity    # Maximum velocity (m/s), default 0.2
+
+---
+# Result
+bool success                # True if navigation succeeded
+float32 final_position_error  # Final position error (m)
+float32 final_heading_error   # Final heading error (rad)
+
+---
+# Feedback
+float32 current_distance      # Distance traveled so far (m)
+float32 remaining_distance    # Remaining distance (m)
+float32 heading_error         # Current heading error (rad)
+float32 current_velocity      # Current velocity (m/s)

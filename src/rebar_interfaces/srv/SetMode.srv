@@ -1,0 +1,11 @@
+# Request
+string MODE_IDLE = "idle"
+string MODE_MANUAL = "manual"
+string MODE_AUTO = "auto"
+
+string mode     # Desired mode (use constants above)
+
+---
+# Response
+bool success    # True if mode change succeeded
+string message  # Status or error message

@@ -1,0 +1,15 @@
+# Goal
+uint8 MODE_SINGLE = 1
+uint8 MODE_CONTINUOUS = 2
+
+uint8 mode              # Tying mode (use constants above)
+
+---
+# Result
+bool success            # True if tying sequence succeeded
+uint8 tied_count        # Number of rebar ties completed
+
+---
+# Feedback
+string current_step     # Current step in sequence: "moving", "gripping", "tying", "releasing"
+float32 progress        # Progress of current sequence (0.0 to 1.0)
