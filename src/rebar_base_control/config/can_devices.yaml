@@ -1,0 +1,22 @@
+# CAN Device Configuration
+
+can_parser:
+  ros__parameters:
+    motor_can_interface: 'can2'
+    remote_can_interface: 'can3'
+    motor_can_bitrate: 1000000  # 1Mbps
+    remote_can_bitrate: 250000  # 250kbps
+
+can_sender:
+  ros__parameters:
+    can_interface: 'can2'
+    can_bitrate: 1000000  # 1Mbps
+    left_motor_id: 0x141
+    right_motor_id: 0x142
+    wheel_radius: 0.1  # meters
+
+drive_controller:
+  ros__parameters:
+    wheel_base: 0.5  # meters (바퀴 간 거리)
+    max_linear_vel: 10.0  # m/s
+    max_angular_vel: 2.0  # rad/s

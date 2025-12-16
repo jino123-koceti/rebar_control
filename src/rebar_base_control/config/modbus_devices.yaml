@@ -1,0 +1,13 @@
+# Modbus Device Configuration
+
+modbus_controller:
+  ros__parameters:
+    # Seengrip Gripper (Modbus RTU)
+    seengrip_port: '/dev/ttyUSB0'
+    seengrip_baudrate: 115200
+    seengrip_slave_id: 1
+
+    # EZI-IO Sensor Module (Modbus TCP)
+    ezi_io_host: '192.168.1.100'
+    ezi_io_port: 502
+    ezi_io_slave_id: 1
