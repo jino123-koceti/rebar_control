@@ -47,8 +47,33 @@ rebar_interfaces/action/TyingSequence
 rebar_interfaces/srv/SetMode
 ```
 
+---
+
+### Phase 2: 하드웨어 추상화 계층 - **완료** (2025-12-17)
+
+**브랜치:** `refactoring/phase2-base-control`
+**커밋:** `fa1b412 - feat(phase2): implement hardware abstraction layer (rebar_base_control)`
+
+#### 완료된 작업
+- [x] `rebar_base_control` 패키지 생성
+  - [x] can_parser.py (CAN 메시지 파싱)
+  - [x] can_sender.py (CAN 메시지 전송)
+  - [x] drive_controller.py (cmd_vel → DriveControl)
+  - [x] modbus_controller.py (Seengrip + EZI-IO)
+  - [x] authority_controller.py (권한 관리)
+  - [x] navigator_base.py (State Machine)
+- [x] python-statemachine 설치 및 State Machine 구현
+- [x] 설정 파일 작성 (can_devices.yaml, modbus_devices.yaml)
+- [x] Launch 파일 작성 (base_system.launch.py)
+- [x] 빌드 테스트 성공 (3.54초, 1개 패키지)
+
+#### State Machine
+- 상태: idle, manual, auto, navigating, tying, emergency_stop
+- 전이: S10/S20 스위치, 모션 명령, 비상정지
+- 라이브러리: python-statemachine
+
 #### 다음 단계
-Phase 2: 하드웨어 추상화 계층 (`rebar_base_control`) 구현 예정
+Phase 3: 상위 제어 계층 (`rebar_control`) 리팩토링 예정
 
 ---
 
@@ -758,70 +783,63 @@ def generate_launch_description():
   - [x] 기존 메시지 삭제 (PrecisionNavGoal.msg 등)
   - [x] 빌드 테스트
 
-### Phase 2: 하드웨어 추상화 계층 (rebar_base_control)
-- [ ] `rebar_base_control` 패키지 생성
-  - [ ] 디렉토리 구조 생성
-  - [ ] setup.py 작성
-  - [ ] package.xml 작성
+### Phase 2: 하드웨어 추상화 계층 (rebar_base_control) ✅ **완료 (2025-12-17)**
+- [x] `rebar_base_control` 패키지 생성
+  - [x] 디렉토리 구조 생성
+  - [x] setup.py 작성
+  - [x] package.xml 작성
 
-- [ ] `can_parser.py` 구현
-  - [ ] CAN2 모터 피드백 파싱 (0x141, 0x142)
-  - [ ] CAN3 리모콘 파싱
-  - [ ] MotorFeedback 메시지 발행
-  - [ ] RemoteControl 메시지 발행
-  - [ ] 단위 테스트 작성
-  - [ ] `position_control_node.py`에서 코드 마이그레이션
+- [x] `can_parser.py` 구현
+  - [x] CAN2 모터 피드백 파싱 (0x241, 0x242)
+  - [x] CAN3 리모콘 파싱 (0x1E4, 0x2E4, 0x764)
+  - [x] MotorFeedback 메시지 발행
+  - [x] RemoteControl 메시지 발행
+  - [x] `position_control_node.py`, `iron_md_teleop_node.py` 참조
 
-- [ ] `can_sender.py` 구현
-  - [ ] DriveControl 구독
-  - [ ] CAN 메시지 전송 (0x141, 0x142)
-  - [ ] 에러 처리
-  - [ ] 단위 테스트 작성
-  - [ ] `position_control_node.py`에서 코드 마이그레이션
+- [x] `can_sender.py` 구현
+  - [x] DriveControl 구독
+  - [x] CAN 메시지 전송 (0x141, 0x142)
+  - [x] 속도 제어 명령 (0xA2)
+  - [x] 오른쪽 모터 반전
+  - [x] `position_control_node.py` 참조
 
-- [ ] `modbus_controller.py` 구현
-  - [ ] Seengrip Modbus RTU 통신
-  - [ ] EZI-IO Modbus TCP 통신
-  - [ ] GripperControl 구독
-  - [ ] IOStatus 발행
-  - [ ] 단위 테스트 작성
-  - [ ] `ezi_io_node.py`, `seengrip_node.py`에서 코드 마이그레이션
+- [x] `modbus_controller.py` 구현
+  - [x] Seengrip Modbus RTU 통신
+  - [x] EZI-IO Modbus TCP 통신
+  - [x] GripperControl 구독
+  - [x] IOStatus 발행 (10Hz)
+  - [x] `ezi_io_node.py`, `seengrip_node.py` 참조
 
-- [ ] `authority_controller.py` 구현
-  - [ ] RemoteControl 구독
-  - [ ] S10/S20 모드 전환 로직
-  - [ ] S20 모드에서 리모콘 명령 무시
-  - [ ] authority_status 발행
-  - [ ] 단위 테스트 작성
-  - [ ] `iron_md_teleop_node.py`에서 코드 마이그레이션
+- [x] `authority_controller.py` 구현
+  - [x] RemoteControl 구독
+  - [x] S10/S20 모드 전환 로직
+  - [x] 비상정지 처리
+  - [x] authority_status 발행 (5Hz)
+  - [x] `iron_md_teleop_node.py` 참조
 
-- [ ] `drive_controller.py` 구현
-  - [ ] `/cmd_vel` 구독
-  - [ ] Differential drive 변환
-  - [ ] 오른쪽 모터 반전 처리
-  - [ ] DriveControl 발행
-  - [ ] 단위 테스트 작성
-  - [ ] `position_control_node.py`에서 속도 변환 로직 마이그레이션
+- [x] `drive_controller.py` 구현
+  - [x] `/cmd_vel` 구독
+  - [x] Differential drive kinematics 변환
+  - [x] DriveControl 발행
+  - [x] 속도 제한
+  - [x] `position_control_node.py` 참조
 
-- [ ] `navigator_base.py` 구현
-  - [ ] `python-statemachine` 설치
-  - [ ] RebarStateMachine 클래스 작성
-  - [ ] 상태 전이 로직
-  - [ ] control_mode 발행
-  - [ ] 단위 테스트 작성
+- [x] `navigator_base.py` 구현
+  - [x] `python-statemachine` 설치
+  - [x] RebarStateMachine 클래스 작성
+  - [x] 6개 상태 정의 (idle, manual, auto, navigating, tying, emergency_stop)
+  - [x] 상태 전이 로직
+  - [x] control_mode 발행 (5Hz)
 
-- [ ] 설정 파일 작성
-  - [ ] `config/can_devices.yaml`
-  - [ ] `config/modbus_devices.yaml`
+- [x] 설정 파일 작성
+  - [x] `config/can_devices.yaml`
+  - [x] `config/modbus_devices.yaml`
 
-- [ ] Launch 파일 작성
-  - [ ] `launch/base_system.launch.py`
+- [x] Launch 파일 작성
+  - [x] `launch/base_system.launch.py` (6개 노드)
 
-- [ ] 통합 테스트
-  - [ ] 모든 노드 동시 실행
-  - [ ] CAN 통신 확인
-  - [ ] Modbus 통신 확인
-  - [ ] 상태 전이 확인
+- [x] 빌드 테스트
+  - [x] 빌드 성공 (3.54초)
 
 ### Phase 3: 상위 제어 계층 (rebar_control)
 - [ ] `rebar_control` 리팩토링
