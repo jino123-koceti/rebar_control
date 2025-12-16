@@ -20,3 +20,6 @@ drive_controller:
     wheel_base: 0.5  # meters (바퀴 간 거리)
     max_linear_vel: 10.0  # m/s
     max_angular_vel: 2.0  # rad/s
+    joystick_deadzone: 20  # 조이스틱 데드존 (0-127 범위)
+    joystick_center: 127  # 조이스틱 중립값
+    publish_frequency: 20  # Hz (Tire Roller 방식 - 주기적 발행)
