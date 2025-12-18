@@ -113,46 +113,120 @@ class CANParser(Node):
         응답 ID:
         - 0x241: 왼쪽 모터 (0x141)
         - 0x242: 오른쪽 모터 (0x142)
+        - 0x243: 횡이동 모터 (0x143)
 
         데이터 포맷 (8바이트):
         - Byte 0: Command Type
-        - Byte 1: Motor Temperature (°C)
-        - Byte 2-3: Motor Torque Current (int16, 0.01A/LSB)
-        - Byte 4-5: Motor Speed (int16, 1dps/LSB or 1rpm/LSB)
-        - Byte 6-7: Encoder Position (uint16)
+        - 0xA2 응답:
+          - Byte 1: Motor Temperature (°C)
+          - Byte 2-3: Motor Torque Current (int16, 0.01A/LSB)
+          - Byte 4-5: Motor Speed (int16, 1dps/LSB)
+          - Byte 6-7: Motor Angle (int16, 1°/LSB)
+        - 0x90 응답 (Single-Turn Encoder):
+          - Byte 2-3: Encoder position (uint16)
+          - Byte 4-5: Encoder raw (uint16)
+          - Byte 6-7: Encoder offset (uint16)
         """
         can_id = can_msg.arbitration_id
         data = can_msg.data
 
-        # 모터 응답 ID 확인 (0x241, 0x242)
-        if can_id not in [0x241, 0x242]:
+        # 모터 응답 ID 확인 (0x241, 0x242, 0x243)
+        if can_id not in [0x241, 0x242, 0x243]:
             return
 
-        # 모터 ID 계산 (0x241 -> 0x141, 0x242 -> 0x142)
-        motor_id = can_id - 0x100
+        # 모터 ID 계산 (0x241 -> 0x41, 0x242 -> 0x42, 0x243 -> 0x43)
+        # uint8 범위: 0x141 = 321 (범위 초과) → 0x41 = 65 사용
+        motor_id = can_id - 0x200  # 0x241 -> 0x41, 0x242 -> 0x42, 0x243 -> 0x43
 
         if len(data) < 8:
             return
 
         try:
-            # 데이터 파싱
+            command_type = data[0]
+
+            # 0x90: Single-Turn Encoder 응답
+            if command_type == 0x90:
+                encoder_position = struct.unpack('<H', data[2:4])[0]  # uint16
+                encoder_raw = struct.unpack('<H', data[4:6])[0]  # uint16
+                encoder_offset = struct.unpack('<H', data[6:8])[0]  # uint16
+
+                # MotorFeedback 메시지 생성
+                feedback_msg = MotorFeedback()
+                feedback_msg.motor_id = motor_id
+                feedback_msg.current_position = float(encoder_position)
+                feedback_msg.current_speed = 0.0
+                feedback_msg.current_current = 0
+                feedback_msg.temperature = 0
+                feedback_msg.error_code = 0
+                feedback_msg.status = command_type
+
+                self.motor_feedback_pub.publish(feedback_msg)
+
+                # 관측 로그 (0x243)
+                if motor_id == 0x43:
+                    self.get_logger().info(
+                        f"[PUB /motor_feedback] id:0x{motor_id:02X} status:0x{command_type:02X} enc:{encoder_position} raw:{encoder_raw} offset:{encoder_offset}",
+                        throttle_duration_sec=0.2
+                    )
+
+                # 0x243 로그 (info)
+                if motor_id == 0x43:
+                    self.get_logger().info(
+                        f"[0x90 RX 0x243] encoder:{encoder_position} raw:{encoder_raw} offset:{encoder_offset}",
+                        throttle_duration_sec=0.5
+                    )
+                return
+
+            # 0x92: Multi-Turn Angle (0.01 deg/LSB, output shaft)
+            if command_type == 0x92:
+                angle_raw = struct.unpack('<i', data[4:8])[0]  # int32, 0.01°/LSB
+                angle_deg = angle_raw * 0.01
+
+                feedback_msg = MotorFeedback()
+                feedback_msg.motor_id = motor_id
+                feedback_msg.current_position = float(angle_deg)
+                feedback_msg.current_speed = 0.0
+                feedback_msg.current_current = 0
+                feedback_msg.temperature = 0
+                feedback_msg.error_code = 0
+                feedback_msg.status = command_type
+
+                self.motor_feedback_pub.publish(feedback_msg)
+
+                if motor_id == 0x43:
+                    self.get_logger().info(
+                        f"[0x92 RX 0x243] angle:{angle_deg:.2f}° raw:{angle_raw}",
+                        throttle_duration_sec=0.5
+                    )
+                return
+
+            # 0xA2: Speed Control 응답 (기존)
+            # 데이터 파싱 (프로토콜 정의 필드만 사용)
             temperature = data[1]  # °C
             torque_current = struct.unpack('<h', data[2:4])[0] * 0.01  # A
             speed = struct.unpack('<h', data[4:6])[0]  # dps or rpm
-            encoder_raw = struct.unpack('<H', data[6:8])[0]  # raw encoder
+            angle_deg = struct.unpack('<h', data[6:8])[0]  # int16, 1°/LSB (프로토콜 정의)
 
             # MotorFeedback 메시지 생성
             feedback_msg = MotorFeedback()
-            feedback_msg.motor_id = motor_id
+            feedback_msg.motor_id = motor_id  # 0x41 or 0x42 (uint8 범위)
             feedback_msg.current_speed = float(speed)  # dps or rpm
-            feedback_msg.current_position = float(encoder_raw)  # encoder counts
+            feedback_msg.current_position = float(angle_deg)  # 0xA2 응답의 각도 필드
             feedback_msg.current_current = int(torque_current * 1000)  # A -> mA
             feedback_msg.temperature = temperature
             feedback_msg.error_code = 0  # TODO: 에러 코드 파싱
-            feedback_msg.status = data[0]  # Command Type as status
+            feedback_msg.status = command_type
 
             # 발행
             self.motor_feedback_pub.publish(feedback_msg)
+
+            # 0x243 (0x143) 피드백 로그 (throttle 1초)
+            if motor_id == 0x43:
+                hex_data = data.hex()
+                self.get_logger().info(
+                    f"[CAN RX 0x243] RAW:{hex_data} angle:{angle_deg} speed:{speed}dps current:{torque_current:.2f}A temp:{temperature}°C",
+                    throttle_duration_sec=0.2
+                )
 
         except Exception as e:
             self.get_logger().error(f"모터 피드백 파싱 오류 (ID: 0x{can_id:03X}): {e}")
@@ -207,42 +281,38 @@ class CANParser(Node):
 
     def _parse_switch_data(self, data):
         """
-        스위치 데이터 파싱 (0x2E4)
+        스위치 데이터 파싱 (0x2E4) - Iron-MD 프로토콜
 
-        주요 스위치:
-        - S10 (S19): Manual 모드
-        - S20: Auto 모드
-        - Emergency_Stop
+        Byte 0:
+        - Bit 7: Emergency_Stop_Active
+        - Bit 6: Emergency_Stop_Release
+
+        Byte 3:
+        - Bit 4: S19 (Manual 모드)
+        - Bit 5: S20 (Auto 모드)
         """
         if len(data) < 8:
             return
 
         try:
-            # 스위치 비트 파싱 (실제 Iron-MD 프로토콜에 맞춰 수정 필요)
-            # 임시 구현: Byte 단위로 스위치 상태 추출
+            # Byte 0: 비상정지
+            byte0 = data[0]
+            emergency_stop_release = (byte0 >> 6) & 0x01
+            emergency_stop_active = (byte0 >> 7) & 0x01
 
-            # S19-S20 모드 스위치 (3단 스위치)
-            s19 = (data[2] >> 3) & 0x01  # S19 (Manual)
-            s20 = (data[2] >> 4) & 0x01  # S20 (Auto)
+            # 비상정지 상태: Active=1이면 비상정지, Release=1이면 해제
+            emergency_stop = (emergency_stop_active == 1)
 
-            # 비상정지
-            emergency_stop = (data[7] >> 0) & 0x01
-
-            # 기타 스위치들
-            s13 = (data[1] >> 5) & 0x01  # 브레이크
-            s14 = (data[1] >> 6) & 0x01  # 위치 리셋
-            s17 = (data[2] >> 1) & 0x01
-            s18 = (data[2] >> 2) & 0x01
-            s21 = (data[2] >> 5) & 0x01
-            s22 = (data[2] >> 6) & 0x01
-            s23 = (data[2] >> 7) & 0x01
-            s24 = (data[3] >> 0) & 0x01
+            # Byte 3: S19/S20 모드 스위치
+            byte3 = data[3]
+            s19 = (byte3 >> 4) & 0x01  # Manual mode
+            s20 = (byte3 >> 5) & 0x01  # Auto mode
 
             # RemoteControl 메시지 생성
             remote_msg = RemoteControl()
-            remote_msg.switch_s10 = (s19 == 1)  # Manual mode
+            remote_msg.switch_s10 = (s19 == 1)  # Manual mode (S10=S19)
             remote_msg.switch_s20 = (s20 == 1)  # Auto mode
-            remote_msg.emergency_stop = (emergency_stop == 1)
+            remote_msg.emergency_stop = emergency_stop
 
             # 조이스틱 값 포함 (이전에 저장한 값 사용)
             an1 = getattr(self, 'joystick_an1', 127)
@@ -257,6 +327,22 @@ class CANParser(Node):
                 float((an3 - 127) / 127.0),
                 float((an4 - 127) / 127.0)
             ]
+
+            # 기타 스위치들 (Byte 1, 2)
+            byte1 = data[1]
+            byte2 = data[2]
+            s13 = (byte1 >> 5) & 0x01
+            s14 = (byte1 >> 6) & 0x01
+
+            # 버튼 재매핑: S17/S18이 byte3 상위 비트(0x40, 0x80)로 들어옴
+            s17 = (byte3 >> 6) & 0x01
+            s18 = (byte3 >> 7) & 0x01
+
+            # 기타 스위치는 기존 위치 유지 (필요 시 추후 보정)
+            s21 = (byte2 >> 5) & 0x01
+            s22 = (byte2 >> 6) & 0x01
+            s23 = (byte2 >> 7) & 0x01
+            s24 = (byte3 >> 0) & 0x01
 
             # 기타 스위치 상태 (배열로 저장)
             remote_msg.buttons = [s13, s14, s17, s18, s21, s22, s23, s24]
