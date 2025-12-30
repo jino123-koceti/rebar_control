@@ -227,7 +227,7 @@ class CANSender(Node):
                 # 전송
                 self.bus.send(can_msg)
 
-                self.get_logger().info(
+                self.get_logger().debug(
                     f"[CAN TX 0x{motor_id:03X}] 0x{command:02X} Encoder/Angle 요청"
                 )
 
@@ -236,14 +236,17 @@ class CANSender(Node):
 
     def joint_control_callback(self, msg):
         """
-        JointControl 메시지를 받아 위치 제어 명령 전송
+        JointControl 메시지를 받아 위치/속도 제어 명령 전송
 
-        RMD-X4 Position Control Command:
-        - Command Type: 0xA4 (Multi-turn Position Control)
+        RMD-X4 Position Control Command (0xA4):
         - Data: [0xA4, 0x00, max_speed_low, max_speed_high,
                  position_0, position_1, position_2, position_3]
         - Max Speed: uint16, 1 dps/LSB
         - Position: int32, 0.01 degree/LSB
+
+        RMD-X4 Speed Control Command (0xA2):
+        - Data: [0xA2, 0x00, 0x00, 0x00, speed_0, speed_1, speed_2, speed_3]
+        - Speed: int32, 0.01 dps/LSB
         """
         if not self.bus:
             return
@@ -253,6 +256,17 @@ class CANSender(Node):
             target_deg = msg.position
             max_speed_dps = msg.velocity
             mode = msg.control_mode
+
+            # 속도 제어 모드 (MODE_SPEED = 2)
+            if mode == JointControl.MODE_SPEED:
+                # position 필드에 속도(dps)가 들어옴
+                speed_dps = target_deg
+                if abs(speed_dps) < 0.1:
+                    # 속도 0이면 정지 명령 (0x81) - 관성 오버슈트 방지
+                    self._send_motor_stop(motor_id)
+                else:
+                    self._send_speed_command_joint(motor_id, speed_dps)
+                return
 
             self.get_logger().info(
                 f"[JointControl RX] ID:0x{motor_id:03X} pos:{target_deg:.1f}° vel:{max_speed_dps:.0f}dps mode:{mode}"
@@ -279,6 +293,87 @@ class CANSender(Node):
 
         except Exception as e:
             self.get_logger().error(f"JointControl 전송 오류: {e}")
+
+    def _send_speed_command_joint(self, motor_id, speed_dps):
+        """
+        관절 모터 속도 제어 CAN 명령 전송 (0xA2)
+
+        Parameters:
+        - motor_id: 모터 CAN ID (0x144, 0x145 등)
+        - speed_dps: 속도 (dps, degree per second)
+        """
+        if not self.bus:
+            return
+
+        try:
+            # 속도 변환: dps → 0.01 dps/LSB
+            speed_cmd = int(speed_dps * 100.0)
+
+            # 속도 제한: ±30000 (= ±300 dps)
+            speed_cmd = max(-30000, min(30000, speed_cmd))
+
+            # 속도 바이트 (int32, little-endian)
+            speed_bytes = struct.pack('<i', speed_cmd)
+
+            # 데이터 패킹
+            data = [
+                0xA2,  # Command Type: Speed Control
+                0x00,  # Reserved
+                0x00,  # Reserved
+                0x00,  # Reserved
+                speed_bytes[0],  # Speed byte 0 (LSB)
+                speed_bytes[1],  # Speed byte 1
+                speed_bytes[2],  # Speed byte 2
+                speed_bytes[3],  # Speed byte 3 (MSB)
+            ]
+
+            # CAN 메시지 생성
+            can_msg = can.Message(
+                arbitration_id=motor_id,
+                data=data,
+                is_extended_id=False
+            )
+
+            # 전송
+            self.bus.send(can_msg)
+
+            # 조이스틱 연속 제어는 로그 최소화 (DEBUG 레벨)
+            self.get_logger().debug(
+                f"[CAN TX 0x{motor_id:03X}] 속도 명령: {speed_dps:.1f} dps"
+            )
+
+        except Exception as e:
+            self.get_logger().error(f"CAN 속도 명령 전송 실패 (ID: 0x{motor_id:03X}): {e}")
+
+    def _send_motor_stop(self, motor_id):
+        """
+        모터 정지 CAN 명령 전송 (0x81)
+        관성으로 인한 오버슈트 방지를 위한 즉시 정지 명령
+
+        Parameters:
+        - motor_id: 모터 CAN ID (0x144, 0x145 등)
+        """
+        if not self.bus:
+            return
+
+        try:
+            # 0x81: Motor Stop (clear running status)
+            data = [0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+            can_msg = can.Message(
+                arbitration_id=motor_id,
+                data=data,
+                is_extended_id=False
+            )
+
+            self.bus.send(can_msg)
+
+            self.get_logger().debug(
+                f"[CAN TX 0x{motor_id:03X}] 모터 정지 (0x81)"
+            )
+
+        except Exception as e:
+            self.get_logger().error(f"모터 정지 명령 전송 실패 (ID: 0x{motor_id:03X}): {e}")
 
     def _send_position_command(self, motor_id, target_deg, max_speed_dps):
         """

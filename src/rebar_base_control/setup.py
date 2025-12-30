@@ -14,6 +14,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
+        # entry_points handles executables, no need for lib/ data_files
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -27,9 +28,12 @@ setup(
             'can_parser = rebar_base_control.can_parser:main',
             'can_sender = rebar_base_control.can_sender:main',
             'drive_controller = rebar_base_control.drive_controller:main',
+            'joint_controller = rebar_base_control.joint_controller:main',
             'modbus_controller = rebar_base_control.modbus_controller:main',
             'authority_controller = rebar_base_control.authority_controller:main',
             'navigator_base = rebar_base_control.navigator_base:main',
+            'ezi_io_controller = rebar_base_control.ezi_io_controller:main',
+            'sequence_controller = rebar_base_control.sequence_controller:main',
         ],
     },
 )

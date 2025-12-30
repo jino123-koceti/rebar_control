@@ -18,7 +18,10 @@ install(PROGRAMS
   rebar_base_control/can_parser.py
   rebar_base_control/can_sender.py
   rebar_base_control/drive_controller.py
+  rebar_base_control/joint_controller.py
+  rebar_base_control/sequence_controller.py
   rebar_base_control/modbus_controller.py
+  rebar_base_control/ezi_io_controller.py
   rebar_base_control/authority_controller.py
   rebar_base_control/navigator_base.py
   DESTINATION lib/${PROJECT_NAME}

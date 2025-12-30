@@ -16,6 +16,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MotorFeedback.msg"
   "msg/IOStatus.msg"
   "msg/GripperControl.msg"
+  "msg/JointControl.msg"
+  "msg/Waypoint.msg"
+  "msg/WaypointArray.msg"
   DEPENDENCIES std_msgs
 )
 

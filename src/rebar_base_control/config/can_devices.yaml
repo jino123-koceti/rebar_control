@@ -13,13 +13,74 @@ can_sender:
     can_bitrate: 1000000  # 1Mbps
     left_motor_id: 0x141
     right_motor_id: 0x142
-    wheel_radius: 0.1  # meters
+    lateral_motor_id: 0x143
+    wheel_radius: 0.02865  # meters (0x141/0x142: 1 rev = 0.18 m)
 
 drive_controller:
   ros__parameters:
     wheel_base: 0.5  # meters (바퀴 간 거리)
-    max_linear_vel: 10.0  # m/s
+    max_linear_vel: 1.0  # m/s
     max_angular_vel: 2.0  # rad/s
+    speed_scale_factor: 0.25  # 속도 스케일링 (0.25 = 정격의 25%, 테스트용)
     joystick_deadzone: 20  # 조이스틱 데드존 (0-127 범위)
     joystick_center: 127  # 조이스틱 중립값
     publish_frequency: 20  # Hz (Tire Roller 방식 - 주기적 발행)
+    lateral_position_tolerance: 1.0  # 도달 판정 오차 (deg) - 1회전=5cm 기계 정밀도
+    # RMD X4-36 엔코더: uint16 (0~65535) = 360° (출력축 기준, 감속 후)
+    # 실측 (2025-12-18): 평균 360 counts/360° → 360 CPR
+    lateral_encoder_cpr: 360.0  # counts per revolution (출력축, 실측값)
+
+joint_controller:
+  ros__parameters:
+    # === 횡이동 모터 (0x143) ===
+    lateral_step_deg: 360.0  # S17, S18 단위 (degree)
+    # RMD X4-36 (0x143): 정격 속도 83rpm (498 dps)
+    # 테스트 결과: 150dps → 실속도 37.6dps (25%), 200dps로 상향 시도
+    lateral_max_speed: 200.0  # 0x143 최대 속도 (dps) - 정격: 498 dps
+
+    # === Yaw 모터 (0x147) ===
+    yaw_step_deg: 5.0  # S23, S24 단위 (degree)
+    yaw_max_speed: 134.0  # 0x147 최대 속도 (dps)
+
+    # === 3축 스테이지 (0x144, 0x145, 0x146) ===
+    # X축 스테이지 (0x144) - AN1 조이스틱 제어
+    stage_x_step_deg: 36.0      # 1mm = 36° (리드스크류 10mm/rev 가정)
+    stage_x_max_speed: 200.0    # dps
+
+    # Y축 스테이지 (0x145) - AN2 조이스틱 제어
+    stage_y_step_deg: 36.0      # 1mm = 36° (리드스크류 10mm/rev 가정)
+    stage_y_max_speed: 200.0    # dps
+
+    # Z축 스테이지 (0x146) - S21(하강)/S22(상승) 버튼 제어
+    stage_z_step_deg: 36.0      # 1mm = 36° (리드스크류 10mm/rev 가정)
+    stage_z_max_speed: 200.0    # dps
+
+    # 조이스틱 설정
+    joystick_deadzone: 0.15     # 15% 데드존 (-1.0 ~ 1.0 범위)
+    joystick_scale: 1.0         # 조이스틱 감도 스케일
+
+    # 명령 간격
+    command_interval: 6.0  # 명령 간 최소 간격 (초) - 5초 이동시간 + 1초 여유
+
+    # 리밋 센서 사용 여부
+    use_limit_sensors: true  # false로 설정하면 리밋 체크 비활성화
+
+ezi_io_controller:
+  ros__parameters:
+    # EZI-IO 모듈 연결 설정
+    ip_address: '192.168.0.6'
+    board_id: 0
+    update_rate: 20.0  # Hz
+
+    # 리미트 센서 채널 매핑 (FASTECH EZI-IO-EN-L16O16N-T)
+    # X축 스테이지 (0x144)
+    limit_x_min_channel: 2   # IN02
+    limit_x_max_channel: 3   # IN03
+    # Y축 스테이지 (0x145)
+    limit_y_min_channel: 1   # IN01
+    limit_y_max_channel: 0   # IN00
+    # Z축 스테이지 (0x146)
+    limit_z_min_channel: 5   # IN05
+    limit_z_max_channel: 6   # IN06
+    # Yaw 원점 (0x147)
+    limit_yaw_home_channel: 4  # IN04

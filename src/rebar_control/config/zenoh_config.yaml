@@ -1,0 +1,21 @@
+zenoh_client:
+  ros__parameters:
+    # Zenoh 설정
+    zenoh_mode: "peer"                  # peer or client
+    # zenoh_router: "192.168.1.100"    # client 모드일 때만 사용
+    # zenoh_port: 7447
+
+    # Zenoh Keys
+    command_key: "rebar/command"        # UI → Robot
+    status_key: "rebar/status"          # Robot → UI (msgpack)
+    pose_key: "rebar/pose"              # Robot → UI (msgpack)
+
+    # ROS2 Topics
+    mission_command_topic: "/mission/command"
+    mission_status_topic: "/mission/status"
+    robot_pose_topic: "/robot_pose"
+    control_mode_topic: "/control_mode"
+
+    # 업데이트 주기
+    status_publish_rate: 10.0           # Hz
+    pose_publish_rate: 20.0             # Hz

@@ -3,21 +3,20 @@
 <package format="3">
   <name>rebar_control</name>
   <version>0.1.0</version>
-  <description>Integrated control system for rebar tying robot</description>
-  <maintainer email="koceti@todo.todo">koceti</maintainer>
+  <description>Rebar upper control layer (Phase 3)</description>
+  <maintainer email="koceti@example.com">koceti</maintainer>
   <license>MIT</license>
 
   <depend>rclpy</depend>
-  <depend>std_msgs</depend>
+  <depend>rebar_base_interfaces</depend>
   <depend>geometry_msgs</depend>
-  <depend>sensor_msgs</depend>
-  <depend>rmd_robot_control</depend>
-  <depend>pololu_ros2</depend>
-  <depend>seengrip_ros2</depend>
-  <depend>ezi_io_ros2</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
 
-  <exec_depend>joy</exec_depend>
-  <exec_depend>teleop_twist_joy</exec_depend>
+  <!-- Python dependencies -->
+  <exec_depend>python3-zenoh</exec_depend>
+  <exec_depend>python3-msgpack</exec_depend>
+  <exec_depend>python3-statemachine</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

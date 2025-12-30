@@ -10,9 +10,28 @@ CAN3 (250kbps): 리모콘 (0x1E4, 0x2E4, 0x764)
 import rclpy
 from rclpy.node import Node
 from rebar_base_interfaces.msg import MotorFeedback, RemoteControl
+from std_msgs.msg import String
 import can
 import struct
 import threading
+import json
+
+# RMD-X4 모터 에러 코드 (데이터시트 기준)
+MOTOR_ERROR_CODES = {
+    0x00: "No error",
+    0x01: "Motor stall",
+    0x02: "Low voltage",
+    0x03: "Overvoltage",
+    0x04: "Overcurrent",
+    0x05: "Motor overheated",
+    0x06: "MOS overheated",
+    0x07: "Encoder error",
+    0x08: "Phase wire break",
+}
+
+# 온도 임계값 (°C)
+MOTOR_TEMP_WARNING = 70   # 경고
+MOTOR_TEMP_CRITICAL = 85  # 위험
 
 
 class CANParser(Node):
@@ -42,6 +61,12 @@ class CANParser(Node):
         self.remote_control_pub = self.create_publisher(
             RemoteControl,
             '/remote_control',
+            10
+        )
+        # 모터 에러 발행자
+        self.motor_error_pub = self.create_publisher(
+            String,
+            '/motor_errors',
             10
         )
 
@@ -130,13 +155,13 @@ class CANParser(Node):
         can_id = can_msg.arbitration_id
         data = can_msg.data
 
-        # 모터 응답 ID 확인 (0x241, 0x242, 0x243)
-        if can_id not in [0x241, 0x242, 0x243]:
+        # 모터 응답 ID 확인 (0x241~0x247: 주행+횡이동+3축스테이지+Yaw)
+        if can_id not in [0x241, 0x242, 0x243, 0x244, 0x245, 0x246, 0x247]:
             return
 
-        # 모터 ID 계산 (0x241 -> 0x41, 0x242 -> 0x42, 0x243 -> 0x43)
+        # 모터 ID 계산 (0x241 -> 0x41, ..., 0x247 -> 0x47)
         # uint8 범위: 0x141 = 321 (범위 초과) → 0x41 = 65 사용
-        motor_id = can_id - 0x200  # 0x241 -> 0x41, 0x242 -> 0x42, 0x243 -> 0x43
+        motor_id = can_id - 0x200  # 0x241 -> 0x41, 0x244 -> 0x44, etc.
 
         if len(data) < 8:
             return
@@ -162,18 +187,13 @@ class CANParser(Node):
 
                 self.motor_feedback_pub.publish(feedback_msg)
 
-                # 관측 로그 (0x243)
+                # 관측 로그 (DEBUG 레벨로 변경 - 반복 로그 방지)
                 if motor_id == 0x43:
-                    self.get_logger().info(
-                        f"[PUB /motor_feedback] id:0x{motor_id:02X} status:0x{command_type:02X} enc:{encoder_position} raw:{encoder_raw} offset:{encoder_offset}",
-                        throttle_duration_sec=0.2
+                    self.get_logger().debug(
+                        f"[PUB /motor_feedback] id:0x{motor_id:02X} status:0x{command_type:02X} enc:{encoder_position} raw:{encoder_raw} offset:{encoder_offset}"
                     )
-
-                # 0x243 로그 (info)
-                if motor_id == 0x43:
-                    self.get_logger().info(
-                        f"[0x90 RX 0x243] encoder:{encoder_position} raw:{encoder_raw} offset:{encoder_offset}",
-                        throttle_duration_sec=0.5
+                    self.get_logger().debug(
+                        f"[0x90 RX 0x243] encoder:{encoder_position} raw:{encoder_raw} offset:{encoder_offset}"
                     )
                 return
 
@@ -193,10 +213,33 @@ class CANParser(Node):
 
                 self.motor_feedback_pub.publish(feedback_msg)
 
-                if motor_id == 0x43:
-                    self.get_logger().info(
-                        f"[0x92 RX 0x243] angle:{angle_deg:.2f}° raw:{angle_raw}",
-                        throttle_duration_sec=0.5
+                # 0x43~0x47 (횡이동 + 3축 스테이지 + Yaw) 로깅
+                if motor_id in [0x43, 0x44, 0x45, 0x46, 0x47]:
+                    self.get_logger().debug(
+                        f"[0x92 RX 0x2{motor_id:02X}] angle:{angle_deg:.2f}° raw:{angle_raw}"
+                    )
+                return
+
+            # 0x94: Single-Circle Angle (0.01 deg/LSB, 0~360°)
+            if command_type == 0x94:
+                angle_raw = struct.unpack('<H', data[6:8])[0]  # uint16, 0.01°/LSB
+                angle_deg = angle_raw * 0.01
+
+                feedback_msg = MotorFeedback()
+                feedback_msg.motor_id = motor_id
+                feedback_msg.current_position = float(angle_deg)
+                feedback_msg.current_speed = 0.0
+                feedback_msg.current_current = 0
+                feedback_msg.temperature = 0
+                feedback_msg.error_code = 0
+                feedback_msg.status = command_type
+
+                self.motor_feedback_pub.publish(feedback_msg)
+
+                # 0x43~0x47 (횡이동 + 3축 스테이지 + Yaw) 로깅
+                if motor_id in [0x43, 0x44, 0x45, 0x46, 0x47]:
+                    self.get_logger().debug(
+                        f"[0x94 RX 0x2{motor_id:02X}] angle:{angle_deg:.2f}° raw:{angle_raw}"
                     )
                 return
 
@@ -207,6 +250,28 @@ class CANParser(Node):
             speed = struct.unpack('<h', data[4:6])[0]  # dps or rpm
             angle_deg = struct.unpack('<h', data[6:8])[0]  # int16, 1°/LSB (프로토콜 정의)
 
+            # 에러 코드 추출 (온도 기반 + 전류 기반)
+            error_code = 0
+
+            # 온도 기반 에러 감지
+            if temperature >= MOTOR_TEMP_CRITICAL:
+                error_code = 0x05  # Motor overheated
+                self.get_logger().error(
+                    f"🔥 모터 0x{motor_id + 0x100:03X} 과열 위험: {temperature}°C"
+                )
+            elif temperature >= MOTOR_TEMP_WARNING:
+                self.get_logger().warn(
+                    f"⚠️ 모터 0x{motor_id + 0x100:03X} 온도 경고: {temperature}°C",
+                    throttle_duration_sec=5.0
+                )
+
+            # 과전류 감지 (모터 정격의 2배 이상)
+            if abs(torque_current) > 20.0:  # 20A 초과 시 경고
+                error_code = 0x04  # Overcurrent
+                self.get_logger().error(
+                    f"⚡ 모터 0x{motor_id + 0x100:03X} 과전류: {torque_current:.2f}A"
+                )
+
             # MotorFeedback 메시지 생성
             feedback_msg = MotorFeedback()
             feedback_msg.motor_id = motor_id  # 0x41 or 0x42 (uint8 범위)
@@ -214,18 +279,30 @@ class CANParser(Node):
             feedback_msg.current_position = float(angle_deg)  # 0xA2 응답의 각도 필드
             feedback_msg.current_current = int(torque_current * 1000)  # A -> mA
             feedback_msg.temperature = temperature
-            feedback_msg.error_code = 0  # TODO: 에러 코드 파싱
+            feedback_msg.error_code = error_code  # 에러 코드 설정
             feedback_msg.status = command_type
 
             # 발행
             self.motor_feedback_pub.publish(feedback_msg)
 
-            # 0x243 (0x143) 피드백 로그 (throttle 1초)
+            # 에러 발생 시 /motor_errors 토픽으로도 발행
+            if error_code != 0:
+                error_msg = String()
+                error_msg.data = json.dumps({
+                    'motor_id': f'0x{motor_id + 0x100:03X}',
+                    'error_code': error_code,
+                    'error_message': MOTOR_ERROR_CODES.get(error_code, 'Unknown'),
+                    'temperature': temperature,
+                    'current': torque_current,
+                    'timestamp': self.get_clock().now().nanoseconds // 1000000  # ms
+                })
+                self.motor_error_pub.publish(error_msg)
+
+            # 0x243 (0x143) 피드백 로그 (DEBUG 레벨로 변경 - 반복 로그 방지)
             if motor_id == 0x43:
                 hex_data = data.hex()
-                self.get_logger().info(
-                    f"[CAN RX 0x243] RAW:{hex_data} angle:{angle_deg} speed:{speed}dps current:{torque_current:.2f}A temp:{temperature}°C",
-                    throttle_duration_sec=0.2
+                self.get_logger().debug(
+                    f"[CAN RX 0x243] RAW:{hex_data} angle:{angle_deg} speed:{speed}dps current:{torque_current:.2f}A temp:{temperature}°C"
                 )
 
         except Exception as e:
@@ -338,11 +415,11 @@ class CANParser(Node):
             s17 = (byte3 >> 6) & 0x01
             s18 = (byte3 >> 7) & 0x01
 
-            # 기타 스위치는 기존 위치 유지 (필요 시 추후 보정)
-            s21 = (byte2 >> 5) & 0x01
-            s22 = (byte2 >> 6) & 0x01
-            s23 = (byte2 >> 7) & 0x01
-            s24 = (byte3 >> 0) & 0x01
+            # S21/S22/S23/S24: 이전 코드(iron_md_teleop_node.py) 참고 - byte3에서 파싱
+            s21 = (byte3 >> 2) & 0x01  # byte3 비트 2
+            s22 = (byte3 >> 3) & 0x01  # byte3 비트 3
+            s23 = (byte3 >> 0) & 0x01  # byte3 비트 0
+            s24 = (byte3 >> 1) & 0x01  # byte3 비트 1
 
             # 기타 스위치 상태 (배열로 저장)
             remote_msg.buttons = [s13, s14, s17, s18, s21, s22, s23, s24]

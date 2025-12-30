@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""
+Joint Controller Node
+관절(위치제어) 모터 통합 제어
+
+역할:
+- Manual 모드: 리모콘 스위치 → 상대 위치 제어 (S17, S18, S21, S22, S23, S24)
+- Auto 모드: 상위 계층 명령 → 절대/상대 위치 제어
+
+제어 모터:
+- 0x143: 횡이동 (Lateral Move)
+- 0x144: X축
+- 0x145: Y축
+- 0x146: Z축
+- 0x147: Yaw 회전
+"""
+
+import rclpy
+from rclpy.node import Node
+from rebar_base_interfaces.msg import RemoteControl, JointControl
+from std_msgs.msg import String
+import time
+
+
+class JointController(Node):
+    """관절 위치 제어를 통합 관리하는 노드"""
+
+    def __init__(self):
+        super().__init__('joint_controller')
+
+        # 파라미터 선언
+        self.declare_parameter('lateral_step_deg', 360.0)  # S17, S18 단위 (도)
+        self.declare_parameter('lateral_max_speed', 150.0)  # 0x143 최대 속도 (dps)
+        self.declare_parameter('yaw_step_deg', 5.0)  # S23, S24 단위 (도)
+        self.declare_parameter('yaw_max_speed', 134.0)  # 0x147 최대 속도 (dps)
+        self.declare_parameter('command_interval', 0.3)  # 명령 간 최소 간격 (초)
+
+        # 파라미터 가져오기
+        self.lateral_step = self.get_parameter('lateral_step_deg').value
+        self.lateral_speed = self.get_parameter('lateral_max_speed').value
+        self.yaw_step = self.get_parameter('yaw_step_deg').value
+        self.yaw_speed = self.get_parameter('yaw_max_speed').value
+        self.command_interval = self.get_parameter('command_interval').value
+
+        # 상태 변수
+        self.control_mode = 'idle'  # idle, manual, auto
+        self.last_command_time = {}  # 모터별 마지막 명령 시간
+        self.current_positions = {
+            0x143: 0.0,  # 횡이동
+            0x144: 0.0,  # X축
+            0x145: 0.0,  # Y축
+            0x146: 0.0,  # Z축
+            0x147: 0.0,  # Yaw
+        }
+
+        # 이전 스위치 상태 (엣지 감지용)
+        self.prev_buttons = [0] * 8
+
+        # ROS2 Subscribers
+        self.remote_control_sub = self.create_subscription(
+            RemoteControl,
+            '/remote_control',
+            self.remote_control_callback,
+            10
+        )
+
+        self.control_mode_sub = self.create_subscription(
+            String,
+            '/authority_status',
+            self.control_mode_callback,
+            10
+        )
+
+        # Auto 모드용 상위 계층 명령 (추후 구현)
+        # self.joint_command_sub = ...
+
+        # ROS2 Publisher
+        self.joint_control_pub = self.create_publisher(
+            JointControl,
+            '/joint_control',
+            10
+        )
+
+        self.get_logger().info("Joint Controller 노드 초기화 완료")
+        self.get_logger().info(f"  - Lateral step: {self.lateral_step}° @ {self.lateral_speed} dps")
+        self.get_logger().info(f"  - Yaw step: {self.yaw_step}° @ {self.yaw_speed} dps")
+        self.get_logger().info(f"  - Command interval: {self.command_interval}s")
+
+    def control_mode_callback(self, msg):
+        """제어 모드 업데이트"""
+        old_mode = self.control_mode
+        self.control_mode = msg.data
+
+        if old_mode != self.control_mode:
+            self.get_logger().info(f"제어 모드 변경: {old_mode} → {self.control_mode}")
+
+    def remote_control_callback(self, msg):
+        """
+        리모콘 신호 처리 (Manual 모드 전용)
+
+        버튼 매핑 (can_parser.py 참조):
+        - buttons[0]: S13 (브레이크)
+        - buttons[1]: S14 (리셋)
+        - buttons[2]: S17
+        - buttons[3]: S18
+        - buttons[4]: S21
+        - buttons[5]: S22
+        - buttons[6]: S23
+        - buttons[7]: S24
+        """
+        # Manual 모드에서만 동작
+        if self.control_mode != 'manual':
+            return
+
+        # S17, S18: 횡이동 (0x143) ±360도
+        self._handle_lateral_move(msg)
+
+        # S23, S24: Yaw 회전 (0x147) ±5도
+        self._handle_yaw_rotation(msg)
+
+        # S21, S22: 작업 시퀀스 (추후 구현)
+        # self._handle_work_sequence(msg)
+
+        # 이전 버튼 상태 저장
+        self.prev_buttons = msg.buttons.copy() if msg.buttons else [0] * 8
+
+    def _handle_lateral_move(self, msg):
+        """
+        횡이동 제어 (S17/S18: ±360도)
+        0x143 모터
+        """
+        if not msg.buttons or len(msg.buttons) < 4:
+            return
+
+        s17 = msg.buttons[2]
+        s18 = msg.buttons[3]
+        prev_s17 = self.prev_buttons[2] if len(self.prev_buttons) > 2 else 0
+        prev_s18 = self.prev_buttons[3] if len(self.prev_buttons) > 3 else 0
+
+        # 엣지 감지 (0 → 1)
+        s17_pressed = (prev_s17 == 0 and s17 == 1)
+        s18_pressed = (prev_s18 == 0 and s18 == 1)
+
+        if s17_pressed:
+            # +360도 회전
+            self._send_relative_position(
+                motor_id=0x143,
+                delta_position=self.lateral_step,
+                max_speed=self.lateral_speed,
+                name='횡이동'
+            )
+
+        elif s18_pressed:
+            # -360도 회전
+            self._send_relative_position(
+                motor_id=0x143,
+                delta_position=-self.lateral_step,
+                max_speed=self.lateral_speed,
+                name='횡이동'
+            )
+
+    def _handle_yaw_rotation(self, msg):
+        """
+        Yaw 회전 제어 (S23/S24: ±5도)
+        0x147 모터
+        """
+        if not msg.buttons or len(msg.buttons) < 8:
+            return
+
+        s23 = msg.buttons[6]
+        s24 = msg.buttons[7]
+        prev_s23 = self.prev_buttons[6] if len(self.prev_buttons) > 6 else 0
+        prev_s24 = self.prev_buttons[7] if len(self.prev_buttons) > 7 else 0
+
+        # 엣지 감지 (0 → 1)
+        s23_pressed = (prev_s23 == 0 and s23 == 1)
+        s24_pressed = (prev_s24 == 0 and s24 == 1)
+
+        if s23_pressed:
+            # +5도 회전
+            self._send_relative_position(
+                motor_id=0x147,
+                delta_position=self.yaw_step,
+                max_speed=self.yaw_speed,
+                name='Yaw'
+            )
+
+        elif s24_pressed:
+            # -5도 회전
+            self._send_relative_position(
+                motor_id=0x147,
+                delta_position=-self.yaw_step,
+                max_speed=self.yaw_speed,
+                name='Yaw'
+            )
+
+    def _send_relative_position(self, motor_id, delta_position, max_speed, name='Joint'):
+        """
+        상대 위치 제어 명령 전송
+
+        Parameters:
+        - motor_id: 모터 CAN ID (0x143, 0x147 등)
+        - delta_position: 상대 이동량 (degree)
+        - max_speed: 최대 속도 (dps)
+        - name: 모터 이름 (로깅용)
+        """
+        # 명령 간격 체크 (과부하 방지)
+        current_time = time.time()
+        if motor_id in self.last_command_time:
+            elapsed = current_time - self.last_command_time[motor_id]
+            if elapsed < self.command_interval:
+                self.get_logger().warn(
+                    f"⏸️  {name} (0x{motor_id:03X}) 명령 간격 부족: {elapsed:.2f}s < {self.command_interval}s"
+                )
+                return
+
+        # 현재 위치 업데이트 (누적)
+        self.current_positions[motor_id] += delta_position
+
+        # JointControl 메시지 생성
+        msg = JointControl()
+        msg.joint_id = motor_id
+        msg.position = delta_position  # 상대 위치
+        msg.velocity = max_speed
+        msg.control_mode = JointControl.MODE_RELATIVE  # 상대 위치 모드
+
+        # 발행
+        self.joint_control_pub.publish(msg)
+
+        # 로그
+        direction = "+" if delta_position > 0 else ""
+        self.get_logger().info(
+            f"🔧 {name} (0x{motor_id:03X}): {direction}{delta_position:.1f}° "
+            f"@ {max_speed:.0f} dps (누적: {self.current_positions[motor_id]:.1f}°)"
+        )
+
+        # 마지막 명령 시간 기록
+        self.last_command_time[motor_id] = current_time
+
+    def _send_absolute_position(self, motor_id, target_position, max_speed, name='Joint'):
+        """
+        절대 위치 제어 명령 전송 (Auto 모드용, 추후 구현)
+
+        Parameters:
+        - motor_id: 모터 CAN ID
+        - target_position: 목표 절대 위치 (degree)
+        - max_speed: 최대 속도 (dps)
+        - name: 모터 이름 (로깅용)
+        """
+        # JointControl 메시지 생성
+        msg = JointControl()
+        msg.joint_id = motor_id
+        msg.position = target_position
+        msg.velocity = max_speed
+        msg.control_mode = JointControl.MODE_ABSOLUTE
+
+        # 발행
+        self.joint_control_pub.publish(msg)
+
+        # 로그
+        self.get_logger().info(
+            f"🎯 {name} (0x{motor_id:03X}): → {target_position:.1f}° "
+            f"@ {max_speed:.0f} dps (절대위치)"
+        )
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = JointController()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
