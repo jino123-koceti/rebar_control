@@ -40,6 +40,8 @@ class SequenceState(Enum):
     # S22 시퀀스
     S22_TRIGGER = auto()
     S22_WAIT_TRIGGER = auto()
+    S22_TRIGGER_RETURN = auto()
+    S22_WAIT_TRIGGER_RETURN = auto()
     S22_GRIPPER_OPEN = auto()
     S22_WAIT_OPEN = auto()
     S22_Z_UP = auto()
@@ -149,6 +151,14 @@ class SequenceController(Node):
             10
         )
 
+        # 자동 시퀀스 명령 구독 (tying_orchestrator에서 트리거)
+        self.sequence_cmd_sub = self.create_subscription(
+            String,
+            '/sequence_cmd',
+            self.sequence_cmd_callback,
+            10
+        )
+
         # 상태 머신 타이머 (20Hz)
         self.timer = self.create_timer(0.05, self.state_machine_loop)
 
@@ -156,6 +166,29 @@ class SequenceController(Node):
         self.get_logger().info(f"  - S21: Z 하강 {self.z_down_deg}°")
         self.get_logger().info(f"  - S22: Z 상승 {self.z_up_deg}° (리밋까지)")
         self.get_logger().info(f"  - Z 속도: {self.z_speed} dps")
+
+    def sequence_cmd_callback(self, msg: String):
+        """자동 모드 시퀀스 명령 수신 (tying_orchestrator에서 호출)"""
+        if self.state != SequenceState.IDLE:
+            self.get_logger().warn(
+                f"시퀀스 명령 거부: 현재 {self.state.name} 상태"
+            )
+            return
+
+        command = msg.data
+
+        if command == "AUTO_S21":
+            self.get_logger().info("=" * 50)
+            self.get_logger().info("[AUTO] S21 시퀀스 시작: 하강 -> 닫힘")
+            self.get_logger().info("=" * 50)
+            self._start_s21_sequence()
+        elif command == "AUTO_S22":
+            self.get_logger().info("=" * 50)
+            self.get_logger().info("[AUTO] S22 시퀀스 시작: 열림 -> 상승")
+            self.get_logger().info("=" * 50)
+            self._start_s22_sequence()
+        else:
+            self.get_logger().warn(f"알 수 없는 시퀀스 명령: {command}")
 
     def remote_callback(self, msg: RemoteControl):
         """리모콘 입력 처리"""
@@ -274,19 +307,30 @@ class SequenceController(Node):
             self._transition_to(SequenceState.S22_WAIT_TRIGGER)
 
         elif self.state == SequenceState.S22_WAIT_TRIGGER:
-            if elapsed >= self.wait_trigger:
-                self._send_trigger_command(False)  # 트리거 해제
-                self.get_logger().info(f"  [2/5] 대기 완료 ({self.wait_trigger}초)")
+            if elapsed >= 1.0:  # 1초 후 역방향 원복
+                self._send_trigger_command(False)  # 트리거 정지
+                self.get_logger().info("  [2/7] 트리거 1초 대기 완료")
+                self._transition_to(SequenceState.S22_TRIGGER_RETURN)
+
+        elif self.state == SequenceState.S22_TRIGGER_RETURN:
+            self._send_trigger_return_command()  # 역방향 원복
+            self.get_logger().info("  [3/7] 트리거 원복 시작")
+            self._transition_to(SequenceState.S22_WAIT_TRIGGER_RETURN)
+
+        elif self.state == SequenceState.S22_WAIT_TRIGGER_RETURN:
+            if elapsed >= 1.0:  # 1초 후 정지
+                self._send_trigger_command(False)  # 트리거 정지
+                self.get_logger().info("  [4/7] 트리거 원복 완료")
                 self._transition_to(SequenceState.S22_GRIPPER_OPEN)
 
         elif self.state == SequenceState.S22_GRIPPER_OPEN:
             self._send_gripper_command(GripperControl.COMMAND_OPEN)
-            self.get_logger().info("  [3/5] 그리퍼 열기")
+            self.get_logger().info("  [5/7] 그리퍼 열기")
             self._transition_to(SequenceState.S22_WAIT_OPEN)
 
         elif self.state == SequenceState.S22_WAIT_OPEN:
             if elapsed >= self.wait_open:
-                self.get_logger().info(f"  [4/5] 대기 완료 ({self.wait_open}초)")
+                self.get_logger().info(f"  [6/7] 대기 완료 ({self.wait_open}초)")
                 self._transition_to(SequenceState.S22_Z_UP)
 
         elif self.state == SequenceState.S22_Z_UP:
@@ -368,6 +412,13 @@ class SequenceController(Node):
         vel_msg.data = self.trigger_speed if activate else 0.0
         self.pololu_trigger_pub.publish(vel_msg)
         self.get_logger().info(f"🔧 트리거: {'ON' if activate else 'OFF'} (vel={vel_msg.data})")
+
+    def _send_trigger_return_command(self):
+        """트리거 역방향 원복 명령 전송"""
+        vel_msg = Float32()
+        vel_msg.data = -self.trigger_speed  # 역방향
+        self.pololu_trigger_pub.publish(vel_msg)
+        self.get_logger().info(f"🔧 트리거 원복: vel={vel_msg.data}")
 
     def _publish_status(self, status: str):
         """시퀀스 상태 발행"""

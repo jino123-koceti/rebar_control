@@ -19,6 +19,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/JointControl.msg"
   "msg/Waypoint.msg"
   "msg/WaypointArray.msg"
+  "msg/RebarDetection.msg"
+  "msg/RebarGrid.msg"
+  "srv/DetectCrossings.srv"
   DEPENDENCIES std_msgs
 )
 

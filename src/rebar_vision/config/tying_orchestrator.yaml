@@ -1,0 +1,23 @@
+# 결속 오케스트레이터 설정
+# 3축 스테이지 + 결속 시퀀스 자동화 파라미터
+
+tying_orchestrator:
+  ros__parameters:
+    # 스테이지 파라미터
+    deg_per_mm: 36.0             # 리드스크류: 36도 = 1mm
+    stage_max_speed_dps: 200.0   # 최대 속도 (degree/s)
+    stage_settling_time: 1.5     # 이동 후 안정 대기 시간 (초)
+    max_stage_timeout: 10.0      # 스테이지 이동 최대 대기 시간 (초)
+    position_tolerance_deg: 5.0  # 위치 허용오차 (~0.14mm)
+
+    # 스테이지 이동 범위 제한 (mm)
+    # 주의: 실제 스트로크 측정 후 이 값을 업데이트해야 함
+    max_stage_x_mm: 500.0        # X축 최대 이동 범위 (TODO: 실측 필요)
+    max_stage_y_mm: 500.0        # Y축 최대 이동 범위 (TODO: 실측 필요)
+
+    # 결속 시퀀스 타이밍
+    inter_point_delay: 0.5       # 포인트 간 대기 시간 (초)
+
+    # 검출 재시도
+    detection_retry_count: 3     # 검출 실패 시 재시도 횟수
+    detection_retry_delay: 1.0   # 재시도 대기 시간 (초)

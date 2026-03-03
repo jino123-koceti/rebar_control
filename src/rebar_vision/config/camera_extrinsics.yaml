@@ -1,0 +1,26 @@
+# 카메라 외부 파라미터 설정 (비전 기반 철근 교차점 검출)
+# 위치: mm (로봇 기준), 회전: degrees [pitch, roll, yaw]
+
+rebar_detection_node:
+  ros__parameters:
+    # YOLO 모델
+    model_path: '/home/koceti/ros2_ws/src/rebar_vision/model/best.pt'
+    confidence_threshold: 0.5
+    depth_kernel_size: 5
+    max_depth_m: 2.0
+    min_depth_m: 0.05
+
+    # 그리드 설정
+    grid_rows: 2
+    grid_cols: 3
+    dedup_distance_mm: 20.0
+
+    # 좌측 카메라 (zedxmini1, SN: 56755054)
+    left_camera:
+      position: [-200.0, 100.0, 108.0]
+      rotation: [40.0, 0.0, -20.0]   # pitch, roll, yaw
+
+    # 우측 카메라 (zedxmini2, SN: 54946194)
+    right_camera:
+      position: [-200.0, -100.0, 108.0]
+      rotation: [40.0, 0.0, 20.0]

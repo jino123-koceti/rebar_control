@@ -15,6 +15,9 @@ setup(
         # Launch 파일
         (os.path.join('share', package_name, 'launch'),
             glob('launch/*.launch.py')),
+        # Config 파일
+        (os.path.join('share', package_name, 'config'),
+            glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -30,6 +33,8 @@ setup(
     entry_points={
         'console_scripts': [
             'dual_camera_recorder = rebar_vision.dual_camera_recorder_node:main',
+            'rebar_detection = rebar_vision.rebar_detection_node:main',
+            'tying_orchestrator = rebar_vision.tying_orchestrator_node:main',
         ],
     },
 )

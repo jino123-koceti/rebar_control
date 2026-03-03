@@ -1,0 +1,13 @@
+# DetectCrossings.srv
+# 철근 교차점 검출 서비스
+
+# Request
+uint8 camera_selection       # 0=양쪽, 1=좌측만, 2=우측만
+float32 confidence_threshold # 최소 신뢰도 (기본 0.5)
+uint8 expected_count         # 예상 교차점 수 (기본 6)
+---
+# Response
+bool success
+RebarGrid grid               # 정렬된 검출 그리드
+string message               # 상태 메시지
+float32 detection_time_ms    # 추론 시간 (ms)
