@@ -42,6 +42,7 @@ class RebarDetectionNode(Node):
         self.declare_parameter('grid_rows', 2)
         self.declare_parameter('grid_cols', 3)
         self.declare_parameter('dedup_distance_mm', 20.0)
+        self.declare_parameter('detection_strategy', 'cross')  # cross, merge, single
 
         # 카메라 외부 파라미터 (position: mm, rotation: degrees)
         self.declare_parameter('left_camera.position', [-200.0, 100.0, 108.0])
@@ -58,6 +59,7 @@ class RebarDetectionNode(Node):
         self.grid_rows = self.get_parameter('grid_rows').value
         self.grid_cols = self.get_parameter('grid_cols').value
         self.dedup_distance_mm = self.get_parameter('dedup_distance_mm').value
+        self.detection_strategy = self.get_parameter('detection_strategy').value
 
         self.camera_extrinsics = {
             'left': {
@@ -150,6 +152,11 @@ class RebarDetectionNode(Node):
         self.get_logger().info(f'  신뢰도: {self.confidence_threshold}')
         self.get_logger().info(f'  그리드: {self.grid_rows}x{self.grid_cols}')
         self.get_logger().info(f'  깊이 범위: {self.min_depth_m}~{self.max_depth_m}m')
+        self.get_logger().info(f'  검출 전략: {self.detection_strategy}')
+        if self.detection_strategy == 'cross':
+            self.get_logger().info(
+                '    Left cam → Y- (먼쪽) 3pt, Right cam → Y+ (먼쪽) 3pt'
+            )
         self.get_logger().info('=' * 60)
 
     # ============================================
@@ -254,35 +261,80 @@ class RebarDetectionNode(Node):
             right_depth = self.bridge.imgmsg_to_cv2(right_depth_msg, 'passthrough')
 
             all_detections = []
+            strategy = self.detection_strategy
 
-            # 카메라별 검출
-            if request.camera_selection in (0, 1):  # 좌측 또는 양쪽
+            # 단일 카메라 요청 시 strategy 무관하게 처리
+            if request.camera_selection in (1, 2):
+                strategy = 'single'
+
+            if strategy == 'cross':
+                # ===== Cross Detection 전략 =====
+                # Left 카메라(Y=+100mm) → 먼 쪽(Y-) 포인트 검출
+                # Right 카메라(Y=-100mm) → 먼 쪽(Y+) 포인트 검출
+                # 각 카메라가 3개씩, 총 6개 → 중복 제거 불필요
+                left_dets = []
+                right_dets = []
+
                 if self.left_camera_info:
-                    dets = self._detect_single_camera(
+                    left_dets = self._detect_single_camera(
                         left_rgb, left_depth,
                         self.left_camera_info,
                         self.camera_extrinsics['left'],
                         camera_id=0,
                         conf_threshold=conf_threshold
                     )
-                    all_detections.extend(dets)
+                    # Left 카메라: 먼 쪽 = Y가 작은 포인트 (Y-)
+                    left_dets = self._filter_far_side(
+                        left_dets, camera_side='left',
+                        max_points=self.grid_cols
+                    )
 
-            if request.camera_selection in (0, 2):  # 우측 또는 양쪽
                 if self.right_camera_info:
-                    dets = self._detect_single_camera(
+                    right_dets = self._detect_single_camera(
                         right_rgb, right_depth,
                         self.right_camera_info,
                         self.camera_extrinsics['right'],
                         camera_id=1,
                         conf_threshold=conf_threshold
                     )
-                    all_detections.extend(dets)
+                    # Right 카메라: 먼 쪽 = Y가 큰 포인트 (Y+)
+                    right_dets = self._filter_far_side(
+                        right_dets, camera_side='right',
+                        max_points=self.grid_cols
+                    )
+
+                all_detections = left_dets + right_dets
+
+            else:
+                # ===== Merge / Single 전략 =====
+                if request.camera_selection in (0, 1):  # 좌측 또는 양쪽
+                    if self.left_camera_info:
+                        dets = self._detect_single_camera(
+                            left_rgb, left_depth,
+                            self.left_camera_info,
+                            self.camera_extrinsics['left'],
+                            camera_id=0,
+                            conf_threshold=conf_threshold
+                        )
+                        all_detections.extend(dets)
+
+                if request.camera_selection in (0, 2):  # 우측 또는 양쪽
+                    if self.right_camera_info:
+                        dets = self._detect_single_camera(
+                            right_rgb, right_depth,
+                            self.right_camera_info,
+                            self.camera_extrinsics['right'],
+                            camera_id=1,
+                            conf_threshold=conf_threshold
+                        )
+                        all_detections.extend(dets)
+
+                # merge 전략: 양쪽 카메라 중복 제거
+                if strategy == 'merge' and request.camera_selection == 0:
+                    if len(all_detections) > expected_count:
+                        all_detections = self._deduplicate(all_detections)
 
             total_detected = len(all_detections)
-
-            # 양쪽 카메라 사용 시 중복 제거
-            if request.camera_selection == 0 and len(all_detections) > expected_count:
-                all_detections = self._deduplicate(all_detections)
 
             # 2x3 그리드 정렬
             grid = self._sort_into_grid(
@@ -443,6 +495,35 @@ class RebarDetectionNode(Node):
         return Rz @ Ry @ Rx
 
     # ============================================
+    # Cross Detection: 먼 쪽 포인트 필터링
+    # ============================================
+    def _filter_far_side(self, detections, camera_side, max_points):
+        """카메라 반대쪽(먼 쪽) 포인트만 필터링
+
+        Left 카메라 (Y=+100mm): Y가 작은(Y-) 포인트 = 카메라 기준 먼 쪽
+        Right 카메라 (Y=-100mm): Y가 큰(Y+) 포인트 = 카메라 기준 먼 쪽
+
+        깊이 최소 측정거리 문제를 회피하고, 결속 공구 가림 문제도 감소
+        """
+        if not detections:
+            return detections
+
+        if camera_side == 'left':
+            # Left 카메라: Y가 작은 순서 (먼 쪽)로 정렬 → 상위 max_points 선택
+            sorted_dets = sorted(detections, key=lambda d: d.y)
+        else:
+            # Right 카메라: Y가 큰 순서 (먼 쪽)로 정렬 → 상위 max_points 선택
+            sorted_dets = sorted(detections, key=lambda d: d.y, reverse=True)
+
+        selected = sorted_dets[:max_points]
+
+        self.get_logger().debug(
+            f'[{camera_side}] 전체 {len(detections)}개 중 '
+            f'먼 쪽 {len(selected)}개 선택'
+        )
+        return selected
+
+    # ============================================
     # 중복 제거
     # ============================================
     def _deduplicate(self, detections):
@@ -476,9 +557,11 @@ class RebarDetectionNode(Node):
     def _sort_into_grid(self, detections, grid_rows, grid_cols):
         """검출 결과를 2x3 그리드 순서로 정렬
 
-        그리드 레이아웃 (로봇 X=전방):
-          Row 0 (작은 X, 가까운 쪽): [col0] [col1] [col2]  Y 기준 정렬
-          Row 1 (큰 X, 먼 쪽):      [col0] [col1] [col2]  Y 기준 정렬
+        그리드 레이아웃 (로봇 기준, X=전방, Y=횡방향):
+          Row 0 (Y- 쪽, Right 카메라가 담당): [col0] [col1] [col2]  X 기준 정렬
+          Row 1 (Y+ 쪽, Left 카메라가 담당):  [col0] [col1] [col2]  X 기준 정렬
+
+        Cross 전략에서는 camera_id로 자연 분리 가능
         """
         grid = RebarGrid()
         grid.grid_rows = grid_rows
@@ -490,8 +573,7 @@ class RebarDetectionNode(Node):
             grid.error_message = (
                 f'{expected}개 필요, {len(detections)}개만 검출됨'
             )
-            # 검출된 것이라도 정렬해서 반환
-            sorted_dets = sorted(detections, key=lambda d: (d.x, d.y))
+            sorted_dets = sorted(detections, key=lambda d: (d.y, d.x))
             grid.detections = sorted_dets
             return grid
 
@@ -499,14 +581,21 @@ class RebarDetectionNode(Node):
         sorted_by_conf = sorted(detections, key=lambda d: d.confidence, reverse=True)
         selected = sorted_by_conf[:expected]
 
-        # X 기준 정렬 → 행 분리
-        sorted_by_x = sorted(selected, key=lambda d: d.x)
-        row_0 = sorted_by_x[:grid_cols]
-        row_1 = sorted_by_x[grid_cols:]
+        if self.detection_strategy == 'cross':
+            # Cross 전략: camera_id로 행 분리
+            # camera_id=1 (Right) → Y- 먼 쪽 = Row 0
+            # camera_id=0 (Left) → Y+ 먼 쪽 = Row 1
+            row_0 = [d for d in selected if d.camera_id == 1]  # Right → Y-
+            row_1 = [d for d in selected if d.camera_id == 0]  # Left → Y+
+        else:
+            # Merge/Single: Y 기준 정렬 → 행 분리
+            sorted_by_y = sorted(selected, key=lambda d: d.y)
+            row_0 = sorted_by_y[:grid_cols]  # Y가 작은 행
+            row_1 = sorted_by_y[grid_cols:]  # Y가 큰 행
 
-        # 각 행을 Y 기준 정렬
-        row_0.sort(key=lambda d: d.y)
-        row_1.sort(key=lambda d: d.y)
+        # 각 행을 X 기준 정렬 (전방 방향 순서)
+        row_0.sort(key=lambda d: d.x)
+        row_1.sort(key=lambda d: d.x)
 
         grid.detections = row_0 + row_1
         grid.valid = True
