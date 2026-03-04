@@ -50,25 +50,29 @@ class TyingOrchestratorNode(Node):
         # ============================================
         # 파라미터 선언
         # ============================================
-        self.declare_parameter('deg_per_mm', 36.0)
+        self.declare_parameter('deg_per_mm_x', 2.698)
+        self.declare_parameter('deg_per_mm_y', 2.677)
         self.declare_parameter('stage_max_speed_dps', 200.0)
         self.declare_parameter('stage_settling_time', 1.5)
         self.declare_parameter('max_stage_timeout', 10.0)
         self.declare_parameter('position_tolerance_deg', 5.0)
-        self.declare_parameter('max_stage_x_mm', 500.0)
-        self.declare_parameter('max_stage_y_mm', 500.0)
+        self.declare_parameter('max_stage_x_mm', 420.0)
+        self.declare_parameter('max_stage_y_mm', 300.0)
+        self.declare_parameter('max_yaw_deg', 243.0)
         self.declare_parameter('inter_point_delay', 0.5)
         self.declare_parameter('detection_retry_count', 3)
         self.declare_parameter('detection_retry_delay', 1.0)
 
         # 파라미터 가져오기
-        self.deg_per_mm = self.get_parameter('deg_per_mm').value
+        self.deg_per_mm_x = self.get_parameter('deg_per_mm_x').value
+        self.deg_per_mm_y = self.get_parameter('deg_per_mm_y').value
         self.stage_max_speed = self.get_parameter('stage_max_speed_dps').value
         self.stage_settling_time = self.get_parameter('stage_settling_time').value
         self.max_stage_timeout = self.get_parameter('max_stage_timeout').value
         self.position_tolerance = self.get_parameter('position_tolerance_deg').value
         self.max_stage_x_mm = self.get_parameter('max_stage_x_mm').value
         self.max_stage_y_mm = self.get_parameter('max_stage_y_mm').value
+        self.max_yaw_deg = self.get_parameter('max_yaw_deg').value
         self.inter_point_delay = self.get_parameter('inter_point_delay').value
         self.detection_retry_count = self.get_parameter('detection_retry_count').value
         self.detection_retry_delay = self.get_parameter('detection_retry_delay').value
@@ -155,11 +159,11 @@ class TyingOrchestratorNode(Node):
 
         self.get_logger().info('=' * 60)
         self.get_logger().info('Tying Orchestrator 노드 초기화 완료')
-        self.get_logger().info(f'  스테이지: {self.deg_per_mm} deg/mm')
-        self.get_logger().info(f'  스테이지 속도: {self.stage_max_speed} dps')
-        self.get_logger().info(f'  안정화 시간: {self.stage_settling_time}s')
-        self.get_logger().info(f'  X 최대: {self.max_stage_x_mm}mm, '
-                               f'Y 최대: {self.max_stage_y_mm}mm')
+        self.get_logger().info(f'  X: {self.deg_per_mm_x} deg/mm, 최대 {self.max_stage_x_mm}mm')
+        self.get_logger().info(f'  Y: {self.deg_per_mm_y} deg/mm, 최대 {self.max_stage_y_mm}mm')
+        self.get_logger().info(f'  Yaw 최대: {self.max_yaw_deg}°')
+        self.get_logger().info(f'  속도: {self.stage_max_speed} dps, '
+                               f'안정화: {self.stage_settling_time}s')
         self.get_logger().info('=' * 60)
 
     # ============================================
@@ -358,9 +362,9 @@ class TyingOrchestratorNode(Node):
             self._transition_to(TyingState.ADVANCING)
             return
 
-        # mm → degree 변환
-        dx_deg = dx_mm * self.deg_per_mm
-        dy_deg = dy_mm * self.deg_per_mm
+        # mm → degree 변환 (축별 변환비)
+        dx_deg = dx_mm * self.deg_per_mm_x
+        dy_deg = dy_mm * self.deg_per_mm_y
 
         self.get_logger().info(
             f'  [{self.current_point_index + 1}/{len(self.grid.detections)}] '
@@ -443,7 +447,7 @@ class TyingOrchestratorNode(Node):
         if abs(self.stage_x_accumulated) > 0.1:
             x_msg = JointControl()
             x_msg.joint_id = 0x144
-            x_msg.position = -self.stage_x_accumulated * self.deg_per_mm
+            x_msg.position = -self.stage_x_accumulated * self.deg_per_mm_x
             x_msg.velocity = self.stage_max_speed
             x_msg.control_mode = JointControl.MODE_RELATIVE
             self.joint_pub.publish(x_msg)
@@ -451,7 +455,7 @@ class TyingOrchestratorNode(Node):
         if abs(self.stage_y_accumulated) > 0.1:
             y_msg = JointControl()
             y_msg.joint_id = 0x145
-            y_msg.position = -self.stage_y_accumulated * self.deg_per_mm
+            y_msg.position = -self.stage_y_accumulated * self.deg_per_mm_y
             y_msg.velocity = self.stage_max_speed
             y_msg.control_mode = JointControl.MODE_RELATIVE
             self.joint_pub.publish(y_msg)
