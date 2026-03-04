@@ -18,7 +18,7 @@ Monitors limit sensors for XYZ stage control.
 ### Connections
 - **Device**: FASTECH EZI-IO-EN-L16O16N-T
 - **Communication**: Ethernet (Modbus TCP)
-- **IP Address**: 192.168.0.3 (상부체 스테이지)
+- **IP Address**: 192.168.0.6 (tying head stage)
 - **Port**: 502
 - **Slave ID**: 1
 
@@ -81,14 +81,14 @@ ros2 topic echo /ezi_io/diagnostics
 ### Published
 | Topic | Type | Rate | Description |
 |-------|------|------|-------------|
-| `/limit_sensors/x_min` | std_msgs/Bool | 20Hz | X축 원점 리미트 (IN02) |
-| `/limit_sensors/x_max` | std_msgs/Bool | 20Hz | X축 최대 리미트 (IN03) |
-| `/limit_sensors/y_min` | std_msgs/Bool | 20Hz | Y축 원점 리미트 (IN01) |
-| `/limit_sensors/y_max` | std_msgs/Bool | 20Hz | Y축 최대 리미트 (IN00) |
-| `/limit_sensors/z_min` | std_msgs/Bool | 20Hz | Z축 원점 리미트 (IN05) |
-| `/limit_sensors/z_max` | std_msgs/Bool | 20Hz | Z축 최대 리미트 (IN06) |
-| `/limit_sensors/yaw_min` | std_msgs/Bool | 20Hz | Yaw축 원점 리미트 (IN04) |
-| `/ezi_io/diagnostics` | diagnostic_msgs/DiagnosticArray | 20Hz | 전체 센서 상태 |
+| `/limit_sensors/x_min` | std_msgs/Bool | 20Hz | X-axis min limit (IN02) |
+| `/limit_sensors/x_max` | std_msgs/Bool | 20Hz | X-axis max limit (IN03) |
+| `/limit_sensors/y_min` | std_msgs/Bool | 20Hz | Y-axis min limit (IN01) |
+| `/limit_sensors/y_max` | std_msgs/Bool | 20Hz | Y-axis max limit (IN00) |
+| `/limit_sensors/z_min` | std_msgs/Bool | 20Hz | Z-axis min limit (IN05) |
+| `/limit_sensors/z_max` | std_msgs/Bool | 20Hz | Z-axis max limit (IN06) |
+| `/limit_sensors/yaw_min` | std_msgs/Bool | 20Hz | Yaw home limit (IN04) |
+| `/ezi_io/diagnostics` | diagnostic_msgs/DiagnosticArray | 20Hz | All sensor states |
 
 **Note**: `True` = Limit triggered (sensor activated), `False` = Clear
 
@@ -102,29 +102,29 @@ ros2 topic echo /ezi_io/diagnostics
 | `update_rate` | float | 20.0 | Update frequency (Hz) |
 | `input_start_address` | int | 0 | First input register |
 | `input_count` | int | 16 | Number of inputs to read |
-| `limit_x_min_channel` | int | 2 | X축 원점 리미트 (IN02) |
-| `limit_x_max_channel` | int | 3 | X축 최대 리미트 (IN03) |
-| `limit_y_min_channel` | int | 1 | Y축 원점 리미트 (IN01) |
-| `limit_y_max_channel` | int | 0 | Y축 최대 리미트 (IN00) |
-| `limit_z_min_channel` | int | 5 | Z축 원점 리미트 (IN05) |
-| `limit_z_max_channel` | int | 6 | Z축 최대 리미트 (IN06) |
-| `limit_yaw_min_channel` | int | 4 | Yaw축 원점 리미트 (IN04) |
+| `limit_x_min_channel` | int | 2 | X-axis min limit (IN02) |
+| `limit_x_max_channel` | int | 3 | X-axis max limit (IN03) |
+| `limit_y_min_channel` | int | 1 | Y-axis min limit (IN01) |
+| `limit_y_max_channel` | int | 0 | Y-axis max limit (IN00) |
+| `limit_z_min_channel` | int | 5 | Z-axis min limit (IN05) |
+| `limit_z_max_channel` | int | 6 | Z-axis max limit (IN06) |
+| `limit_yaw_min_channel` | int | 4 | Yaw home limit (IN04) |
 
-## Channel Mapping (실제 배선)
+## Channel Mapping (Actual Wiring)
 
-**상부체 스테이지 리미트 센서:**
+**Tying head stage limit sensors:**
 
 ```
-IN00: Y축 최대 리미트
-IN01: Y축 원점 리미트
-IN02: X축 원점 리미트
-IN03: X축 최대 리미트
-IN04: Yaw축 원점 리미트
-IN05: Z축 원점 리미트
-IN06: Z축 최대 리미트
+IN00: Y-axis max limit
+IN01: Y-axis min limit
+IN02: X-axis min limit
+IN03: X-axis max limit
+IN04: Yaw home limit
+IN05: Z-axis min limit
+IN06: Z-axis max limit
 ```
 
-설정 파일 (`config/ezi_io.yaml`)에 반영됨
+Reflected in config file (`config/ezi_io.yaml`)
 
 ## Troubleshooting
 

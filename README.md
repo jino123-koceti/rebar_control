@@ -1,369 +1,323 @@
-# 철근 결속 로봇 제어 시스템 (Rebar Tying Robot Control System)
+# Rebar Tying Robot Control System
 
-ROS2 Humble 기반 철근 결속 로봇 통합 제어 시스템
+ROS2 Humble-based integrated control system for an automated rebar tying robot used in construction sites.
 
-## 🤖 시스템 개요
+## System Overview
 
-이 프로젝트는 건설 현장에서 철근을 자동으로 결속하는 로봇의 제어 시스템입니다. ROS2 Humble을 기반으로 7개의 RMD 모터, Iron-MD 무선 리모콘, Seengrip 그리퍼, 리미트 센서 등을 통합 제어합니다.
+This project controls a rebar tying robot that automatically ties rebar intersections on construction sites. It integrates 7 RMD motors, an Iron-MD wireless remote controller, a Seengrip gripper, limit sensors, dual ZED X Mini cameras, and a YOLO-based vision system under ROS2 Humble.
 
-### 주요 기능
+### Key Features
 
-- **7축 RMD 모터 제어**: 위치/속도 제어, 이벤트 기반 피드백
-- **무선 리모콘 제어**: Iron-MD CAN 프로토콜 (4개 조이스틱, 24개 버튼)
-- **듀얼 CAN 버스**: can2 (1Mbps, 모터), can3 (250kbps, 리모콘)
-- **그리퍼 통합**: Seengrip Modbus RTU 제어
-- **리미트 센서**: FASTECH EZI-IO Modbus TCP
-- **헤드리스 운영**: 모니터 없는 환경에서 로그 중심 운영
-- **자동 시퀀스**: S21/S22 작업 시퀀스 (하강→그리퍼 닫기, 트리거→그리퍼 열기→상승)
+- **7-axis RMD motor control**: Position/velocity control with event-driven feedback
+- **Wireless remote control**: Iron-MD CAN protocol (4 joysticks, 24 buttons)
+- **Dual CAN bus**: can2 (1 Mbps, motors), can3 (250 kbps, remote)
+- **Gripper integration**: Seengrip Modbus RTU control
+- **Limit sensors**: FASTECH EZI-IO Modbus TCP (16 input channels)
+- **Dual camera vision**: ZED X Mini stereo cameras with YOLO rebar crossing detection
+- **Automated tying sequence**: Vision-guided 3-axis stage positioning + S21/S22 tying cycles
+- **Headless operation**: Log-based operation without monitor
 
-## 📋 시스템 아키텍처
+## System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Iron-MD Wireless Remote                  │
-│              (CAN3 @ 250kbps - 4 Joysticks)                │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                    ┌──────▼──────┐
-                    │  Ubuntu PC  │
-                    │ ROS2 Humble │
-                    └──────┬──────┘
-                           │
-        ┌──────────────────┼──────────────────┐
-        │                  │                  │
-   ┌────▼────┐      ┌──────▼──────┐    ┌─────▼─────┐
-   │  CAN2   │      │  Modbus RTU │    │Modbus TCP │
-   │ 1 Mbps  │      │/dev/ttyUSB0 │    │192.168.0.3│
-   └────┬────┘      └──────┬──────┘    └─────┬─────┘
-        │                  │                  │
-   ┌────▼────────────┐ ┌───▼────┐      ┌─────▼─────┐
-   │ 7 RMD Motors    │ │Seengrip│      │ EZI-IO    │
-   │ 0x141 - 0x147   │ │Gripper │      │  Sensors  │
-   └─────────────────┘ └────────┘      └───────────┘
+                    ┌───────────────────────────┐
+                    │  Iron-MD Wireless Remote   │
+                    │   (CAN3 @ 250 kbps)        │
+                    └─────────────┬─────────────┘
+                                  │
+                    ┌─────────────▼─────────────┐
+                    │   Jetson Orin / Ubuntu PC  │
+                    │       ROS2 Humble          │
+                    └─────────────┬─────────────┘
+                                  │
+       ┌──────────────┬───────────┼───────────┬──────────────┐
+       │              │           │           │              │
+  ┌────▼────┐   ┌─────▼─────┐ ┌──▼───┐ ┌─────▼─────┐  ┌────▼────┐
+  │  CAN2   │   │Modbus RTU │ │ USB  │ │Modbus TCP │  │  GMSL2  │
+  │ 1 Mbps  │   │ RS485     │ │Serial│ │ Ethernet  │  │ Camera  │
+  └────┬────┘   └─────┬─────┘ └──┬───┘ └─────┬─────┘  └────┬────┘
+       │              │          │            │              │
+  ┌────▼──────┐  ┌────▼────┐ ┌──▼──────┐ ┌───▼──────┐ ┌────▼──────┐
+  │ 7x RMD   │  │Seengrip │ │ Pololu  │ │ EZI-IO   │ │ 2x ZED X │
+  │ Motors   │  │ Gripper │ │Trigger  │ │ Sensors  │ │   Mini   │
+  │0x141-147 │  │         │ │ Motor   │ │ 16ch I/O │ │ (Stereo) │
+  └──────────┘  └─────────┘ └─────────┘ └──────────┘ └──────────┘
 ```
 
-### 모터 구성
+### Motor Configuration
 
-| Motor ID | Function | Control Type | Notes |
-|----------|----------|--------------|-------|
-| 0x141 | 좌측 주행 모터 | 속도 제어 (0xA2) | Differential drive |
-| 0x142 | 우측 주행 모터 | 속도 제어 (0xA2) | Differential drive |
-| 0x143 | 횡이동 (Lateral) | 위치 제어 (0xA4) | ±360° rotation |
-| 0x144 | X축 스테이지 | 속도 제어 (0xA2) | Linear motion |
-| 0x145 | Y축 스테이지 | 속도 제어 (0xA2) | Linear motion |
-| 0x146 | Z축 (상하) | 위치 제어 (0xA4) | Work sequence |
-| 0x147 | Yaw (회전) | 위치 제어 (0xA4) | ±30° rotation |
+| Motor ID | Function | Control Type | Measured Specs |
+|----------|----------|--------------|----------------|
+| 0x141 | Left drive motor | Velocity (0xA2) | Differential drive |
+| 0x142 | Right drive motor | Velocity (0xA2) | Differential drive |
+| 0x143 | Lateral traverse | Position (0xA4) | 360 CPR encoder |
+| 0x144 | X-axis stage | Velocity (0xA2) | 2.698 deg/mm, 420 mm stroke |
+| 0x145 | Y-axis stage | Velocity (0xA2) | 2.677 deg/mm, 300 mm stroke |
+| 0x146 | Z-axis (up/down) | Position (0xA4) | ~2.69 deg/mm |
+| 0x147 | Yaw (rotation) | Position (0xA4) | 243 deg stroke |
 
-## 🚀 빠른 시작
+### Camera Setup
 
-### 필수 요구사항
+Two ZED X Mini cameras mounted in an inward-facing V configuration:
 
-- **OS**: Ubuntu 22.04 LTS
+| Camera | Position (mm) | Tilt | Yaw | Facing |
+|--------|---------------|------|-----|--------|
+| Left (zedxmini1) | [-200, +100, 108] | 40 deg | -20 deg | Right-inward |
+| Right (zedxmini2) | [-200, -100, 108] | 40 deg | +20 deg | Left-inward |
+
+## Package Structure
+
+### rebar_base_control
+Core robot control nodes for the rebar tying robot.
+
+| Node | Description |
+|------|-------------|
+| `can_parser.py` | CAN message receiver and ROS2 message converter |
+| `can_sender.py` | ROS2 to CAN message transmitter |
+| `drive_controller.py` | Differential drive kinematics (`/cmd_vel` to motor commands) |
+| `joint_controller.py` | Stage/yaw motor control (0x143-0x147) with joystick and button input |
+| `sequence_controller.py` | S21/S22 tying work sequences (descend, grip, trigger, ascend) |
+| `authority_controller.py` | S10 (Manual) / S20 (Auto) mode switching |
+| `ezi_io_controller.py` | FASTECH EZI-IO limit sensor monitoring via Modbus TCP |
+| `modbus_controller.py` | Seengrip gripper + EZI-IO integration |
+| `navigator_base.py` | State machine for autonomous navigation |
+| `lateral_motion.py` | Lateral traverse (0x143) motion module |
+
+### rebar_base_interfaces
+Custom ROS2 message and service definitions.
+
+| Type | Name | Description |
+|------|------|-------------|
+| msg | DriveControl | Differential drive motor commands |
+| msg | MotorFeedback | Motor position/velocity/status feedback |
+| msg | RemoteControl | Iron-MD remote controller state |
+| msg | JointControl | Joint position/velocity commands |
+| msg | GripperControl | Gripper open/close commands |
+| msg | IOStatus | Digital I/O sensor states |
+| msg | RebarDetection | Single rebar crossing detection result (3D coordinates) |
+| msg | RebarGrid | 2x3 grid of detected rebar crossings |
+| srv | DetectCrossings | Request rebar crossing detection from vision system |
+
+### rebar_vision
+Vision system for rebar crossing detection and automated tying orchestration.
+
+| Node | Description |
+|------|-------------|
+| `rebar_detection_node.py` | YOLO-based rebar crossing detection with dual camera fusion |
+| `tying_orchestrator_node.py` | Automated tying sequence: detect crossings, move stage, trigger S21/S22 |
+| `dual_camera_recorder_node.py` | Dual ZED X Mini data collection for training |
+
+**Detection strategies**: `cross` (each camera detects far-side points), `merge` (combine both cameras), `single` (one camera only)
+
+### rmd_robot_control
+Low-level RMD motor communication and control.
+
+| Node | Description |
+|------|-------------|
+| `position_control_node.py` | 7-motor integrated control (CAN protocol) |
+| `can_manager.py` | SocketCAN communication manager |
+
+### Supporting Packages
+
+| Package | Description |
+|---------|-------------|
+| `seengrip_ros2` | Seengrip gripper Modbus RTU driver |
+| `ezi_io_ros2` | FASTECH EZI-IO limit sensor Modbus TCP driver |
+| `pololu_ros2` | Pololu Simple Motor Controller driver (trigger motor) |
+
+## Quick Start
+
+### Prerequisites
+
+- **OS**: Ubuntu 22.04 LTS (Jetson Orin / x86_64)
 - **ROS**: ROS2 Humble
-- **Hardware**: 
-  - CAN 인터페이스 2개 (can2, can3)
-  - USB-Serial 변환기 (/dev/ttyUSB0)
-  - Ethernet (192.168.0.3 네트워크)
+- **Hardware**:
+  - 2x CAN interfaces (can2, can3)
+  - USB-Serial adapter (/dev/ttyUSB0)
+  - Ethernet (192.168.0.x network)
+  - 2x ZED X Mini cameras (GMSL2)
 
-### 설치
+### Installation
 
 ```bash
-# 저장소 클론
-git clone https://github.com/jino123-koceti/rebar_remote.git
-cd rebar_remote
+# Clone repository
+git clone https://github.com/jino123-koceti/rebar_control.git
+cd rebar_control
 
-# ROS2 의존성 설치
+# Install ROS2 dependencies
 sudo apt update
 sudo apt install ros-humble-desktop python3-pip
 
-# Python 패키지 설치
-pip3 install python-can pymodbus pyserial
+# Install Python packages
+pip3 install python-can pymodbus pyserial ultralytics
 
-# CAN 인터페이스 설정
+# Setup CAN interfaces
 sudo ip link set can2 type can bitrate 1000000
 sudo ip link set can3 type can bitrate 250000
 sudo ip link set can2 up
 sudo ip link set can3 up
 
-# 빌드
+# Build
 source /opt/ros/humble/setup.bash
 colcon build
 source install/setup.bash
 ```
 
-### 실행
+### Running
 
-#### 방법 1: 통합 스크립트 (권장)
+#### Method 1: Systemd Service (Production)
 
 ```bash
-# 헤드리스 환경 - 로그 중심 실행
-./integrated_control_debug.sh
+# Enable and start the service
+sudo systemctl enable robot-control.service
+sudo systemctl start robot-control.service
 
-# 로그 실시간 모니터링
-tail -f /var/log/robot_control/control_latest.log
+# Check status
+sudo systemctl status robot-control.service
 
-# 로그 뷰어 사용
-./view_logs.sh -f  # 실시간 로그
-./view_logs.sh -e  # 에러만 보기
-./view_logs.sh -j  # 조이스틱 로그
+# View logs
+journalctl -u robot-control.service -f
 ```
 
-#### 방법 2: 개별 노드 실행
+#### Method 2: Launch Files
 
 ```bash
-# 터미널 1: RMD 모터 제어
+# Base control system (motors, remote, sensors)
+ros2 launch rebar_base_control base_system.launch.py
+
+# Vision-guided tying system (cameras + detection + orchestrator)
+ros2 launch rebar_vision vision_tying.launch.py
+```
+
+#### Method 3: Individual Nodes
+
+```bash
+# Terminal 1: RMD motor control
 ros2 run rmd_robot_control position_control_node
 
-# 터미널 2: EZI-IO 센서
-ros2 run ezi_io_ros2 ezi_io_node --ros-args -p ip_address:=192.168.0.3
+# Terminal 2: EZI-IO limit sensors
+ros2 run ezi_io_ros2 ezi_io_node --ros-args -p ip_address:=192.168.0.6
 
-# 터미널 3: Seengrip 그리퍼
+# Terminal 3: Seengrip gripper
 ros2 run seengrip_ros2 seengrip_node --ros-args -p serial_port:=/dev/ttyUSB0
-
-# 터미널 4: Iron-MD 텔레옵
-ros2 run rebar_control iron_md_teleop
 ```
 
-## 🎮 리모콘 매핑 (Iron-MD)
+## Remote Controller Mapping (Iron-MD)
 
-### 조이스틱 (Analog) - 실제 리모콘 조작 기준
+### Joysticks (Analog)
 
-| Joystick | Function | Motor | Range | Code Mapping |
-|----------|----------|-------|-------|--------------|
-| AN3 | 전후진 | 0x141, 0x142 | -1.0 ~ 1.0 | angular 변수 (모터 180도 장착) |
-| AN4 | 좌우 회전 | 0x141, 0x142 | -1.0 ~ 1.0 | linear 변수 (모터 180도 장착) |
-| AN1 | X축 이동 | 0x144 | ±200 dps | - |
-| AN2 | Y축 이동 | 0x145 | ±200 dps | - |
+| Joystick | Function | Motor | Range |
+|----------|----------|-------|-------|
+| AN3 | Forward/Backward | 0x141, 0x142 | -1.0 to 1.0 |
+| AN4 | Left/Right turn | 0x141, 0x142 | -1.0 to 1.0 |
+| AN1 | X-axis stage | 0x144 | +/-200 dps |
+| AN2 | Y-axis stage | 0x145 | +/-200 dps |
 
-> **Note**: 드라이브 모터(0x141, 0x142)가 180도 틀어져 장착되어 코드상 AN3/AN4 매핑이 역전되어 있습니다.
+> **Note**: Drive motors (0x141, 0x142) are mounted 180 degrees rotated, so AN3/AN4 mapping is inverted in code.
 
-### 버튼 (Digital)
+### Buttons (Digital)
 
 | Button | Function | Description |
 |--------|----------|-------------|
-| S13 | 브레이크 토글 | 모터 브레이크 해제/잠금 |
-| S14 | 홈잉 | 드라이브 모터 홈 리미트 탐색 |
-| S17 | 횡이동 + | 0x143 +360° 회전 |
-| S18 | 횡이동 - | 0x143 -360° 회전 |
-| S21 | 작업 시퀀스 1 | Z축 하강 → 그리퍼 닫기 |
-| S22 | 작업 시퀀스 2 | 트리거 → 그리퍼 열기 → Z축 상승 |
-| S23 | Yaw + | 0x147 +30° 회전 |
-| S24 | Yaw - | 0x147 -30° 회전 |
+| S10 | Manual mode | Switch to manual (remote) control |
+| S13 | Brake toggle | Motor brake release/lock |
+| S14 | Homing | Drive motor home limit search |
+| S17 | Lateral + | 0x143 +360 deg rotation (one full lead screw turn) |
+| S18 | Lateral - | 0x143 -360 deg rotation |
+| S20 | Auto mode | Switch to autonomous operation |
+| S21 | Work sequence 1 | Z-axis descend, gripper close |
+| S22 | Work sequence 2 | Trigger, gripper open, Z-axis ascend |
+| S23 | Yaw + | 0x147 +45 deg rotation |
+| S24 | Yaw - | 0x147 -45 deg rotation |
 
-## 📦 패키지 구조
+## Configuration
 
-### rebar_control
-Iron-MD 무선 리모콘 CAN 통신 및 텔레옵 제어
+### CAN Device Config: `src/rebar_base_control/config/can_devices.yaml`
 
-**주요 파일:**
-- `iron_md_teleop_node.py` (1,255줄): 메인 텔레옵 노드
-- `iron_md_joystick.dbc`: CAN DBC 정의
+Key parameters (measured 2026-03-04):
+- Stage X: 2.698 deg/mm (1133.29 deg / 420 mm)
+- Stage Y: 2.677 deg/mm (803.09 deg / 300 mm)
+- Stage Z: ~2.69 deg/mm (estimated, same mechanism)
+- Yaw: 243 deg total stroke (mechanical stoppers)
 
-**기능:**
-- CAN 0x1E4 (조이스틱), 0x2E4 (스위치), 0x764 (heartbeat) 파싱
-- ROS2 토픽 발행: `/cmd_vel`, `/joint_*/position`, `/gripper/position`
-- 작업 시퀀스 타이머 기반 비동기 실행
+### Limit Sensor Channel Mapping (EZI-IO)
 
-### rmd_robot_control
-RMD 모터 7개 통합 제어
+| Channel | Sensor | Description |
+|---------|--------|-------------|
+| IN00 | Y-axis max | Y+ limit |
+| IN01 | Y-axis min | Y- limit |
+| IN02 | X-axis min | X- limit |
+| IN03 | X-axis max | X+ limit |
+| IN04 | Yaw home | Yaw home position sensor |
+| IN05 | Z-axis min | Z bottom limit |
+| IN06 | Z-axis max | Z top limit |
 
-**주요 파일:**
-- `position_control_node.py` (1,140줄): 위치/속도 제어 노드
-- `can_manager.py`: CAN 통신 매니저
-- `rmd_x4_protocol.py`: RMD Protocol V4.3 구현
+## Troubleshooting
 
-**기능:**
-- 0xA4 절대 위치 제어 (0x143, 0x146, 0x147)
-- 0xA2 속도 제어 (0x141, 0x142, 0x144, 0x145)
-- 0x92 멀티턴 각도 읽기 (이벤트 기반)
-- 모터 에러 상태 자동 감지 및 로깅
-
-### seengrip_ros2
-Seengrip 그리퍼 Modbus RTU 제어
-
-**주요 파일:**
-- `seengrip_node.py`: Modbus RTU 통신 노드
-
-**기능:**
-- `/gripper/position` 구독 (0.0=열림, 1.0=닫힘)
-- Modbus 레지스터: 위치(40001), 속도(40002), 힘(40003)
-
-### ezi_io_ros2
-FASTECH EZI-IO 리미트 센서 Modbus TCP
-
-**주요 파일:**
-- `ezi_io_node.py`: Modbus TCP 통신 노드
-
-**기능:**
-- 6개 리미트 센서 모니터링 (IN00-IN06)
-- ROS2 토픽 발행: `/limit_sensors/*`
-- 10Hz 폴링
-
-### pololu_ros2
-Pololu Simple Motor Controller 제어
-
-**주요 파일:**
-- `pololu_node.py`: Pololu SMC 통신 노드
-- `pololu_driver.py`: SMC 드라이버
-
-**기능:**
-- 트리거 모터 제어 (forward/reverse)
-- USB 시리얼 통신
-
-## 🔧 설정 파일
-
-### CAN 인터페이스 자동 설정
+### CAN Bus Errors
 
 ```bash
-# /etc/systemd/network/80-can.network
-[Match]
-Name=can2
+# Restart CAN interface
+sudo ip link set can2 down && sudo ip link set can2 up
 
-[CAN]
-BitRate=1M
-
-[Match]
-Name=can3
-
-[CAN]
-BitRate=250K
-```
-
-### 부팅 시 자동 실행
-
-```bash
-# /etc/systemd/system/robot-control.service
-[Unit]
-Description=Rebar Robot Control System
-After=network.target
-
-[Service]
-Type=simple
-User=koceti
-WorkingDirectory=/home/koceti/ros2_ws
-ExecStart=/home/koceti/ros2_ws/integrated_control_debug.sh
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-활성화:
-```bash
-sudo systemctl enable robot-control.service
-sudo systemctl start robot-control.service
-```
-
-## 📊 로그 관리
-
-### 로그 위치
-
-- **메인 로그**: `/var/log/robot_control/control_YYYYMMDD_HHMMSS.log`
-- **최신 로그**: `/var/log/robot_control/control_latest.log` (심볼릭 링크)
-
-### 로그 유틸리티
-
-```bash
-# 실시간 로그 보기
-./view_logs.sh -f
-
-# 에러만 필터링
-./view_logs.sh -e
-
-# CAN 메시지만 보기
-./view_logs.sh -c
-
-# 조이스틱 입력 확인
-./view_logs.sh -j
-
-# 모터 제어 로그
-./view_logs.sh -m
-
-# 로그 통계
-./view_logs.sh -s
-
-# 로그 정리 (7일 이상, 500MB 초과)
-./cleanup_logs.sh
-```
-
-## 🐛 문제 해결
-
-### CAN 버스 에러
-
-```bash
-# CAN 인터페이스 재시작
-sudo ip link set can2 down
-sudo ip link set can2 up
-
-# CAN 에러 확인
+# Check CAN statistics
 ip -details -statistics link show can2
 
-# Bus-off 복구
+# Bus-off recovery
 sudo ip link set can2 type can restart-ms 100
 ```
 
-### 모터 에러 상태
+### Motor Error Codes
 
-모터 에러는 자동으로 로그에 기록됩니다:
-```
-[ERROR] MOTOR ERROR 0x146: Error State=0x04 (Overtemp=1)
-```
+| Code | Description |
+|------|-------------|
+| 0x01 | Low voltage |
+| 0x02 | Overcurrent |
+| 0x04 | Overtemperature |
+| 0x08 | Encoder error |
+| 0x10 | Overload |
 
-에러 코드:
-- `0x01`: Low Voltage (저전압)
-- `0x02`: Overcurrent (과전류)
-- `0x04`: Overtemp (과열)
-- `0x08`: Encoder Error (엔코더 오류)
-- `0x10`: Overload (과부하)
-
-### 그리퍼 연결 실패
+### Gripper Connection
 
 ```bash
-# 시리얼 포트 확인
-ls -l /dev/ttyUSB*
+# Check serial port
+ls -l /dev/ttyUSB* /dev/ttyACM*
 
-# 권한 설정
+# Set permissions
 sudo chmod 666 /dev/ttyUSB0
 
-# Modbus RTU 통신 테스트
-# (seengrip_ros2/seengrip_node.py 참고)
+# Or add user to dialout group (permanent)
+sudo usermod -a -G dialout $USER
 ```
 
-## 📚 문서
+## Utility Scripts
 
-- [ROBOT_CONTROL_ARCHITECTURE.md](ROBOT_CONTROL_ARCHITECTURE.md): 전체 시스템 아키텍처
-- [MOTOR_CONTROL_GUIDE.md](MOTOR_CONTROL_GUIDE.md): 모터 제어 상세 가이드
-- [HEADLESS_OPERATION.md](HEADLESS_OPERATION.md): 헤드리스 환경 운영
-- [FIX_MOTOR_CONTROL.md](FIX_MOTOR_CONTROL.md): 모터 제어 수정 사항
-- [src/rebar_control/IRON_MD_GUIDE.md](src/rebar_control/IRON_MD_GUIDE.md): Iron-MD 리모콘 가이드
+| Script | Description |
+|--------|-------------|
+| `measure_stroke.py` | Interactive motor stroke measurement via CAN (0x92 multi-turn read) |
+| `check_motor_alarm.py` | Check motor error/alarm status (0x9A) |
+| `cleanup_ros2_nodes.sh` | Clean up orphaned ROS2 processes |
+| `robot_control_service.sh` | Systemd service management helper |
 
-## 🔐 안전 기능
+## Safety Features
 
-- **비상 정지**: Iron-MD 리모콘 비상정지 버튼 (즉시 모든 모터 정지)
-- **리미트 센서**: EZI-IO 6개 센서로 동작 범위 제한
-- **브레이크 시스템**: 전원 차단 시 자동 브레이크 작동
-- **에러 감지**: 모터 과열/과전류 자동 감지 및 로깅
-- **프로세스 모니터링**: 5분마다 노드 상태 확인 및 로깅
+- **Emergency stop**: Iron-MD remote E-stop button (immediate all-motor stop)
+- **Limit sensors**: 7 sensors on EZI-IO for overtravel prevention (X/Y/Z min/max + Yaw home)
+- **Brake system**: Automatic brake engagement on power loss
+- **Error detection**: Motor overtemp/overcurrent auto-detection and logging
+- **Stroke limits**: Software-enforced stage travel limits based on measured values
 
-## 🤝 기여
+## License
 
-버그 리포트, 기능 제안, Pull Request 환영합니다!
+MIT License
 
-## 📝 라이선스
+## Team
 
-이 프로젝트는 MIT 라이선스 하에 배포됩니다.
-
-## 👥 개발자
-
-- **Koceti Robotics Team**
+- **KOCETI Robotics Team**
 - GitHub: [@jino123-koceti](https://github.com/jino123-koceti)
-
-## 📮 연락처
-
-문제가 있거나 질문이 있으시면 GitHub Issues를 이용해주세요.
 
 ---
 
-**Last Updated**: 2025-10-30  
-**ROS2 Version**: Humble  
-**Ubuntu Version**: 22.04 LTS
+**Last Updated**: 2026-03-04
+**ROS2 Version**: Humble
+**Platform**: Jetson Orin (Ubuntu 22.04 LTS, aarch64)

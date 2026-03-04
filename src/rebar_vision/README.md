@@ -1,350 +1,241 @@
-# Rebar Vision - 철근 교차점 인식 시스템
+# Rebar Vision - Rebar Crossing Detection System
 
-YOLO 기반 철근 배근 교차점 검출 및 3D 좌표 변환 시스템
+YOLO-based rebar crossing detection and 3D coordinate transformation for automated tying.
 
-## 📦 패키지 구성
+## Package Components
 
-### 현재 Phase: **Phase 1 - 데이터 수집** ✅
+### Nodes
 
-- `dual_camera_recorder_node.py`: 듀얼 ZED X mini 카메라 데이터 수집 노드
+| Node | Description |
+|------|-------------|
+| `rebar_detection_node.py` | YOLO inference + depth sampling + 3D coordinate transform |
+| `tying_orchestrator_node.py` | Automated tying state machine: detect, move stage, tie |
+| `dual_camera_recorder_node.py` | Dual ZED X Mini synchronized data collection |
 
-### 향후 개발 예정
+### Detection Strategies
 
-- `rebar_detector_node.py`: YOLO 기반 교차점 검출
-- `rebar_coordinate_transformer_node.py`: 2D→3D 좌표 변환
-- `rebar_fusion_node.py`: 좌우 카메라 검출 결과 융합
+The detection node supports three strategies via the `detection_strategy` parameter:
+
+- **`cross`** (default): Left camera detects far-side (Y-) points, right camera detects far-side (Y+) points. Avoids depth minimum distance issues and tool occlusion.
+- **`merge`**: Both cameras detect all points, results merged with duplicate removal (20 mm threshold).
+- **`single`**: Single camera only.
+
+### Detection Pipeline
+
+```
+1. Grab cached latest frames (RGB + Depth) from dual ZED cameras
+2. YOLO inference -> bounding boxes + confidence scores
+3. Extract center pixel (u, v) of each detection
+4. Sample depth from depth image (5x5 median filter)
+5. Pixel to camera 3D: X_cam = (u-cx)*Z/fx, Y_cam = (v-cy)*Z/fy
+6. Camera to robot frame: R(pitch, roll, yaw) @ P_cam + translation
+7. Merge dual camera results (duplicate removal within 20 mm)
+8. Sort into 2x3 grid: split by X into 2 rows, sort each row by Y
+```
+
+### Tying Orchestrator State Machine
+
+```
+IDLE -> DETECTING -> MOVING_TO_POINT -> WAITING_STAGE
+  -> EXECUTING_S21 -> WAITING_S21
+  -> EXECUTING_S22 -> WAITING_S22
+  -> ADVANCING -> (next point or COMPLETE)
+  -> COMPLETE -> IDLE
+```
+
+Triggered when `/control_mode` changes to `"tying"`.
 
 ---
 
-## 🚀 설치
+## Installation
 
 ```bash
 cd ~/ros2_ws
+pip3 install ultralytics  # YOLO
 colcon build --packages-select rebar_vision
 source install/setup.bash
 ```
 
 ---
 
-## 📊 데이터 수집 사용법
+## Usage
 
-### 1. 수동 캡처 모드 (기본)
+### Data Collection
 
 ```bash
-# 1. 런치 실행
+# Launch dual camera data collection
 ros2 launch rebar_vision data_collection.launch.py
 
-# 2. 로봇을 원하는 위치에 배치
-
-# 3. 캡처 트리거 (별도 터미널)
+# Manual capture trigger
 ros2 topic pub /rebar/recorder/trigger std_msgs/Bool "data: true" --once
 
-# 4. 반복: 로봇 이동 → 캡처
-# ...
-
-# 5. 종료 (Ctrl+C)
-# 자동으로 session_info.json 저장됨
+# Auto capture (every 2 seconds)
+ros2 launch rebar_vision data_collection.launch.py \
+    save_mode:=auto auto_interval:=2.0
 ```
 
-### 2. 자동 캡처 모드 (N초마다)
+### Vision-Guided Tying
 
 ```bash
-# 2초마다 자동 캡처
-ros2 launch rebar_vision data_collection.launch.py \
-    save_mode:=auto \
-    auto_interval:=2.0 \
-    rebar_spacing:=200 \
-    rebar_pattern:=orthogonal
-```
+# Launch detection + orchestrator
+ros2 launch rebar_vision vision_tying.launch.py
 
-### 3. 연속 녹화 모드 (N FPS)
+# Manual detection test
+ros2 service call /rebar/detect_crossings \
+    rebar_base_interfaces/srv/DetectCrossings \
+    "{camera_selection: 0, confidence_threshold: 0.3, expected_count: 6}"
 
-```bash
-# 10 FPS로 연속 녹화
-ros2 launch rebar_vision data_collection.launch.py \
-    save_mode:=continuous \
-    fps_limit:=10.0 \
-    rebar_spacing:=200
-```
-
-### 4. 커스텀 세션 이름
-
-```bash
-ros2 launch rebar_vision data_collection.launch.py \
-    session_name:=test_100mm_diagonal \
-    rebar_spacing:=100 \
-    rebar_pattern:=diagonal
+# View detection overlay image
+ros2 topic echo /rebar/detection_image
 ```
 
 ---
 
-## 📁 저장 구조
+## Configuration
 
-```
-/home/test/dataset/rebar_20251203_143052/
-├─ left_camera/
-│  ├─ rgb/
-│  │  ├─ frame_0000.png
-│  │  ├─ frame_0001.png
-│  │  └─ ...
-│  ├─ depth/
-│  │  ├─ frame_0000.png (16-bit, uint16, millimeters)
-│  │  └─ ...
-│  └─ camera_info.json
-│
-├─ right_camera/
-│  ├─ rgb/
-│  ├─ depth/
-│  └─ camera_info.json
-│
-└─ metadata/
-   ├─ session_info.json
-   └─ frame_info.json
-```
+### Camera Extrinsics: `config/camera_extrinsics.yaml`
 
-### Depth 이미지 포맷
+| Camera | Position (mm) | Pitch | Roll | Yaw |
+|--------|---------------|-------|------|-----|
+| Left (zedxmini1) | [-200, +100, 108] | 40 deg | 0 deg | -20 deg |
+| Right (zedxmini2) | [-200, -100, 108] | 40 deg | 0 deg | +20 deg |
 
-- **형식**: 16-bit PNG (uint16)
-- **단위**: 밀리미터(mm)
-- **범위**:
-  - 카메라: 100mm ~ 8000mm (0.1m ~ 8.0m)
-  - 저장: 0 ~ 65535mm (0 ~ 65.535m)
-- **변환**: ZED 32FC1 (미터) → uint16 (밀리미터)
-- **무효값**: 0 (측정 불가/범위 밖)
+### Tying Orchestrator: `config/tying_orchestrator.yaml`
 
-```python
-# Depth 이미지 읽기 예시
-import cv2
-import numpy as np
-import json
-
-# 1. Depth 이미지 로드
-depth = cv2.imread('frame_0000.png', cv2.IMREAD_UNCHANGED)  # uint16
-distance_mm = depth[y, x]  # 밀리미터 단위
-distance_m = distance_mm / 1000.0  # 미터 단위
-
-# 2. 카메라 정보 로드
-with open('camera_info.json', 'r') as f:
-    cam_info = json.load(f)
-
-# 3. 픽셀 좌표 → 3D 좌표 변환
-def pixel_to_3d(u, v, depth_mm, cam_info):
-    fx = cam_info['camera_matrix']['fx']
-    fy = cam_info['camera_matrix']['fy']
-    cx = cam_info['camera_matrix']['cx']
-    cy = cam_info['camera_matrix']['cy']
-
-    depth_m = depth_mm / 1000.0
-    X = (u - cx) * depth_m / fx
-    Y = (v - cy) * depth_m / fy
-    Z = depth_m
-    return X, Y, Z
-
-# 예: 픽셀 (480, 300)의 3D 좌표
-X, Y, Z = pixel_to_3d(480, 300, depth[300, 480], cam_info)
-print(f"3D: ({X:.3f}, {Y:.3f}, {Z:.3f}) meters")
-```
-
-**완전한 예제**: `depth_to_3d_example.py` 참고
-
-### session_info.json 예시
-
-```json
-{
-  "session_id": "rebar_20251203_143052",
-  "total_frames": 85,
-  "rebar_config": {
-    "spacing": 200,
-    "pattern": "orthogonal",
-    "crossing_points": 6
-  },
-  "camera_setup": {
-    "left": {
-      "serial_number": "56755054",
-      "position": [-200, 100, 108],
-      "rotation": [40, 0, -20],
-      "facing": "right_inward"
-    },
-    "right": {
-      "serial_number": "54946194",
-      "position": [-200, -100, 108],
-      "rotation": [40, 0, 20],
-      "facing": "left_inward"
-    }
-  }
-}
-```
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `deg_per_mm_x` | 2.698 | X-axis: 1133.29 deg / 420 mm (measured) |
+| `deg_per_mm_y` | 2.677 | Y-axis: 803.09 deg / 300 mm (measured) |
+| `stage_max_speed_dps` | 200.0 | Maximum stage speed (deg/s) |
+| `max_stage_x_mm` | 420.0 | X-axis stroke (measured) |
+| `max_stage_y_mm` | 300.0 | Y-axis stroke (measured) |
+| `max_yaw_deg` | 243.0 | Yaw rotation range (measured) |
+| `position_tolerance_deg` | 5.0 | Position tolerance (~1.9 mm) |
+| `stage_settling_time` | 1.5 | Post-move settling time (seconds) |
 
 ---
 
-## 🎮 ROS2 API
+## ROS2 API
 
-### Topics (구독)
+### Topics (Subscribed)
 
 | Topic | Type | Description |
 |-------|------|-------------|
-| `/zedxmini1/zed_node/rgb/image_rect_color` | sensor_msgs/Image | 좌측 카메라 RGB |
-| `/zedxmini1/zed_node/depth/depth_registered` | sensor_msgs/Image | 좌측 카메라 Depth |
-| `/zedxmini2/zed_node/rgb/image_rect_color` | sensor_msgs/Image | 우측 카메라 RGB |
-| `/zedxmini2/zed_node/depth/depth_registered` | sensor_msgs/Image | 우측 카메라 Depth |
-| `/rebar/recorder/trigger` | std_msgs/Bool | 수동 캡처 트리거 |
+| `/zedxmini1/zed_node/rgb/image_rect_color` | sensor_msgs/Image | Left camera RGB |
+| `/zedxmini1/zed_node/depth/depth_registered` | sensor_msgs/Image | Left camera depth |
+| `/zedxmini2/zed_node/rgb/image_rect_color` | sensor_msgs/Image | Right camera RGB |
+| `/zedxmini2/zed_node/depth/depth_registered` | sensor_msgs/Image | Right camera depth |
+| `/control_mode` | std_msgs/String | Mode switch trigger for orchestrator |
+| `/sequence_status` | std_msgs/String | Tying sequence completion status |
+
+### Topics (Published)
+
+| Topic | Type | Description |
+|-------|------|-------------|
+| `/rebar/detection_image` | sensor_msgs/Image | Debug overlay with detections |
+| `/rebar/detected_grid` | RebarGrid | Detected 2x3 crossing grid |
+| `/joint_control` | JointControl | Stage motor commands (0x144, 0x145) |
+| `/sequence_cmd` | std_msgs/String | Auto S21/S22 trigger |
 
 ### Services
 
 | Service | Type | Description |
 |---------|------|-------------|
-| `/rebar/recorder/start` | std_srvs/Trigger | 녹화 시작 |
-| `/rebar/recorder/stop` | std_srvs/Trigger | 녹화 중지 |
-| `/rebar/recorder/save_session` | std_srvs/Trigger | 세션 정보 저장 |
-
-### Parameters
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `save_path` | string | `/home/test/dataset` | 저장 경로 |
-| `save_mode` | string | `manual` | 캡처 모드 (manual/auto/continuous) |
-| `auto_interval` | double | 2.0 | 자동 캡처 간격 (초) |
-| `fps_limit` | double | 10.0 | 연속 모드 FPS |
-| `rebar_spacing` | int | 200 | 철근 간격 (mm) |
-| `rebar_pattern` | string | `orthogonal` | 배근 패턴 (orthogonal/diagonal) |
-| `session_name` | string | `` | 커스텀 세션 이름 |
-| `save_depth` | bool | true | Depth 이미지 저장 여부 |
+| `/rebar/detect_crossings` | DetectCrossings | Request crossing detection |
 
 ---
 
-## 📷 하드웨어 사양
+## Data Storage Structure
 
-### ZED X Mini 카메라
+```
+/home/test/dataset/rebar_YYYYMMDD_HHMMSS/
+├── left_camera/
+│   ├── rgb/          # PNG images
+│   ├── depth/        # 16-bit PNG (uint16, millimeters)
+│   └── camera_info.json
+├── right_camera/
+│   ├── rgb/
+│   ├── depth/
+│   └── camera_info.json
+└── metadata/
+    ├── session_info.json
+    └── frame_info.json
+```
 
-| 항목 | 사양 |
-|------|------|
-| 모델 | Stereolabs ZED X Mini |
-| 해상도 | 1280×720 (HD720) @ 15 FPS |
-| Depth 범위 | **0.1m ~ 8.0m** (100mm ~ 8000mm) |
-| Depth 모드 | ULTRA (launch 파라미터) |
-| FOV | 90° (H) × 60° (V) |
+### Depth Image Format
 
-### 카메라 배치 (대향 설치)
+- **Format**: 16-bit PNG (uint16)
+- **Unit**: Millimeters
+- **Range**: 100 mm to 8000 mm (camera), 0 to 65535 mm (storage)
+- **Invalid value**: 0 (measurement failed / out of range)
+
+```python
+import cv2
+depth = cv2.imread('frame_0000.png', cv2.IMREAD_UNCHANGED)  # uint16
+distance_mm = depth[y, x]
+distance_m = distance_mm / 1000.0
+```
+
+---
+
+## Hardware
+
+### ZED X Mini Cameras
+
+| Spec | Value |
+|------|-------|
+| Model | Stereolabs ZED X Mini |
+| Resolution | 1280x720 (HD720) @ 15 FPS |
+| Depth range | 0.1 m to 8.0 m |
+| Depth mode | ULTRA |
+| FOV | 90 deg (H) x 60 deg (V) |
+
+### Camera Mounting (Inward V-Configuration)
 
 ```
      ┌─────────────────┐
-     │   Robot Body    │
+     │   Robot Body     │
      └─────────────────┘
            │
     ┌──────┴──────┐
     │             │
-[CAM1]          [CAM2]
-(Left)         (Right)
-↘ 40°         ↙ 40°
+ [CAM1]        [CAM2]
+ (Left)       (Right)
+  ↘ 40°      ↙ 40°
     ╲       ╱
-     ╲  ▼  ╱  <- 철근
+     ╲  ▼  ╱   <- Rebar
       ╲   ╱
        ╲ ╱
 ```
 
 ---
 
-## 🔧 트러블슈팅
+## Troubleshooting
 
-### ZED 카메라가 인식되지 않음
+### ZED cameras not detected
 
 ```bash
-# ZED 토픽 확인
 ros2 topic list | grep zedxmini
-
-# 없으면 ZED 노드 재시작
+# If empty, restart ZED nodes
 ros2 launch zed_wrapper two_zedxmini.launch.py
 ```
 
-### 저장 경로 권한 오류
+### Sync errors (4-topic timestamp mismatch)
 
+Adjust `slop` parameter in `dual_camera_recorder_node.py` (default: 50 ms).
+
+### Depth images appear black
+
+16-bit PNGs don't display properly in standard image viewers. Use:
 ```bash
-sudo mkdir -p /home/test/dataset
-sudo chown -R $USER:$USER /home/test/dataset
-```
-
-### 동기화 오류 (4개 토픽 타임스탬프 불일치)
-
-```bash
-# slop 파라미터 조정 (dual_camera_recorder_node.py)
-# 현재: slop=0.05 (50ms)
-# 증가: slop=0.1 (100ms)
-```
-
-### Depth 이미지가 검은색으로만 보임
-
-**원인**: 16-bit PNG는 일반 이미지 뷰어에서 제대로 표시되지 않습니다.
-
-**해결**:
-- `*_visualization.png` 파일 확인 (자동 생성되는 컬러 이미지)
-- 또는 Python으로 확인:
-
-```bash
-# 시각화 도구 사용
-python3 /home/test/ros2_ws/view_depth_image.py frame_0000.png
-
-# 또는 데이터 확인
 python3 -c "
 import cv2
 depth = cv2.imread('frame_0000.png', cv2.IMREAD_UNCHANGED)
-print(f'Range: {depth[depth>0].min()}-{depth.max()}mm')
+print(f'Range: {depth[depth>0].min()}-{depth.max()} mm')
 "
 ```
 
-### Depth 데이터 활용 방법
-
-**완전한 예제 실행**:
-```bash
-python3 /home/test/ros2_ws/depth_to_3d_example.py
-```
-
-**주요 활용 사례**:
-1. **YOLO 검출 → 3D 좌표**: 철근 교차점 픽셀 → 실제 3D 위치
-2. **Point Cloud 생성**: 전체 장면의 3D 모델
-3. **거리 측정**: 두 교차점 사이의 실제 거리
-4. **정확도**: 1mm 단위 (16-bit uint16 저장)
-
 ---
 
-## 📈 데이터 수집 체크리스트
-
-### 필수 조건별 데이터
-
-- [ ] 200mm 간격 직교 (80장)
-- [ ] 150mm 간격 직교 (50장)
-- [ ] 100mm 간격 직교 (50장)
-- [ ] 사선 배근 45° (40장)
-- [ ] 다양한 조명 (30장)
-
-**총 목표: 250장 × 2 (좌우) = 500장**
-
-### 로봇 위치 변화
-
-각 조건마다 5-10 포지션:
-- 중앙
-- 전방 ±100mm
-- 후방 ±100mm
-- 좌우 ±50mm
-
----
-
-## 📝 다음 단계
-
-1. **데이터 수집 완료** (현재)
-2. **데이터 정리** - 이미지 이름 변경 및 디렉토리 구조 정리
-3. **라벨링** - Roboflow로 교차점 바운딩 박스
-4. **YOLO 학습** - YOLOv8n 모델 학습
-5. **ROS2 인식 노드 개발** - 실시간 검출 및 좌표 변환
-
----
-
-## 📚 참고 문서
-
-- [REBAR_VISION_DEVELOPMENT_PLAN.md](../../REBAR_VISION_DEVELOPMENT_PLAN.md) - 전체 개발 계획
-- [ZED SDK Documentation](https://www.stereolabs.com/docs)
-- [YOLOv8 Documentation](https://docs.ultralytics.com)
-
----
-
-**작성일**: 2025-12-03  
-**버전**: 0.1.0 (Phase 1)
+**Last Updated**: 2026-03-04
+**Version**: 0.2.0 (Detection + Orchestrator)
