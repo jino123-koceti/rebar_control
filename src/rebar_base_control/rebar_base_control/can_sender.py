@@ -99,6 +99,10 @@ class CANSender(Node):
             0x147: 0.0,
         }
 
+        # 속도 명령 버퍼 (모터별 최신값만 유지, 타이머에서 일괄 전송)
+        self.pending_speed_cmds = {}  # {motor_id: speed_dps}
+        self.create_timer(1.0 / 200.0, self._flush_speed_commands)  # 200Hz
+
         self.get_logger().info("CAN Sender 노드 초기화 완료")
         self.get_logger().info("  - 속도 제어: 0x141, 0x142 (DriveControl)")
         self.get_logger().info("  - 위치 제어: 0x143~0x147 (JointControl)")
@@ -257,15 +261,10 @@ class CANSender(Node):
             max_speed_dps = msg.velocity
             mode = msg.control_mode
 
-            # 속도 제어 모드 (MODE_SPEED = 2)
+            # 속도 제어 모드 (MODE_SPEED = 2) → 버퍼에 저장, 타이머에서 일괄 전송
             if mode == JointControl.MODE_SPEED:
-                # position 필드에 속도(dps)가 들어옴
                 speed_dps = target_deg
-                if abs(speed_dps) < 0.1:
-                    # 속도 0이면 정지 명령 (0x81) - 관성 오버슈트 방지
-                    self._send_motor_stop(motor_id)
-                else:
-                    self._send_speed_command_joint(motor_id, speed_dps)
+                self.pending_speed_cmds[motor_id] = speed_dps
                 return
 
             self.get_logger().info(
@@ -293,6 +292,18 @@ class CANSender(Node):
 
         except Exception as e:
             self.get_logger().error(f"JointControl 전송 오류: {e}")
+
+    def _flush_speed_commands(self):
+        """버퍼된 속도 명령을 일괄 CAN 전송 (200Hz 타이머)"""
+        if not self.pending_speed_cmds or not self.bus:
+            return
+        cmds = dict(self.pending_speed_cmds)
+        self.pending_speed_cmds.clear()
+        for motor_id, speed_dps in cmds.items():
+            if abs(speed_dps) < 0.1:
+                self._send_motor_stop(motor_id)
+            else:
+                self._send_speed_command_joint(motor_id, speed_dps)
 
     def _send_speed_command_joint(self, motor_id, speed_dps):
         """
