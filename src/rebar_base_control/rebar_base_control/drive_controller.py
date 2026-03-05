@@ -236,8 +236,8 @@ class DriveController(Node):
             joy_angular = 0.0
 
         # 조이스틱 값 → 선속도/각속도 변환
-        # AN3-: 전진, AN3+: 후진
-        linear_velocity = -joy_linear * self.max_linear  # 부호 반전 (AN3- = 전진)
+        # AN3+: 전진, AN3-: 후진 (방향 반전)
+        linear_velocity = joy_linear * self.max_linear
 
         # AN4+: CCW (왼쪽), AN4-: CW (오른쪽)
         angular_velocity = joy_angular * self.max_angular
@@ -265,8 +265,8 @@ class DriveController(Node):
         drive_msg = DriveControl()
 
         try:
-            # 입력 제한
-            linear = max(-self.max_linear, min(self.max_linear, msg.linear.x))
+            # 입력 제한 (전후면 반전: cmd_vel 부호 반전)
+            linear = -max(-self.max_linear, min(self.max_linear, msg.linear.x))
             angular = max(-self.max_angular, min(self.max_angular, msg.angular.z))
 
             # Differential drive 변환

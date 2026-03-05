@@ -388,7 +388,16 @@ class JointController(Node):
         if msg.joint_id == 0x143 and msg.control_mode == JointControl.MODE_RELATIVE:
             self._handle_auto_lateral_motion(msg)
         else:
-            # 기타 모터: 그대로 can_sender로 전달
+            # 리밋 센서 안전 체크 (0x144~0x147)
+            axis_map = {0x144: 'x', 0x145: 'y', 0x146: 'z', 0x147: 'yaw'}
+            axis = axis_map.get(msg.joint_id)
+            if axis and not self._check_limit_safe(axis, msg.position):
+                self.get_logger().warn(
+                    f"[Auto] 리밋 센서 차단: 0x{msg.joint_id:03X} ({axis}) "
+                    f"방향={msg.position:.1f}° - 이동 거부"
+                )
+                return
+
             self.joint_publisher.publish(msg)
             self.last_command_time = self.get_clock().now()
 
@@ -1340,7 +1349,15 @@ class JointController(Node):
 
         elif self.homing_state == HomingState.COMPLETE:
             self.is_homed = True
-            self._publish_homing_status("COMPLETE")
+            # Reference angles를 JSON으로 포함하여 발행
+            import json
+            ref_data = {
+                'x': self.homing_references.get(0x144, 0.0),
+                'y': self.homing_references.get(0x145, 0.0),
+                'z': self.homing_references.get(0x146, 0.0),
+                'yaw': self.homing_references.get(0x147, 0.0),
+            }
+            self._publish_homing_status(f"COMPLETE:{json.dumps(ref_data)}")
             elapsed = now - self.homing_start_time
             self.get_logger().info("=" * 60)
             self.get_logger().info(f"  HOMING COMPLETE ({elapsed:.1f}s)")

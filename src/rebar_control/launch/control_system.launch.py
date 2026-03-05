@@ -51,8 +51,8 @@ def generate_launch_description():
             name='pose_mux',
             output='screen',
             parameters=[{
-                'front_odom_topic': '/zed_front/zed_node/odom',
-                'back_odom_topic': '/zed_back/zed_node/odom',
+                'front_odom_topic': '/zed_back/zed_node/odom',
+                'back_odom_topic': '/zed_front/zed_node/odom',
                 'output_topic': '/robot_pose',
                 'direction_source': 'cmd_vel',
                 'velocity_deadband': 0.02,

@@ -24,7 +24,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Twist
-from rebar_base_interfaces.msg import Waypoint, WaypointArray
+from rebar_base_interfaces.msg import Waypoint, WaypointArray, JointControl
 from statemachine import StateMachine, State
 import json
 import math
@@ -158,6 +158,49 @@ class Navigator(Node):
             10
         )
 
+        # Homing 명령/상태 토픽
+        self.homing_cmd_pub = self.create_publisher(
+            String,
+            '/homing_cmd',
+            10
+        )
+
+        self.homing_status_sub = self.create_subscription(
+            String,
+            '/homing_status',
+            self.homing_status_callback,
+            10
+        )
+
+        # Homing 상태 추적
+        self.homing_in_progress = False
+        self.is_homed = False
+
+        # 상부 결속부 단동 구동 (UPPER_BINDING_MOVE)
+        self.joint_control_pub = self.create_publisher(
+            JointControl,
+            '/joint_control_cmd',
+            10
+        )
+
+        # mm → degree 변환 계수 (can_devices.yaml 실측값)
+        self.declare_parameter('stage_x_step_deg', 4.497)   # 1mm = 4.497° (0x144) - 실측 보정
+        self.declare_parameter('stage_y_step_deg', 4.462)   # 1mm = 4.462° (0x145) - 실측 보정
+        self.declare_parameter('stage_z_step_deg', 2.69)    # 1mm = 2.69°  (0x146)
+        self.declare_parameter('stage_max_speed', 200.0)    # dps
+        self.declare_parameter('yaw_max_speed', 134.0)      # dps
+
+        self.stage_x_step = self.get_parameter('stage_x_step_deg').value
+        self.stage_y_step = self.get_parameter('stage_y_step_deg').value
+        self.stage_z_step = self.get_parameter('stage_z_step_deg').value
+        self.stage_max_speed = self.get_parameter('stage_max_speed').value
+        self.yaw_max_speed = self.get_parameter('yaw_max_speed').value
+
+        self.stage_moving = False
+
+        # 호밍 영점 기준 (homing reference angles, 0x92 deg)
+        self.home_references = {'x': None, 'y': None, 'z': None, 'yaw': None}
+
         # 현재 제어 모드
         self.control_mode = "idle"
 
@@ -243,6 +286,12 @@ class Navigator(Node):
                         self.current_waypoint_idx = 0
                         self.path_published = False
 
+                    elif json_command == "GO_HOME":
+                        self.start_homing()
+
+                    elif json_command == "UPPER_BINDING_MOVE":
+                        self.handle_upper_biding_move(data)
+
                     else:
                         self.get_logger().warn(f"알 수 없는 JSON 명령: {json_command}")
 
@@ -279,12 +328,8 @@ class Navigator(Node):
             self.path_published = False
 
         elif command == "GO_HOME":
-            # 홈 위치 (0, 0)로 이동
-            self.waypoints = [{'x': 0.0, 'y': 0.0, 'motion_type': Waypoint.MOTION_DIFFERENTIAL, 'max_speed': 0.3}]
-            self.current_waypoint_idx = 0
-            self.path_published = False
-            self.sm.plan()
-            self.sm.start()
+            # 하드웨어 호밍 (리밋 센서 기반 스테이지 원점복귀)
+            self.start_homing()
 
         elif command == "PLAN_PATH":
             self.sm.plan()
@@ -651,6 +696,166 @@ class Navigator(Node):
         else:
             # 진행 상황 피드백 갱신
             self.publish_feedback()
+
+    def start_homing(self):
+        """하드웨어 호밍 시작 (joint_controller의 호밍 상태머신 트리거)"""
+        if self.homing_in_progress:
+            self.get_logger().warn("호밍이 이미 진행 중입니다")
+            return
+
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("🏠 GO_HOME: 하드웨어 호밍 시작")
+        self.get_logger().info("=" * 60)
+
+        self.homing_in_progress = True
+
+        # joint_controller에 호밍 시작 명령 전송
+        cmd_msg = String()
+        cmd_msg.data = 'START'
+        self.homing_cmd_pub.publish(cmd_msg)
+
+        # 피드백 발행 (UI에 호밍 상태 알림)
+        self._publish_homing_feedback('homing')
+
+    def homing_status_callback(self, msg):
+        """joint_controller로부터 호밍 상태 수신"""
+        status = msg.data
+
+        if not self.homing_in_progress:
+            return
+
+        self.get_logger().info(f"🏠 호밍 상태: {status}")
+
+        if status.startswith('COMPLETE'):
+            self.homing_in_progress = False
+            self.is_homed = True
+
+            # Reference angles 파싱: "COMPLETE:{"x":123.4,"y":456.7,...}"
+            if ':' in status:
+                try:
+                    ref_json = status.split(':', 1)[1]
+                    ref_data = json.loads(ref_json)
+                    self.home_references = {
+                        'x': ref_data.get('x', 0.0),
+                        'y': ref_data.get('y', 0.0),
+                        'z': ref_data.get('z', 0.0),
+                        'yaw': ref_data.get('yaw', 0.0),
+                    }
+                    self.get_logger().info(f"🏠 영점 기준 설정: {self.home_references}")
+                except Exception as e:
+                    self.get_logger().warn(f"Reference 파싱 실패: {e}")
+
+            self.get_logger().info("=" * 60)
+            self.get_logger().info("🏠 호밍 완료!")
+            self.get_logger().info("=" * 60)
+            self._publish_homing_feedback('homing_complete')
+
+        elif 'FAIL' in status or 'STOPPED' in status:
+            self.homing_in_progress = False
+            self.get_logger().error(f"🏠 호밍 실패: {status}")
+            self._publish_homing_feedback('homing_failed')
+
+    def _publish_homing_feedback(self, state):
+        """호밍 피드백 발행 (UI 표시용)"""
+        feedback_data = {
+            'current_waypoint': 0,
+            'total_waypoints': 0,
+            'state': state
+        }
+        msg = String()
+        msg.data = json.dumps(feedback_data)
+        self.feedback_pub.publish(msg)
+
+    def handle_upper_biding_move(self, data):
+        """
+        상부 결속부 단동 구동 처리 (홈 영점 기준 절대 위치)
+
+        UI 명령 형식:
+        {"command":"UPPER_BINDING_MOVE","target":{"x":100.0,"y":50.0,"z":20.0,"yaw":90.0}}
+
+        - x, y, z: mm 단위 (홈 영점 기준 절대 위치, 0 = 홈 위치)
+        - yaw: degree 단위 (홈 영점 기준)
+        - 실제로는 한 축씩만 데이터가 들어옴
+        """
+        if not self.is_homed:
+            self.get_logger().warn("호밍 미완료 - 먼저 GO_HOME을 실행하세요")
+            self._publish_stage_feedback('stage_move_failed', 'homing_required')
+            return
+
+        if self.stage_moving:
+            self.get_logger().warn("스테이지 이동 중 - 이전 명령 완료 대기")
+            return
+
+        target = data.get('target', {})
+        if not target:
+            self.get_logger().warn("UPPER_BINDING_MOVE: target 데이터 없음")
+            return
+
+        # 축별 변환 테이블: (axis_key, motor_id, mm→deg 변환계수, 최대속도, 단위)
+        axis_config = {
+            'x':   (0x144, self.stage_x_step, self.stage_max_speed, 'mm'),
+            'y':   (0x145, self.stage_y_step, self.stage_max_speed, 'mm'),
+            'z':   (0x146, self.stage_z_step, self.stage_max_speed, 'mm'),
+            'yaw': (0x147, 1.0,               self.yaw_max_speed,   'deg'),
+        }
+
+        moved = False
+        for axis_name, (motor_id, step_deg, max_speed, unit) in axis_config.items():
+            value = target.get(axis_name)
+            if value is None:
+                continue
+
+            # 영점 기준(reference angle) 확인
+            ref_angle = self.home_references.get(axis_name)
+            if ref_angle is None:
+                self.get_logger().warn(f"[UPPER_BINDING] {axis_name} 영점 미설정")
+                continue
+
+            # mm → degree 변환 후 영점 기준 절대 위치 계산
+            offset_deg = float(value) * step_deg
+            absolute_deg = ref_angle + offset_deg
+
+            # JointControl 발행 (절대 위치)
+            cmd = JointControl()
+            cmd.joint_id = motor_id
+            cmd.position = absolute_deg
+            cmd.velocity = max_speed
+            cmd.control_mode = JointControl.MODE_ABSOLUTE
+            self.joint_control_pub.publish(cmd)
+
+            self.get_logger().info(
+                f"[UPPER_BINDING] {axis_name.upper()}: {value}{unit} "
+                f"(ref={ref_angle:.1f} + {offset_deg:.1f} = {absolute_deg:.1f}deg) "
+                f"-> 0x{motor_id:03X} @ {max_speed:.0f}dps"
+            )
+            moved = True
+
+        if moved:
+            self.stage_moving = True
+            self._publish_stage_feedback('stage_moving')
+            # 이동 완료 체크 타이머 (이동 시간 추정 후 완료 처리)
+            self.create_timer(0.5, self._check_stage_move_complete_once)
+
+    def _check_stage_move_complete_once(self):
+        """스테이지 이동 완료 체크 (1회성 타이머)"""
+        # 단동 구동은 명령 전송 후 모터가 알아서 이동 완료
+        # 간단한 타이머 기반 완료 처리 (추후 모터 피드백 기반으로 개선 가능)
+        self.stage_moving = False
+        self._publish_stage_feedback('stage_move_complete')
+        self.get_logger().info("[UPPER_BINDING] 이동 완료")
+
+    def _publish_stage_feedback(self, state, detail=''):
+        """스테이지 이동 피드백 발행"""
+        feedback_data = {
+            'current_waypoint': 0,
+            'total_waypoints': 0,
+            'state': state,
+        }
+        if detail:
+            feedback_data['detail'] = detail
+        msg = String()
+        msg.data = json.dumps(feedback_data)
+        self.feedback_pub.publish(msg)
 
     def publish_zero_cmd_vel(self):
         """cmd_vel을 0으로 발행하여 주행을 즉시 멈춤"""

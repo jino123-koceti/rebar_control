@@ -88,9 +88,10 @@ class PoseMux(Node):
     def cmd_vel_callback(self, msg: Twist):
         vx = msg.linear.x
         self.last_speed = vx
-        if vx > self.velocity_deadband:
+        # 전후면 반전: 음수 cmd_vel = 새 전진 방향
+        if vx < -self.velocity_deadband:
             self.last_direction = 'forward'
-        elif vx < -self.velocity_deadband:
+        elif vx > self.velocity_deadband:
             self.last_direction = 'backward'
         # within deadband: keep last_direction
 
