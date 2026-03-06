@@ -44,15 +44,15 @@ joint_controller:
 
     # === 3축 스테이지 (0x144, 0x145, 0x146) - 2026-03-04 실측 ===
     # X축 스테이지 (0x144) - AN1 조이스틱 제어
-    stage_x_step_deg: 2.698     # 1mm = 2.698° (실측: 1133.29° / 420mm)
+    stage_x_step_deg: 4.497     # 1mm = 4.497° (0x144) - P2P 실측 보정
     stage_x_max_speed: 200.0    # dps
 
     # Y축 스테이지 (0x145) - AN2 조이스틱 제어
-    stage_y_step_deg: 2.677     # 1mm = 2.677° (실측: 803.09° / 300mm)
+    stage_y_step_deg: 4.462     # 1mm = 4.462° (0x145) - P2P 실측 보정
     stage_y_max_speed: 200.0    # dps
 
     # Z축 스테이지 (0x146) - S21(하강)/S22(상승) 버튼 제어
-    stage_z_step_deg: 2.69      # 1mm ≈ 2.69° (XY축과 동일 메커니즘 추정)
+    stage_z_step_deg: 13.45     # 1mm ≈ 13.45° (실측: 100mm명령→20mm이동, 2.69*5)
     stage_z_max_speed: 200.0    # dps
 
     # 조이스틱 설정

@@ -65,10 +65,12 @@ class RebarDetectionNode(Node):
             'left': {
                 'position': np.array(self.get_parameter('left_camera.position').value),
                 'rotation': np.array(self.get_parameter('left_camera.rotation').value),
+                'side': 'left',
             },
             'right': {
                 'position': np.array(self.get_parameter('right_camera.position').value),
                 'rotation': np.array(self.get_parameter('right_camera.rotation').value),
+                'side': 'right',
             }
         }
 
@@ -95,39 +97,48 @@ class RebarDetectionNode(Node):
         self.right_camera_info = None
 
         # ============================================
-        # Message Filters - 4채널 동기화
-        # (dual_camera_recorder_node.py 패턴 재사용)
+        # Message Filters - 카메라별 2채널 동기화
+        # 한쪽 카메라만 연결되어도 동작
         # ============================================
+        # 좌측 카메라 (zedxmini1)
         self.left_rgb_sub = message_filters.Subscriber(
-            self, Image, '/zedxmini1/zedxmini1_node/left/image_rect_color'
+            self, Image, '/zedxmini1/zed_node/left/image_rect_color'
         )
         self.left_depth_sub = message_filters.Subscriber(
-            self, Image, '/zedxmini1/zedxmini1_node/depth/depth_registered'
+            self, Image, '/zedxmini1/zed_node/depth/depth_registered'
         )
+        self.ts_left = message_filters.ApproximateTimeSynchronizer(
+            [self.left_rgb_sub, self.left_depth_sub],
+            queue_size=10, slop=0.05
+        )
+        self.ts_left.registerCallback(self._left_sync_callback)
+
+        # 우측 카메라 (zedxmini2)
         self.right_rgb_sub = message_filters.Subscriber(
-            self, Image, '/zedxmini2/zedxmini2_node/left/image_rect_color'
+            self, Image, '/zedxmini2/zed_node/left/image_rect_color'
         )
         self.right_depth_sub = message_filters.Subscriber(
-            self, Image, '/zedxmini2/zedxmini2_node/depth/depth_registered'
+            self, Image, '/zedxmini2/zed_node/depth/depth_registered'
         )
+        self.ts_right = message_filters.ApproximateTimeSynchronizer(
+            [self.right_rgb_sub, self.right_depth_sub],
+            queue_size=10, slop=0.05
+        )
+        self.ts_right.registerCallback(self._right_sync_callback)
 
-        self.ts = message_filters.ApproximateTimeSynchronizer(
-            [self.left_rgb_sub, self.left_depth_sub,
-             self.right_rgb_sub, self.right_depth_sub],
-            queue_size=10,
-            slop=0.05  # 50ms
-        )
-        self.ts.registerCallback(self._sync_callback)
+        # 개별 카메라 프레임 캐시
+        self.left_frames = None   # (rgb_msg, depth_msg)
+        self.right_frames = None  # (rgb_msg, depth_msg)
 
         # Camera Info 구독
         self.left_info_sub = self.create_subscription(
             CameraInfo,
-            '/zedxmini1/zedxmini1_node/left/camera_info',
+            '/zedxmini1/zed_node/left/camera_info',
             self._left_info_callback, 10
         )
         self.right_info_sub = self.create_subscription(
             CameraInfo,
-            '/zedxmini2/zedxmini2_node/left/camera_info',
+            '/zedxmini2/zed_node/left/camera_info',
             self._right_info_callback, 10
         )
 
@@ -188,11 +199,26 @@ class RebarDetectionNode(Node):
     # ============================================
     # 프레임 캐싱 콜백
     # ============================================
-    def _sync_callback(self, left_rgb, left_depth, right_rgb, right_depth):
-        """동기화된 4채널 프레임 캐싱 (추론 없이 저장만)"""
+    def _left_sync_callback(self, rgb_msg, depth_msg):
+        """좌측 카메라 프레임 캐싱"""
         with self.frame_lock:
-            self.cached_frames = (left_rgb, left_depth, right_rgb, right_depth)
-            self.frame_timestamp = self.get_clock().now()
+            self.left_frames = (rgb_msg, depth_msg)
+            self._update_cached_frames()
+
+    def _right_sync_callback(self, rgb_msg, depth_msg):
+        """우측 카메라 프레임 캐싱"""
+        with self.frame_lock:
+            self.right_frames = (rgb_msg, depth_msg)
+            self._update_cached_frames()
+
+    def _update_cached_frames(self):
+        """개별 프레임으로 cached_frames 구성 (lock 내에서 호출)"""
+        left_rgb = self.left_frames[0] if self.left_frames else None
+        left_depth = self.left_frames[1] if self.left_frames else None
+        right_rgb = self.right_frames[0] if self.right_frames else None
+        right_depth = self.right_frames[1] if self.right_frames else None
+        self.cached_frames = (left_rgb, left_depth, right_rgb, right_depth)
+        self.frame_timestamp = self.get_clock().now()
 
     def _left_info_callback(self, msg):
         """좌측 카메라 intrinsics 저장"""
@@ -254,11 +280,11 @@ class RebarDetectionNode(Node):
         try:
             left_rgb_msg, left_depth_msg, right_rgb_msg, right_depth_msg = frames
 
-            # CV 이미지 변환
-            left_rgb = self.bridge.imgmsg_to_cv2(left_rgb_msg, 'bgr8')
-            left_depth = self.bridge.imgmsg_to_cv2(left_depth_msg, 'passthrough')
-            right_rgb = self.bridge.imgmsg_to_cv2(right_rgb_msg, 'bgr8')
-            right_depth = self.bridge.imgmsg_to_cv2(right_depth_msg, 'passthrough')
+            # CV 이미지 변환 (카메라가 없으면 None)
+            left_rgb = self.bridge.imgmsg_to_cv2(left_rgb_msg, 'bgr8') if left_rgb_msg else None
+            left_depth = self.bridge.imgmsg_to_cv2(left_depth_msg, 'passthrough') if left_depth_msg else None
+            right_rgb = self.bridge.imgmsg_to_cv2(right_rgb_msg, 'bgr8') if right_rgb_msg else None
+            right_depth = self.bridge.imgmsg_to_cv2(right_depth_msg, 'passthrough') if right_depth_msg else None
 
             all_detections = []
             strategy = self.detection_strategy
@@ -275,7 +301,7 @@ class RebarDetectionNode(Node):
                 left_dets = []
                 right_dets = []
 
-                if self.left_camera_info:
+                if self.left_camera_info and left_rgb is not None:
                     left_dets = self._detect_single_camera(
                         left_rgb, left_depth,
                         self.left_camera_info,
@@ -289,7 +315,7 @@ class RebarDetectionNode(Node):
                         max_points=self.grid_cols
                     )
 
-                if self.right_camera_info:
+                if self.right_camera_info and right_rgb is not None:
                     right_dets = self._detect_single_camera(
                         right_rgb, right_depth,
                         self.right_camera_info,
@@ -308,7 +334,7 @@ class RebarDetectionNode(Node):
             else:
                 # ===== Merge / Single 전략 =====
                 if request.camera_selection in (0, 1):  # 좌측 또는 양쪽
-                    if self.left_camera_info:
+                    if self.left_camera_info and left_rgb is not None:
                         dets = self._detect_single_camera(
                             left_rgb, left_depth,
                             self.left_camera_info,
@@ -319,7 +345,7 @@ class RebarDetectionNode(Node):
                         all_detections.extend(dets)
 
                 if request.camera_selection in (0, 2):  # 우측 또는 양쪽
-                    if self.right_camera_info:
+                    if self.right_camera_info and right_rgb is not None:
                         dets = self._detect_single_camera(
                             right_rgb, right_depth,
                             self.right_camera_info,
@@ -341,8 +367,10 @@ class RebarDetectionNode(Node):
                 all_detections, self.grid_rows, self.grid_cols
             )
 
-            # 디버그 이미지 발행
-            self._publish_debug_image(left_rgb, all_detections)
+            # 디버그 이미지 발행 (사용 가능한 이미지 선택)
+            debug_rgb = right_rgb if right_rgb is not None else left_rgb
+            if debug_rgb is not None:
+                self._publish_debug_image(debug_rgb, all_detections)
 
             # 응답 구성
             elapsed_ms = (time.monotonic() - start_time) * 1000.0
@@ -460,14 +488,21 @@ class RebarDetectionNode(Node):
         """카메라 3D → 로봇 좌표계 (mm)
 
         카메라 프레임 (OpenCV): X=우, Y=하, Z=전방
-        로봇 프레임: X=전방, Y=좌, Z=상
-        """
-        pitch = np.radians(extrinsics['rotation'][0])  # 40도 하향
-        roll = np.radians(extrinsics['rotation'][1])
-        yaw = np.radians(extrinsics['rotation'][2])
+        로봇 프레임: X=전방(+), Y=우(+), Z=상(+)
+        원점: EEF_origin (스테이지 홈 위치 공구 끝단)
 
-        R = self._rotation_matrix(roll, pitch, yaw)
+        변환 순서:
+        1. 카메라 프레임에서 pitch 적용 (하향 틸트)
+        2. 카메라→로봇 프레임 축 정렬 (카메라 바라보는 방향에 따라)
+        3. 로봇 프레임에서 yaw 적용 (내향 각도)
+        4. 카메라 위치(translation) 더하기
+        """
+        pitch_deg = extrinsics['rotation'][0]  # 하향 각도 (양수 = 아래로)
+        yaw_deg = extrinsics['rotation'][2]    # 내향 각도
+        side = extrinsics.get('side', 'right')
         t = extrinsics['position']  # mm 단위
+
+        R = self._build_cam_to_robot_rotation(side, pitch_deg, yaw_deg)
 
         # 카메라 좌표 (미터) → mm 변환 후 회전+이동
         point_cam_mm = point_cam * 1000.0
@@ -476,23 +511,48 @@ class RebarDetectionNode(Node):
         return point_robot
 
     @staticmethod
-    def _rotation_matrix(roll, pitch, yaw):
-        """ZYX 오일러 각도 → 회전 행렬
+    def _build_cam_to_robot_rotation(side, pitch_deg, yaw_deg):
+        """카메라→로봇 회전 행렬 구성
 
-        카메라→로봇 변환:
-        1. Rz(yaw): 좌우 카메라의 내향 각도
-        2. Ry(pitch): 하향 각도 (40도)
-        3. Rx(roll): 기울기 (0)
+        카메라 설치:
+        - right (zedxmini_right): -Y 방향 바라봄 (오른쪽에서 왼쪽으로)
+        - left (zedxmini_left): +Y 방향 바라봄 (왼쪽에서 오른쪽으로)
+
+        변환: R_full = Rz_robot(yaw) @ T_base(side) @ Rx_cam(-pitch)
         """
-        cr, sr = np.cos(roll), np.sin(roll)
-        cp, sp = np.cos(pitch), np.sin(pitch)
-        cy, sy = np.cos(yaw), np.sin(yaw)
+        # Step 1: 카메라 프레임에서 하향 틸트 (Camera X축 기준)
+        p = np.radians(-pitch_deg)  # 하향 = 음수 회전
+        Rx_cam = np.array([
+            [1, 0, 0],
+            [0, np.cos(p), -np.sin(p)],
+            [0, np.sin(p), np.cos(p)]
+        ])
 
-        Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
-        Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
-        Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+        # Step 2: 카메라→로봇 프레임 축 정렬
+        if side == 'right':
+            # Camera Z(forward) → -Y_robot, Camera X(right) → -X_robot
+            T_base = np.array([
+                [-1,  0,  0],
+                [ 0,  0, -1],
+                [ 0, -1,  0]
+            ], dtype=float)
+        else:
+            # Camera Z(forward) → +Y_robot, Camera X(right) → +X_robot
+            T_base = np.array([
+                [ 1,  0,  0],
+                [ 0,  0,  1],
+                [ 0, -1,  0]
+            ], dtype=float)
 
-        return Rz @ Ry @ Rx
+        # Step 3: 로봇 프레임에서 yaw 회전 (Z축 기준)
+        y = np.radians(yaw_deg)
+        Rz = np.array([
+            [np.cos(y), -np.sin(y), 0],
+            [np.sin(y),  np.cos(y), 0],
+            [0, 0, 1]
+        ])
+
+        return Rz @ T_base @ Rx_cam
 
     # ============================================
     # Cross Detection: 먼 쪽 포인트 필터링

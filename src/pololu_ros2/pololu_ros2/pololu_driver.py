@@ -27,6 +27,12 @@ BACKWARD = b'\x06'   # Drive motor reverse command
 START = b'\x03'      # Exit Safe-Start mode so the motor can run
 STOP = b'\x60'       # Stops the motor and enters Safe-Start mode
 
+# Compact Protocol commands (no device ID needed)
+COMPACT_FORWARD = b'\x85'   # Drive motor forward (Compact)
+COMPACT_BACKWARD = b'\x86'  # Drive motor reverse (Compact)
+COMPACT_START = b'\x83'     # Exit Safe-Start (Compact)
+COMPACT_STOP = b'\xE0'      # Stop motor (Compact)
+
 
 class Daisy(object):
     """Represents a single Pololu Simple Motor Controller in a daisy chain
@@ -48,20 +54,28 @@ class Daisy(object):
     count = 0  # static variable to keep track of number of Daisys open
     ser = None  # initialize static variable ser to None
 
-    def __init__(self, dev_num, port="/dev/ttyUSB0", baudrate=9600):
-        """Set motor id and open serial connection if not already open"""
+    def __init__(self, dev_num, port="/dev/ttyUSB0", baudrate=9600, use_compact=True):
+        """Set motor id and open serial connection if not already open
+
+        Args:
+            dev_num: Device number (0-127) for daisy chaining
+            port: Serial port
+            baudrate: Baud rate
+            use_compact: Use Compact Protocol (True) or Pololu Protocol (False)
+        """
 
         if dev_num < 0 or dev_num > 127:
             raise Exception("Invalid motor id, must set to id of motor (0-127) for daisy chaining")
 
         Daisy.count += 1  # increment count of controllers
         self.dev_num = bytes([dev_num])  # set device number to use in other commands
+        self.use_compact = use_compact  # protocol mode
 
         # if serial connection has not been made yet
         if Daisy.ser is None or not Daisy.ser.isOpen():
             Daisy.ser = serial.Serial(port, baudrate=baudrate, timeout=1)
             Daisy.ser.write(BAUD_SYNC)  # sync old devices by writing 0x80
-        
+
         self._exit_safe_start()  # make it so pololu reacts to commands
 
     def __del__(self):
@@ -75,28 +89,36 @@ class Daisy(object):
                 Daisy.ser.close()
                 print("Serial connection closed")
 
-    def _send_command(self, command, databyte3, databyte4):
-        """Sends a two-byte command using the Pololu protocol."""
-        cmd = PROTOCOL + self.dev_num + command + bytes([databyte3, databyte4])
-        print(f"DEBUG: Sending command: {cmd.hex()} (dev={self.dev_num[0]}, cmd={command.hex()}, data3={databyte3}, data4={databyte4})")
+    def _send_command(self, command, compact_command, databyte3, databyte4):
+        """Sends a two-byte command using the appropriate protocol."""
+        if self.use_compact:
+            cmd = compact_command + bytes([databyte3, databyte4])
+            print(f"DEBUG: Sending compact command: {cmd.hex()} (data3={databyte3}, data4={databyte4})")
+        else:
+            cmd = PROTOCOL + self.dev_num + command + bytes([databyte3, databyte4])
+            print(f"DEBUG: Sending command: {cmd.hex()} (dev={self.dev_num[0]}, cmd={command.hex()}, data3={databyte3}, data4={databyte4})")
         Daisy.ser.write(cmd)
         Daisy.ser.flush()  # Ensure data is sent immediately
 
-    def _send_command_single(self, command):
-        """Sends a one-byte command using the Pololu protocol."""
-        cmd = PROTOCOL + self.dev_num + command
-        print(f"DEBUG: Sending single command: {cmd.hex()} (dev={self.dev_num[0]}, cmd={command.hex()})")
+    def _send_command_single(self, command, compact_command):
+        """Sends a one-byte command using the appropriate protocol."""
+        if self.use_compact:
+            cmd = compact_command
+            print(f"DEBUG: Sending compact single command: {cmd.hex()}")
+        else:
+            cmd = PROTOCOL + self.dev_num + command
+            print(f"DEBUG: Sending single command: {cmd.hex()} (dev={self.dev_num[0]}, cmd={command.hex()})")
         Daisy.ser.write(cmd)
         Daisy.ser.flush()  # Ensure data is sent immediately
 
     def _exit_safe_start(self):
         """Exit safe start so you can freely send commands to Pololu.
         This must be run before run other commands."""
-        self._send_command_single(START)
+        self._send_command_single(START, COMPACT_START)
 
     def _stop_motor(self):
         """Immediately stops the motor and enters safe start mode"""
-        self._send_command_single(STOP)
+        self._send_command_single(STOP, COMPACT_STOP)
 
     # USER METHODS
 
@@ -104,17 +126,17 @@ class Daisy(object):
         """Drive motor forward at specified speed (0 to 3200)"""
         speed = max(min(3200, speed), 0)  # enforce bounds
         self._exit_safe_start()
-        
+
         # Pololu Protocol uses 5-bit + 7-bit format for 12-bit data
         # databyte3 contains the lower 5 bits
         # databyte4 contains the upper 7 bits
-        self._send_command(FORWARD, speed & 0x1F, (speed >> 5) & 0x7F)
+        self._send_command(FORWARD, COMPACT_FORWARD, speed & 0x1F, (speed >> 5) & 0x7F)
 
     def backward(self, speed):
         """Drive motor backward (reverse) at specified speed (0 to 3200)"""
         speed = max(min(3200, speed), 0)  # enforce bounds
         self._exit_safe_start()
-        self._send_command(BACKWARD, speed & 0x1F, (speed >> 5) & 0x7F)
+        self._send_command(BACKWARD, COMPACT_BACKWARD, speed & 0x1F, (speed >> 5) & 0x7F)
 
     def drive(self, speed):
         """Drive motor in direction based on speed (-3200, 3200)"""

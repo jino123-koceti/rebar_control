@@ -1438,10 +1438,11 @@ class PositionControlNode(Node):
         right_speed_control = int(right_dps * 100)
         
         # 좌우 모터 180도 반대 장착으로 인한 방향 보정:
-        # - 0x141(좌)과 0x142(우)는 서로 마주보고 장착됨
-        # - 전진: 좌측은 반시계, 우측은 시계 (또는 그 반대)
-        # - 차등 구동 계산 후 한쪽만 반전 필요
-        # FIX: 오른쪽 모터만 반전 (또는 왼쪽만 반전)
+        # - 0x141과 0x142는 180도 회전된 상태로 좌우에 장착
+        # - AN3 앞으로(AN3-) → 전진, AN3 아래로(AN3+) → 후진
+        # - AN4 왼쪽(AN4+) → CW, AN4 오른쪽(AN4-) → CCW
+        # - 모터 방향 반전 유지 (현재 설정이 올바름)
+        left_speed_control = -left_speed_control
         right_speed_control = -right_speed_control
 
         # 로그: CAN 명령 전송 전 (DEBUG 레벨)

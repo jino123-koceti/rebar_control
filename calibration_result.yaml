@@ -1,0 +1,40 @@
+calibration:
+  camera: right (zedxmini2)
+  max_error_mm: 187.9
+  mean_error_mm: 14.38
+  method: multiple_linear_regression_with_cross_terms
+  num_points: 84
+  x_mapping:
+    coeffs:
+    - 0.313292
+    - 6.540951
+    - 2.438966
+    - 0.001678
+    - -0.01686
+    - -1268.947649
+    formula: X = a*u + b*v + c*d + e*u*d + f*v*d + g
+    inputs:
+    - pixel_u
+    - pixel_v
+    - depth_mm
+    - pixel_u*depth
+    - pixel_v*depth
+    - '1'
+    r_squared: 0.9242
+  y_mapping:
+    coeffs:
+    - -0.106164
+    - 3.020685
+    - -0.151391
+    - 0.000257
+    - 0.000219
+    - -473.881442
+    formula: Y = a*u + b*v + c*d + e*u*d + f*v*d + g
+    inputs:
+    - pixel_u
+    - pixel_v
+    - depth_mm
+    - pixel_u*depth
+    - pixel_v*depth
+    - '1'
+    r_squared: 0.9597

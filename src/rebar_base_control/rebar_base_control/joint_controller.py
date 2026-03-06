@@ -56,11 +56,11 @@ class JointController(Node):
         self.declare_parameter('home_encoder_90', 24399)
 
         # Parameters - 3축 스테이지 (0x144, 0x145, 0x146)
-        self.declare_parameter('stage_x_step_deg', 36.0)      # 1mm = 36° (리드스크류 10mm/rev)
+        self.declare_parameter('stage_x_step_deg', 4.497)      # 1mm = 4.497° (P2P 실측 보정)
         self.declare_parameter('stage_x_max_speed', 200.0)    # dps
-        self.declare_parameter('stage_y_step_deg', 36.0)
+        self.declare_parameter('stage_y_step_deg', 4.462)      # 1mm = 4.462° (P2P 실측 보정)
         self.declare_parameter('stage_y_max_speed', 200.0)
-        self.declare_parameter('stage_z_step_deg', 36.0)
+        self.declare_parameter('stage_z_step_deg', 2.69)       # 1mm ≈ 2.69°
         self.declare_parameter('stage_z_max_speed', 200.0)
         self.declare_parameter('joystick_deadzone', 0.15)     # 15% 데드존
         self.declare_parameter('joystick_scale', 1.0)         # 조이스틱 감도
@@ -391,12 +391,20 @@ class JointController(Node):
             # 리밋 센서 안전 체크 (0x144~0x147)
             axis_map = {0x144: 'x', 0x145: 'y', 0x146: 'z', 0x147: 'yaw'}
             axis = axis_map.get(msg.joint_id)
-            if axis and not self._check_limit_safe(axis, msg.position):
-                self.get_logger().warn(
-                    f"[Auto] 리밋 센서 차단: 0x{msg.joint_id:03X} ({axis}) "
-                    f"방향={msg.position:.1f}° - 이동 거부"
-                )
-                return
+            if axis:
+                if msg.control_mode == JointControl.MODE_ABSOLUTE:
+                    # 절대 위치: 현재 homing reference 대비 이동 방향 판단
+                    ref = self.homing_references.get(msg.joint_id)
+                    direction = msg.position - ref if ref is not None else msg.position
+                else:
+                    direction = msg.position
+
+                if not self._check_limit_safe(axis, direction):
+                    self.get_logger().warn(
+                        f"[Auto] 리밋 센서 차단: 0x{msg.joint_id:03X} ({axis}) "
+                        f"방향={direction:.1f}° - 이동 거부"
+                    )
+                    return
 
             self.joint_publisher.publish(msg)
             self.last_command_time = self.get_clock().now()

@@ -18,9 +18,10 @@ rebar_detection_node:
     # 좌측 카메라 (zedxmini1, SN: 56755054)
     left_camera:
       position: [-200.0, 100.0, 108.0]
-      rotation: [40.0, 0.0, -20.0]   # pitch, roll, yaw
+      rotation: [40.0, 0.0, 0.0]   # pitch, roll, yaw (Y축 정렬)
 
     # 우측 카메라 (zedxmini2, SN: 54946194)
+    # 원점: 스테이지 홈(Xmin,Ymin) 작업공구 끝단 기준
     right_camera:
-      position: [-200.0, -100.0, 108.0]
-      rotation: [40.0, 0.0, 20.0]
+      position: [150.0, 370.0, -40.0]   # X=+15cm(앞), Y=+37cm(왼쪽), Z=-4cm(아래)
+      rotation: [40.0, 0.0, 0.0]   # pitch, roll, yaw (Y축 정렬)

@@ -61,20 +61,28 @@ class ZenohClient(Node):
         self.control_mode_topic = self.get_parameter('control_mode_topic').value
 
         # Zenoh 세션 초기화
+        # NOTE: DDS(FastRTPS)가 participant 수에 따라 7446 포트를 점유할 수 있어
+        #       멀티캐스트 스카우팅을 비활성화하고 TCP 리스너만 사용
         try:
+            config = zenoh.Config()
+            port = self.get_parameter('zenoh_port').value
+
+            # 멀티캐스트 스카우팅 비활성화 (DDS 포트 충돌 방지)
+            config.insert_json5("scouting/multicast/enabled", "false")
+
+            # TCP 리스너 설정 (외부 노트북에서 접속 가능)
+            config.insert_json5("listen/endpoints", f'["tcp/0.0.0.0:{port}"]')
+
             if self.zenoh_mode == 'client' and self.zenoh_router:
                 # Client 모드 (Router 주소 지정)
-                config = zenoh.Config()
-                port = self.get_parameter('zenoh_port').value
                 endpoints = f'["tcp/{self.zenoh_router}:{port}"]'
                 config.insert_json5("connect/endpoints", endpoints)
                 self.session = zenoh.open(config)
                 self.get_logger().info(f"✅ Zenoh 세션 열림 (Client 모드): {self.zenoh_router}:{port}")
             else:
-                # Peer 모드 (자동 discovery)
-                config = zenoh.Config()
+                # Peer 모드 (TCP 리스너로 대기)
                 self.session = zenoh.open(config)
-                self.get_logger().info("✅ Zenoh 세션 열림 (Peer 모드)")
+                self.get_logger().info(f"✅ Zenoh 세션 열림 (Peer 모드, TCP 리스너: 0.0.0.0:{port})")
         except Exception as e:
             self.get_logger().error(f"❌ Zenoh 세션 열기 실패: {e}")
             self.session = None

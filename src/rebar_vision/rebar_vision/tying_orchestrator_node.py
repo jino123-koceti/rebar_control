@@ -36,6 +36,8 @@ class TyingState(Enum):
     EXECUTING_S22 = auto()
     WAITING_S22 = auto()
     ADVANCING = auto()
+    EXECUTING_YAW = auto()
+    WAITING_YAW = auto()
     RETURNING_HOME = auto()
     COMPLETE = auto()
     ERROR = auto()
@@ -50,8 +52,8 @@ class TyingOrchestratorNode(Node):
         # ============================================
         # 파라미터 선언
         # ============================================
-        self.declare_parameter('deg_per_mm_x', 2.698)
-        self.declare_parameter('deg_per_mm_y', 2.677)
+        self.declare_parameter('deg_per_mm_x', 4.497)
+        self.declare_parameter('deg_per_mm_y', 4.462)
         self.declare_parameter('stage_max_speed_dps', 200.0)
         self.declare_parameter('stage_settling_time', 1.5)
         self.declare_parameter('max_stage_timeout', 10.0)
@@ -62,6 +64,8 @@ class TyingOrchestratorNode(Node):
         self.declare_parameter('inter_point_delay', 0.5)
         self.declare_parameter('detection_retry_count', 3)
         self.declare_parameter('detection_retry_delay', 1.0)
+        self.declare_parameter('yaw_rotation_speed', 134.0)  # YAW 회전 속도 (dps)
+        self.declare_parameter('yaw_settling_time', 2.0)     # YAW 회전 후 안정화 대기 (초)
 
         # 파라미터 가져오기
         self.deg_per_mm_x = self.get_parameter('deg_per_mm_x').value
@@ -76,6 +80,8 @@ class TyingOrchestratorNode(Node):
         self.inter_point_delay = self.get_parameter('inter_point_delay').value
         self.detection_retry_count = self.get_parameter('detection_retry_count').value
         self.detection_retry_delay = self.get_parameter('detection_retry_delay').value
+        self.yaw_rotation_speed = self.get_parameter('yaw_rotation_speed').value
+        self.yaw_settling_time = self.get_parameter('yaw_settling_time').value
 
         # ============================================
         # 상태 변수
@@ -96,6 +102,10 @@ class TyingOrchestratorNode(Node):
         # 스테이지 목표
         self.target_x_deg = 0.0
         self.target_y_deg = 0.0
+
+        # YAW 추적
+        self.yaw_accumulated = 0.0
+        self.yaw_insert_index = 3  # P3 다음 (0-indexed), P1→P2→P3→YAW→P4→P5→P6
 
         # 서비스 호출 상태
         self.detection_future = None
@@ -253,6 +263,16 @@ class TyingOrchestratorNode(Node):
         elif self.state == TyingState.ADVANCING:
             self._handle_advancing()
 
+        elif self.state == TyingState.EXECUTING_YAW:
+            self._handle_executing_yaw()
+
+        elif self.state == TyingState.WAITING_YAW:
+            if elapsed >= self.yaw_settling_time:
+                self.get_logger().info(
+                    f'  YAW 회전 완료 ({elapsed:.1f}s) - P4로 이동'
+                )
+                self._transition_to(TyingState.MOVING_TO_POINT)
+
         elif self.state == TyingState.RETURNING_HOME:
             if elapsed >= self.stage_settling_time:
                 self._transition_to(TyingState.COMPLETE)
@@ -272,6 +292,7 @@ class TyingOrchestratorNode(Node):
         self.current_point_index = 0
         self.stage_x_accumulated = 0.0
         self.stage_y_accumulated = 0.0
+        self.yaw_accumulated = 0.0
         self.detection_retry = 0
         self._transition_to(TyingState.DETECTING)
 
@@ -305,13 +326,18 @@ class TyingOrchestratorNode(Node):
 
             if result.success and result.grid.valid:
                 self.grid = result.grid
+                self._reorder_grid_for_tying()
                 self.get_logger().info(
                     f'  검출 성공: {len(self.grid.detections)}개 교차점 '
                     f'({result.detection_time_ms:.1f}ms)'
                 )
+                self.get_logger().info(
+                    '  경로: P1→P2→P3→YAW→P4→P5→P6'
+                )
                 for i, det in enumerate(self.grid.detections):
+                    label = f'P{i + 1}'
                     self.get_logger().info(
-                        f'    [{i}] X={det.x:.1f}mm Y={det.y:.1f}mm '
+                        f'    [{label}] X={det.x:.1f}mm Y={det.y:.1f}mm '
                         f'conf={det.confidence:.2f}'
                     )
                 self._transition_to(TyingState.MOVING_TO_POINT)
@@ -397,13 +423,19 @@ class TyingOrchestratorNode(Node):
         self._transition_to(TyingState.WAITING_STAGE)
 
     def _handle_advancing(self):
-        """다음 포인트로 이동 또는 완료"""
+        """다음 포인트로 이동 또는 완료 (P1→P2→P3→YAW→P4→P5→P6)"""
         self.current_point_index += 1
 
         if self.current_point_index >= len(self.grid.detections):
             self.get_logger().info('  전체 결속 포인트 완료 - 스테이지 복귀')
             self._return_stage_home()
             self._transition_to(TyingState.RETURNING_HOME)
+        elif self.current_point_index == self.yaw_insert_index:
+            # P3 완료 후 → YAW home→max 회전 → P4
+            self.get_logger().info(
+                f'  P3 결속 완료 - YAW home → {self.max_yaw_deg}° 회전 실행'
+            )
+            self._transition_to(TyingState.EXECUTING_YAW)
         else:
             # 포인트 간 대기
             time.sleep(self.inter_point_delay)
@@ -428,6 +460,21 @@ class TyingOrchestratorNode(Node):
         self._publish_status()
         self._transition_to(TyingState.IDLE)
 
+    def _handle_executing_yaw(self):
+        """P3→P4 간 YAW 회전 실행 (0x147): home(0°) → max_yaw_deg"""
+        yaw_msg = JointControl()
+        yaw_msg.joint_id = 0x147
+        yaw_msg.position = self.max_yaw_deg
+        yaw_msg.velocity = self.yaw_rotation_speed
+        yaw_msg.control_mode = JointControl.MODE_RELATIVE
+        self.joint_pub.publish(yaw_msg)
+
+        self.yaw_accumulated = self.max_yaw_deg
+        self.get_logger().info(
+            f'  YAW 회전 명령: home → {self.max_yaw_deg}° (max_yaw)'
+        )
+        self._transition_to(TyingState.WAITING_YAW)
+
     def _handle_error(self, error_msg):
         """에러 처리"""
         self.get_logger().error(f'[ERROR] {error_msg}')
@@ -442,6 +489,32 @@ class TyingOrchestratorNode(Node):
     # ============================================
     # 유틸리티
     # ============================================
+    def _reorder_grid_for_tying(self):
+        """검출 그리드를 P1→P2→P3→P4→P5→P6 순서로 재정렬
+
+        검출 노드 출력 (grid.detections):
+          [0:3] = row_0 (Y-) = X 오름차순 (Xmin→Xmax)
+          [3:6] = row_1 (Y+) = X 오름차순 (Xmin→Xmax)
+
+        이미지 기준 (rebar_robot.png):
+          row_1 (Y+, 왼쪽): P3(Xmin)→P2(mid)→P1(Xmax) = X 내림차순
+          row_0 (Y-, 오른쪽): P4(Xmin)→P5(mid)→P6(Xmax) = X 오름차순
+
+        결과 순서: P1→P2→P3 (row_1 X내림차순) → P4→P5→P6 (row_0 X오름차순)
+        """
+        dets = list(self.grid.detections)
+        if len(dets) < 6:
+            return
+
+        row_0 = dets[:3]   # Y- (오른쪽), X 오름차순
+        row_1 = dets[3:6]  # Y+ (왼쪽), X 오름차순
+
+        # P1→P2→P3: row_1을 X 내림차순 (Xmax→Xmin)
+        row_1_reversed = sorted(row_1, key=lambda d: d.x, reverse=True)
+
+        # P4→P5→P6: row_0은 X 오름차순 (Xmin→Xmax) 그대로
+        self.grid.detections = row_1_reversed + row_0
+
     def _return_stage_home(self):
         """스테이지를 원위치로 복귀"""
         if abs(self.stage_x_accumulated) > 0.1:
@@ -460,13 +533,24 @@ class TyingOrchestratorNode(Node):
             y_msg.control_mode = JointControl.MODE_RELATIVE
             self.joint_pub.publish(y_msg)
 
+        # YAW 복귀 (0x147)
+        if abs(self.yaw_accumulated) > 0.1:
+            yaw_msg = JointControl()
+            yaw_msg.joint_id = 0x147
+            yaw_msg.position = -self.yaw_accumulated
+            yaw_msg.velocity = self.yaw_rotation_speed
+            yaw_msg.control_mode = JointControl.MODE_RELATIVE
+            self.joint_pub.publish(yaw_msg)
+
         self.get_logger().info(
             f'  스테이지 복귀: X={-self.stage_x_accumulated:.1f}mm, '
-            f'Y={-self.stage_y_accumulated:.1f}mm'
+            f'Y={-self.stage_y_accumulated:.1f}mm, '
+            f'YAW={-self.yaw_accumulated:.1f}°'
         )
 
         self.stage_x_accumulated = 0.0
         self.stage_y_accumulated = 0.0
+        self.yaw_accumulated = 0.0
 
     def _send_sequence_cmd(self, command):
         """시퀀스 명령 발행"""

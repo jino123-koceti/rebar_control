@@ -4,8 +4,8 @@
 tying_orchestrator:
   ros__parameters:
     # 스테이지 파라미터 (2026-03-04 실측)
-    deg_per_mm_x: 2.698          # X축: 1133.29° / 420mm (실측)
-    deg_per_mm_y: 2.677          # Y축: 803.09° / 300mm (실측)
+    deg_per_mm_x: 4.497          # X축: 1mm = 4.497° (P2P 실측 보정)
+    deg_per_mm_y: 4.462          # Y축: 1mm = 4.462° (P2P 실측 보정)
     stage_max_speed_dps: 200.0   # 최대 속도 (degree/s)
     stage_settling_time: 1.5     # 이동 후 안정 대기 시간 (초)
     max_stage_timeout: 10.0      # 스테이지 이동 최대 대기 시간 (초)
