@@ -101,9 +101,8 @@ class RebarController(Node):
         self.current_waypoint_index = 0  # 현재 웨이포인트 인덱스
         self.path_received = False  # 경로 수신 플래그
 
-        # 후진 모드 상태 유지 (목표 근처에서 heading 오차 불안정 방지)
-        self.backward_mode_locked = False  # 후진 모드 잠금 플래그
-        self.backward_prev_distance = None  # 후진 시 이전 거리 (지나침 감지용)
+        # 경로 방향 (웨이포인트에서 결정, heading_error로 판단하지 않음)
+        self.path_is_backward = False
 
         # PID 상태
         self.prev_distance_error = 0.0
@@ -218,24 +217,52 @@ class RebarController(Node):
         self.current_waypoint_index = 0
         self.path_received = True
 
-        # 새 경로 수신 시 reference_heading 리셋 (매 경로마다 새로 계산)
-        self.reference_heading = None
-        self.backward_mode_locked = False
-        self.backward_prev_distance = None
+        # 경로 방향 결정 (상대좌표 기준: 마지막 WP의 X가 음수면 후진)
+        if len(self.waypoint_array_x) > 1:
+            last_rel_x = self.waypoint_array_x[-1] - self.waypoint_array_x[0]
+            self.path_is_backward = (last_rel_x < 0)
+        else:
+            self.path_is_backward = False
 
-        # 미션 오프셋 계산 (첫 웨이포인트를 현재 위치로)
+        # reference_heading = 로봇의 현재 facing 방향 (직진 유지 기준)
+        self.reference_heading = None
+
+        # 상대좌표 → 절대좌표 변환 (로봇 현재 위치+heading 기준으로 회전+이동)
         if self.current_pose is not None and len(self.waypoint_array_x) > 0:
             curr_x = self.current_pose.pose.position.x
             curr_y = self.current_pose.pose.position.y
+            curr_yaw = self._quaternion_to_yaw(self.current_pose.pose.orientation)
 
-            self.mission_offset_x = curr_x - self.waypoint_array_x[0]
-            self.mission_offset_y = curr_y - self.waypoint_array_y[0]
+            # 첫 웨이포인트를 원점으로, 현재 heading 방향으로 회전하여 odom 프레임으로 변환
+            origin_x = self.waypoint_array_x[0]
+            origin_y = self.waypoint_array_y[0]
+            cos_yaw = math.cos(curr_yaw)
+            sin_yaw = math.sin(curr_yaw)
 
+            direction_str = "후진" if self.path_is_backward else "전진"
             self.get_logger().info("=" * 70)
-            self.get_logger().info(f"📥 전체 경로 수신: {len(self.waypoint_array_x)}개 웨이포인트")
-            self.get_logger().info(f"  현재 위치: ({curr_x:.3f}, {curr_y:.3f}) m")
-            self.get_logger().info(f"  첫 WP: ({self.waypoint_array_x[0]:.3f}, {self.waypoint_array_y[0]:.3f}) m")
-            self.get_logger().info(f"  오프셋: ({self.mission_offset_x:.3f}, {self.mission_offset_y:.3f}) m")
+            self.get_logger().info(f"📥 전체 경로 수신: {len(self.waypoint_array_x)}개 웨이포인트 [{direction_str}]")
+            self.get_logger().info(f"  현재 위치: ({curr_x:.3f}, {curr_y:.3f}) m, yaw={math.degrees(curr_yaw):.1f}")
+            self.get_logger().info(f"  첫 WP (상대): ({origin_x:.3f}, {origin_y:.3f}) m")
+
+            for i in range(len(self.waypoint_array_x)):
+                # 첫 웨이포인트 기준 상대좌표
+                dx = self.waypoint_array_x[i] - origin_x
+                dy = self.waypoint_array_y[i] - origin_y
+                # 현재 heading으로 회전 후 현재 위치에 더함
+                self.waypoint_array_x[i] = curr_x + dx * cos_yaw - dy * sin_yaw
+                self.waypoint_array_y[i] = curr_y + dx * sin_yaw + dy * cos_yaw
+
+            # 오프셋 불필요 (이미 절대좌표로 변환됨)
+            self.mission_offset_x = 0.0
+            self.mission_offset_y = 0.0
+
+            if len(self.waypoint_array_x) > 1:
+                last_idx = len(self.waypoint_array_x) - 1
+                self.get_logger().info(
+                    f"  최종 WP (절대): ({self.waypoint_array_x[last_idx]:.3f}, "
+                    f"{self.waypoint_array_y[last_idx]:.3f}) m"
+                )
             self.get_logger().info("=" * 70)
 
             self.first_waypoint_of_mission = False
@@ -283,19 +310,13 @@ class RebarController(Node):
 
         # 상태 리셋
         self.waypoint_reached_sent = False
-        self.backward_mode_locked = False  # 후진 모드 잠금 해제 (새 웨이포인트)
-        self.backward_prev_distance = None
         if hasattr(self, '_waypoint_reached_published'):
             delattr(self, '_waypoint_reached_published')
 
         # 기준 heading 설정 (첫 번째 웨이포인트에서만)
+        # 로봇의 현재 facing 방향 = 직진 유지 기준 (atan2 아님)
         if self.reference_heading is None and self.current_pose is not None:
-            curr_x = self.current_pose.pose.position.x
-            curr_y = self.current_pose.pose.position.y
-            dx = x - curr_x
-            dy = y - curr_y
-            if math.sqrt(dx**2 + dy**2) > 0.01:
-                self.reference_heading = math.atan2(dy, dx)
+            self.reference_heading = self._quaternion_to_yaw(self.current_pose.pose.orientation)
 
         motion_str = "LATERAL" if motion_type == Waypoint.MOTION_LATERAL else "DIFFERENTIAL"
         self.get_logger().info(
@@ -345,8 +366,7 @@ class RebarController(Node):
         self.lateral_total_rotations = 0
         self.lateral_current_rotation = 0
         self.lateral_command_sent = False
-        self.backward_mode_locked = False
-        self.backward_prev_distance = None
+        self.path_is_backward = False
 
     def mission_command_callback(self, msg: String):
         """미션 명령 처리 (CANCEL 등)"""
@@ -483,8 +503,7 @@ class RebarController(Node):
         # 새 목표가 설정되면 도달 플래그 리셋
         if target_changed:
             self.waypoint_reached_sent = False
-            self.backward_mode_locked = False  # 후진 모드 잠금 해제 (새 목표)
-            self.backward_prev_distance = None
+            self.path_is_backward = False
 
             # 횡이동 진행 중이 아닐 때만 상태 리셋
             # (navigator가 주기적으로 같은 웨이포인트를 재발행하므로, 횡이동 중 리셋 방지)
@@ -613,7 +632,13 @@ class RebarController(Node):
             self._execute_differential_motion()
 
     def _execute_differential_motion(self):
-        """Differential drive 기반 전진/후진 제어"""
+        """Differential drive 기반 전진/후진 제어
+
+        제어 원칙:
+        - 전진/후진은 경로(웨이포인트)에서 결정 (heading_error 기반 판단 안 함)
+        - heading 보정은 직진 유지용 (reference_heading = 경로 시작 시 로봇 facing 방향)
+        - 제자리 선회 없음 (횡이동은 별도 모션으로 처리)
+        """
         # 현재 위치
         curr_x = self.current_pose.pose.position.x
         curr_y = self.current_pose.pose.position.y
@@ -623,108 +648,50 @@ class RebarController(Node):
         target_x = self.target_pose.pose.position.x
         target_y = self.target_pose.pose.position.y
 
-        # 목표까지 거리 및 각도
+        # 목표까지 거리
         dx = target_x - curr_x
         dy = target_y - curr_y
         distance = math.sqrt(dx**2 + dy**2)
-        target_yaw = math.atan2(dy, dx)
 
-        # 기준 heading이 설정되어 있으면 상대 heading으로 계산
-        if self.reference_heading is not None:
-            # 기준 heading에 상대적인 heading 계산
-            relative_curr_yaw = self._normalize_angle(curr_yaw - self.reference_heading)
-            relative_target_yaw = self._normalize_angle(target_yaw - self.reference_heading)
-            # Heading 오차 (상대 heading 기준)
-            heading_error = self._normalize_angle(relative_target_yaw - relative_curr_yaw)
-        else:
-            # 기준 heading이 아직 설정되지 않았으면 절대 heading 사용
-            heading_error = self._normalize_angle(target_yaw - curr_yaw)
-        
-        # 후진 상황 감지: heading 오차가 180° 근처일 때 (카메라가 전방을 향해 있어서)
-        # heading 오차가 150°~180° 또는 -150°~-180° 범위에 있으면 후진으로 판단
-        #
-        # 중요: 한번 후진 모드가 감지되면 유지하되, 목표를 지나치면 해제
-        abs_heading_error_for_backward = abs(heading_error)
-        should_be_backward = (abs_heading_error_for_backward > math.radians(150) and
-                             abs_heading_error_for_backward <= math.radians(180))
-
-        # 후진 모드 잠금/해제 로직
-        if should_be_backward and not self.backward_mode_locked:
-            # 후진 모드 시작
-            self.backward_mode_locked = True
-            self.backward_prev_distance = distance
-            self.get_logger().info(
-                f"🔙 후진 모드 시작: heading_error={math.degrees(heading_error):+.1f}°, 거리={distance*1000:.1f}mm"
-            )
-        elif self.backward_mode_locked:
-            # 목표 지나침 감지: heading_error가 0°~30° 범위 AND 거리가 증가 중
-            # (90°는 측면 오차일 수 있으므로 더 엄격하게 0~30°로 변경)
-            distance_increasing = (self.backward_prev_distance is not None and
-                                   distance > self.backward_prev_distance + 0.01)  # 10mm 이상 증가
-            heading_near_forward = abs_heading_error_for_backward < math.radians(30)
-
-            if heading_near_forward and distance_increasing:
-                # 목표를 지나친 것으로 판단 (heading ~0° + 거리 증가)
-                self.backward_mode_locked = False
-                self.backward_prev_distance = None
-                self.get_logger().info(
-                    f"⚠️ 목표 지나침 감지: heading_error={math.degrees(heading_error):+.1f}°, "
-                    f"거리={distance*1000:.1f}mm (증가 중) → 전진 모드로 전환"
-                )
-            else:
-                # 거리 업데이트 (감소 추적용)
-                self.backward_prev_distance = distance
-
-        is_backward_movement = self.backward_mode_locked
-
-        # 목표 도달 확인 (안정적인 판정: 여러 번 체크 후 도달 확정)
+        # 목표 도달 확인
         if distance < self.distance_tolerance:
             if not self.waypoint_reached_sent:
-                # 첫 도달 시 정지 명령만 발행 (아직 알림은 보내지 않음)
                 self.publish_cmd_vel(0.0, 0.0)
-                # 연속으로 tolerance 내에 있으면 도달 확정
                 self.waypoint_reached_sent = True
                 self.get_logger().info(
-                    f"🎯 목표 근접: 거리={distance*1000:.1f}mm < tolerance={self.distance_tolerance*1000:.0f}mm, "
-                    f"도달 확인 중..."
+                    f"🎯 목표 근접: 거리={distance*1000:.1f}mm < tolerance={self.distance_tolerance*1000:.0f}mm"
                 )
-            elif self.waypoint_reached_sent and not hasattr(self, '_waypoint_reached_published'):
-                # 이미 tolerance 내에 있었고 계속 유지 중이면 도달 확정 (한 번만)
+            elif not hasattr(self, '_waypoint_reached_published'):
                 self.publish_cmd_vel(0.0, 0.0)
-                self._waypoint_reached_published = True  # 발행 완료 플래그
-                self.get_logger().info(
-                    f"✅ 웨이포인트 도달 확정: 거리={distance*1000:.1f}mm"
-                )
+                self._waypoint_reached_published = True
+                self.get_logger().info(f"✅ 웨이포인트 도달 확정: 거리={distance*1000:.1f}mm")
 
-                # 인덱스 기반 모드면 다음 웨이포인트로 자동 이동
                 if self.path_received and len(self.waypoint_array_x) > 0:
                     self._advance_to_next_waypoint()
                 else:
-                    # 하위호환: 기존 방식 (navigator가 다음 웨이포인트 발행)
                     self.publish_waypoint_reached()
                 return
             else:
-                # 이미 도달 알림을 보냈으면 정지만 유지
                 self.publish_cmd_vel(0.0, 0.0)
                 return
         else:
-            # 거리가 tolerance를 벗어나면 플래그 리셋
             if self.waypoint_reached_sent:
                 self.waypoint_reached_sent = False
                 if hasattr(self, '_waypoint_reached_published'):
                     delattr(self, '_waypoint_reached_published')
-                self.get_logger().debug(
-                    f"📍 목표에서 벗어남: 거리={distance*1000:.1f}mm > tolerance={self.distance_tolerance*1000:.0f}mm"
-                )
+
+        # Heading 보정: reference_heading(직진 방향)에서 벗어난 정도
+        # 전진/후진 관계없이 동일 - 로봇이 직선에서 벗어나면 보정
+        heading_error = 0.0
+        if self.reference_heading is not None:
+            heading_error = self._normalize_angle(self.reference_heading - curr_yaw)
 
         # PID 제어
         dt = 1.0 / self.control_rate
 
-        # Distance PID with Anti-windup
+        # Distance PID
         self.integral_distance += distance * dt
-        # Anti-windup: 적분 누적 제한 (발산 방지)
         self.integral_distance = max(-self.integral_limit, min(self.integral_limit, self.integral_distance))
-
         derivative_distance = (distance - self.prev_distance_error) / dt
         linear_vel = (
             self.kp_linear * distance +
@@ -733,113 +700,39 @@ class RebarController(Node):
         )
         self.prev_distance_error = distance
 
-        # 후진 상황 처리: heading 오차가 180° 근처일 때
-        # (카메라가 전방을 향해 있어서 목표가 뒤에 있으면 heading 오차가 180°로 계산됨)
-        if is_backward_movement:
-            # 후진 시 heading 보정: 180°를 기준으로 오차 계산
-            # heading_error가 175° → 후진 기준 -5° (약간 왼쪽으로 틀어짐)
-            # heading_error가 -175° → 후진 기준 +5° (약간 오른쪽으로 틀어짐)
-            if heading_error > 0:
-                backward_heading_error = heading_error - math.pi  # 175° → -5°
-            else:
-                backward_heading_error = heading_error + math.pi  # -175° → +5°
-
-            # 후진 시 heading PID (방향 보정) with Anti-windup
-            self.integral_heading += backward_heading_error * dt
-            self.integral_heading = max(-self.integral_heading_limit, min(self.integral_heading_limit, self.integral_heading))
-            derivative_heading = (backward_heading_error - self.prev_heading_error) / dt
-            angular_vel = (
-                self.kp_angular * backward_heading_error +
-                self.ki_angular * self.integral_heading +
-                self.kd_angular * derivative_heading
-            )
-            self.prev_heading_error = backward_heading_error
-
-            # 후진 시 목표 근접하면 angular 속도 감소 (heading_error ±180° 경계 불안정 방지)
-            # 단, heading 보정은 어느정도 유지
-            backward_short_distance = 0.05  # 50mm
-            if distance < backward_short_distance:
-                angular_vel *= 0.2  # 각속도 20%로 감소 (10% → 20%)
-            elif distance < 0.10:  # 100mm 이하
-                angular_vel *= 0.5  # 각속도 50%로 감소 (30% → 50%)
-
-            # 선속도를 음수로 변환 (후진)
-            # pose_mux가 cmd_vel의 linear.x 부호를 보고 backward 카메라를 사용함
+        # 후진이면 선속도 반전
+        if self.path_is_backward:
             linear_vel = -abs(linear_vel)
 
-            self.get_logger().debug(
-                f"🔙 후진 모드: 거리={distance*1000:.1f}mm, "
-                f"heading_err={math.degrees(backward_heading_error):+.1f}°, "
-                f"linear={linear_vel:.3f}, angular={angular_vel:.3f}"
-            )
-        else:
-            # 전진/측면 이동: 정상 PID 제어
-            # Heading PID with Anti-windup
-            self.integral_heading += heading_error * dt
-            self.integral_heading = max(-self.integral_heading_limit, min(self.integral_heading_limit, self.integral_heading))
-            derivative_heading = (heading_error - self.prev_heading_error) / dt
-            angular_vel = (
-                self.kp_angular * heading_error +
-                self.ki_angular * self.integral_heading +
-                self.kd_angular * derivative_heading
-            )
-            self.prev_heading_error = heading_error
-
-        # 후진 모드가 아닐 때만 heading 기반 선속도 스케일링 적용
-        # (후진 시에는 backward_heading_error를 사용하므로 별도 처리)
-        if not is_backward_movement:
-            # 짧은 거리일 때는 heading 오차를 무시하고 직진만 수행
-            # (Visual Odometry 누적 오차로 인한 불필요한 회전 방지)
-            short_distance_threshold = 0.15  # 15cm 이하일 때
-            if distance < short_distance_threshold:
-                # 짧은 거리: heading 오차 무시, 직진만 수행
-                # 각속도는 최소화 (heading 오차가 매우 클 때만 작은 각속도)
-                abs_heading_error = abs(heading_error)
-                if abs_heading_error > math.pi / 2.0:  # 90도 이상일 때만 각속도 적용
-                    # 각속도는 유지하되, 선속도는 거리 기반으로만 계산
-                    pass
-                else:
-                    # 90도 이하: 각속도 감소 (직진 우선, 단 heading 보정 유지)
-                    angular_vel *= 0.5  # 각속도 50%로 감소 (30% → 50%)
-            else:
-                # 긴 거리: 기존 로직 (heading 오차에 따라 선속도 스케일링)
-                abs_heading_error = abs(heading_error)
-                if abs_heading_error > self.heading_tolerance:
-                    # heading 오차가 tolerance보다 크면 선속도를 점진적으로 감소
-                    # cos 함수를 사용하여 부드러운 전환
-                    # tolerance 이하: 1.0, π/2 이상: 0.0
-                    max_heading_for_scaling = math.pi / 2.0  # 90도
-                    if abs_heading_error >= max_heading_for_scaling:
-                        heading_scale = 0.0  # 90도 이상이면 선속도 0 (제자리 회전)
-                    else:
-                        # heading 오차에 비례하여 선속도 스케일링 (0.0 ~ 1.0)
-                        # tolerance에서 1.0, max_heading_for_scaling에서 0.0
-                        normalized_error = (abs_heading_error - self.heading_tolerance) / (
-                            max_heading_for_scaling - self.heading_tolerance
-                        )
-                        # cos 함수로 부드러운 감소 (0 ~ π/2 범위)
-                        heading_scale = math.cos(normalized_error * math.pi / 2.0)
-                    linear_vel *= heading_scale
-                # else: heading 오차가 tolerance 이하면 선속도 100% 유지 (회전+전진 동시)
+        # Heading PID (직선 유지 보정)
+        self.integral_heading += heading_error * dt
+        self.integral_heading = max(-self.integral_heading_limit, min(self.integral_heading_limit, self.integral_heading))
+        derivative_heading = (heading_error - self.prev_heading_error) / dt
+        angular_vel = (
+            self.kp_angular * heading_error +
+            self.ki_angular * self.integral_heading +
+            self.kd_angular * derivative_heading
+        )
+        self.prev_heading_error = heading_error
 
         # 속도 제한
         linear_vel = max(-self.max_linear, min(self.max_linear, linear_vel))
         angular_vel = max(-self.max_angular, min(self.max_angular, angular_vel))
 
-        # VSLAM 정보 및 거리 오차 출력 (터미널 로깅)
-        mode_str = "후진" if is_backward_movement else "전진"
+        # 로깅
+        mode_str = "후진" if self.path_is_backward else "전진"
         self.get_logger().info(
             f"[{mode_str}] VSLAM: ({curr_x:.3f}, {curr_y:.3f}) yaw={math.degrees(curr_yaw):.1f}° | "
             f"목표: ({target_x:.3f}, {target_y:.3f}) | "
-            f"거리오차: {distance*1000:.1f}mm, 헤딩오차: {math.degrees(heading_error):.1f}° | "
-            f"cmd: lin={linear_vel:.3f}, ang={angular_vel:.3f}"
+            f"거리: {distance*1000:.1f}mm, 헤딩보정: {math.degrees(heading_error):.1f}° | "
+            f"cmd: lin={linear_vel:.3f}, ang={angular_vel:.3f}",
+            throttle_duration_sec=1.0
         )
 
-        # cmd_vel 발행
         self.publish_cmd_vel(linear_vel, angular_vel)
 
     def publish_cmd_vel(self, linear, angular):
-        """cmd_vel 발행"""
+        """cmd_vel 발행 (drive_controller에서 linear 반전 처리함)"""
         msg = Twist()
         msg.linear.x = linear
         msg.angular.z = angular
@@ -884,8 +777,7 @@ class RebarController(Node):
                     self.target_pose = None
                     self.target_waypoint = None
                     self.waypoint_reached_sent = False
-                    self.backward_mode_locked = False
-                    self.backward_prev_distance = None
+                    self.path_is_backward = False
 
                     # 횡이동 상태 리셋
                     self.lateral_total_rotations = 0

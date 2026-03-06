@@ -88,10 +88,11 @@ class PoseMux(Node):
     def cmd_vel_callback(self, msg: Twist):
         vx = msg.linear.x
         self.last_speed = vx
-        # 전후면 반전: 음수 cmd_vel = 새 전진 방향
-        if vx < -self.velocity_deadband:
+        # rebar_controller: positive cmd_vel = forward, negative = backward
+        # drive_controller가 linear 반전 처리하므로 여기서는 원래 부호 기준
+        if vx > self.velocity_deadband:
             self.last_direction = 'forward'
-        elif vx > self.velocity_deadband:
+        elif vx < -self.velocity_deadband:
             self.last_direction = 'backward'
         # within deadband: keep last_direction
 
@@ -106,44 +107,35 @@ class PoseMux(Node):
     # Odom handling
     def front_odom_callback(self, msg: Odometry):
         if self.should_use_front():
-            self.publish_pose(msg)
+            self.publish_pose_transformed(msg)
 
     def back_odom_callback(self, msg: Odometry):
         if self.should_use_back():
-            self.publish_pose_back_transformed(msg)
+            self.publish_pose(msg)
 
-    def transform_back_odom(self, odom: Odometry) -> Odometry:
-        """Transform back camera odom to front camera frame.
+    def transform_odom(self, odom: Odometry) -> Odometry:
+        """전후면 반전 보정: front 카메라의 +X가 로봇 새 전진 방향과 반대이므로 X/Y 반전.
 
-        Back camera is mounted opposite to front, so:
         - Position: X → -X, Y → -Y (Z unchanged)
-        - Orientation: NOT transformed (keep original)
-          → rebar_controller uses heading error ~180° to detect backward motion
-          → If we transform heading, it causes oscillation between forward/backward
+        - Orientation: 유지 (rebar_controller가 heading_error로 전진/후진 판단)
         """
         transformed = Odometry()
         transformed.header = odom.header
         transformed.child_frame_id = odom.child_frame_id
 
-        # Negate X and Y position
         transformed.pose.pose.position.x = -odom.pose.pose.position.x
         transformed.pose.pose.position.y = -odom.pose.pose.position.y
         transformed.pose.pose.position.z = odom.pose.pose.position.z
-
-        # Keep orientation as-is (NO 180° rotation)
-        # This way, rebar_controller sees heading_error ~180° and correctly
-        # switches to backward mode, sending negative linear.x
         transformed.pose.pose.orientation = odom.pose.pose.orientation
 
-        # Copy covariance (simplified - proper transform would rotate covariance too)
         transformed.pose.covariance = odom.pose.covariance
         transformed.twist = odom.twist
 
         return transformed
 
-    def publish_pose_back_transformed(self, odom: Odometry):
-        """Publish back camera odom with 180° transformation."""
-        transformed = self.transform_back_odom(odom)
+    def publish_pose_transformed(self, odom: Odometry):
+        """Publish front camera odom with X/Y negation."""
+        transformed = self.transform_odom(odom)
         pose = PoseStamped()
         pose.header.stamp = transformed.header.stamp
         pose.header.frame_id = self.output_frame
