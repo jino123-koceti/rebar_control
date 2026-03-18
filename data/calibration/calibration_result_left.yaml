@@ -1,0 +1,40 @@
+calibration:
+  camera: Left Camera (zedxmini1)
+  max_error_mm: 12.57
+  mean_error_mm: 5.67
+  method: multiple_linear_regression_with_cross_terms
+  num_points: 24
+  x_mapping:
+    coeffs:
+    - -0.337124
+    - 1.387677
+    - 1.646665
+    - -0.001694
+    - -0.004288
+    - 75.337144
+    formula: X = a*u + b*v + c*d + e*u*d + f*v*d + g
+    inputs:
+    - pixel_u
+    - pixel_v
+    - depth_mm
+    - pixel_u*depth
+    - pixel_v*depth
+    - '1'
+    r_squared: 0.9987
+  y_mapping:
+    coeffs:
+    - -0.354137
+    - -3.370596
+    - -0.774247
+    - 0.000914
+    - 0.001844
+    - 1096.118784
+    formula: Y = a*u + b*v + c*d + e*u*d + f*v*d + g
+    inputs:
+    - pixel_u
+    - pixel_v
+    - depth_mm
+    - pixel_u*depth
+    - pixel_v*depth
+    - '1'
+    r_squared: 0.9879

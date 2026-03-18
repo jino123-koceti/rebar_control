@@ -213,8 +213,8 @@ class RebarDetectionNode(Node):
     def _load_calibration_models(self):
         """캘리브레이션 YAML에서 회귀 계수 로드"""
         calib_files = {
-            'left': '/home/koceti/ros2_ws/calibration_result_left.yaml',
-            'right': '/home/koceti/ros2_ws/calibration_result_right.yaml',
+            'left': '/home/koceti/ros2_ws/data/calibration/calibration_result_left.yaml',
+            'right': '/home/koceti/ros2_ws/data/calibration/calibration_result_right.yaml',
         }
         for cam, path in calib_files.items():
             if not os.path.exists(path):

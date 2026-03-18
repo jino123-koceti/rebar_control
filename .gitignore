@@ -13,19 +13,6 @@ __pycache__/
 *.tar.gz
 *.zip
 
-# Test and analysis scripts
-analyze_*.sh
-plot_*.py
-scan_*.py
-monitor_*.sh
-
-# Setup scripts
-setup_*.sh
-complete_setup.sh
-fix_*.sh
-build_*.sh
-check_*.sh
-
 # Service files
 *.service
 
@@ -44,6 +31,15 @@ src/test_code/
 rmd_can_protocol/
 
 # Temporary test files
-test_gmsl_camera.py
 src/seengrip_code.py
 src/simplemodbus.py
+
+# Generated images (analysis output)
+data/images/
+
+# Captured images
+captured_images/
+captured_training/
+
+# IDE
+.vscode/
