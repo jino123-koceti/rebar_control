@@ -184,7 +184,7 @@ lines2, labels2 = ax2b.get_legend_handles_labels()
 ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
 
 plt.tight_layout()
-plt.savefig(os.path.join(IMG_DIR, 'tying_cycle_breakdown333.png', dpi=150, bbox_inches='tight')
+plt.savefig(os.path.join(IMG_DIR, 'tying_cycle_breakdown333.png'), dpi=150, bbox_inches='tight')
 print("Saved: tying_cycle_breakdown333.png")
 
 # ============================================================
@@ -279,7 +279,7 @@ fig2.legend(handles=legend_elements, loc='lower center', ncol=4, fontsize=10,
             bbox_to_anchor=(0.5, -0.02))
 
 plt.tight_layout(rect=[0, 0.03, 1, 0.96])
-plt.savefig(os.path.join(IMG_DIR, 'tying_cycle_timeline333.png', dpi=150, bbox_inches='tight')
+plt.savefig(os.path.join(IMG_DIR, 'tying_cycle_timeline333.png'), dpi=150, bbox_inches='tight')
 print("Saved: tying_cycle_timeline333.png")
 
 plt.show()

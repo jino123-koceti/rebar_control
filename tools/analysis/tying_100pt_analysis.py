@@ -1,3 +1,5 @@
+import os
+IMG_DIR = os.path.join("/home/koceti/ros2_ws", "data", "images")
 #!/usr/bin/env python3
 """
 100pt 자율결속 3회 시험 분석 및 플롯
@@ -268,7 +270,7 @@ ax4.axhline(y=avg_time_min, color='red', linestyle='--', alpha=0.5)
 ax4.text(2.5, avg_time_min, f'Avg: {avg_time_min:.1f}min', color='red', fontsize=8)
 
 plt.tight_layout()
-plt.savefig('tying_100pt_analysis.png', dpi=150, bbox_inches='tight')
+plt.savefig(os.path.join(IMG_DIR, 'tying_100pt_analysis.png'), dpi=150, bbox_inches='tight')
 print(f'\nPlot saved: tying_100pt_analysis.png')
 
 # 2nd plot: rate over time (points per minute)
@@ -303,7 +305,7 @@ ax.grid(True, alpha=0.3)
 ax.set_xlim(0)
 
 plt.tight_layout()
-plt.savefig('tying_100pt_rate.png', dpi=150, bbox_inches='tight')
+plt.savefig(os.path.join(IMG_DIR, 'tying_100pt_rate.png'), dpi=150, bbox_inches='tight')
 print(f'Plot saved: tying_100pt_rate.png')
 
 plt.show()

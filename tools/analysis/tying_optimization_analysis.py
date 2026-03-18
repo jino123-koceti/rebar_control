@@ -219,7 +219,7 @@ fig.text(0.5, 0.01,
          bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow', edgecolor='orange'))
 
 plt.tight_layout(rect=[0, 0.04, 1, 0.95])
-plt.savefig(os.path.join(IMG_DIR, 'tying_optimization_analysis.png', dpi=150, bbox_inches='tight')
+plt.savefig(os.path.join(IMG_DIR, 'tying_optimization_analysis.png'), dpi=150, bbox_inches='tight')
 print('Saved: tying_optimization_analysis.png')
 
 # Summary

@@ -124,7 +124,7 @@ legend_elements = [
 ]
 fig.legend(handles=legend_elements, loc='lower center', ncol=5, fontsize=9, bbox_to_anchor=(0.5, -0.01))
 plt.tight_layout(rect=[0, 0.04, 1, 0.94])
-plt.savefig(os.path.join(IMG_DIR, 'tying_cycle_timeline.png', dpi=120, bbox_inches='tight')
+plt.savefig(os.path.join(IMG_DIR, 'tying_cycle_timeline.png'), dpi=120, bbox_inches='tight')
 print('Saved: tying_cycle_timeline.png')
 
 # ============================================================
@@ -224,7 +224,7 @@ run_legend = [Patch(facecolor=c, label=f'Run {i+1}' if i < 4 else 'Est. 6pts')
 ax2.legend(handles=run_legend, loc='upper right', fontsize=8)
 
 plt.tight_layout(rect=[0, 0, 1, 0.93])
-plt.savefig(os.path.join(IMG_DIR, 'tying_cycle_breakdown.png', dpi=120, bbox_inches='tight')
+plt.savefig(os.path.join(IMG_DIR, 'tying_cycle_breakdown.png'), dpi=120, bbox_inches='tight')
 print('Saved: tying_cycle_breakdown.png')
 
 # Summary

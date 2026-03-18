@@ -104,7 +104,7 @@ ax2.text(0, 0, f'{avg_total:.1f}s\navg', ha='center', va='center',
         fontsize=16, fontweight='bold', color='#333')
 
 plt.tight_layout()
-plt.savefig(os.path.join(IMG_DIR, 'tying_cycle_analysis_report.png', dpi=150, bbox_inches='tight',
+plt.savefig(os.path.join(IMG_DIR, 'tying_cycle_analysis_report.png'), dpi=150, bbox_inches='tight',
             facecolor='white', edgecolor='none')
 plt.close()
 
@@ -155,7 +155,7 @@ ax3.grid(axis='y', alpha=0.3)
 ax3.set_ylim(-1.2, 8)
 
 plt.tight_layout()
-plt.savefig(os.path.join(IMG_DIR, 'tying_cycle_detail_report.png', dpi=150, bbox_inches='tight',
+plt.savefig(os.path.join(IMG_DIR, 'tying_cycle_detail_report.png'), dpi=150, bbox_inches='tight',
             facecolor='white', edgecolor='none')
 plt.close()
 
