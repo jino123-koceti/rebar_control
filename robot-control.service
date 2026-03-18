@@ -1,0 +1,27 @@
+[Unit]
+Description=Rebar Robot Control System
+After=network.target can-setup.service
+
+[Service]
+Type=simple
+User=koceti
+WorkingDirectory=/home/koceti/ros2_ws
+ExecStart=/home/koceti/ros2_ws/scripts/service/robot_control_service.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# 환경 변수
+Environment="ROS_DOMAIN_ID=0"
+
+[Install]
+WantedBy=multi-user.target
+
+
+
+
+
+
+
+
