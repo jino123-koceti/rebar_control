@@ -24,6 +24,7 @@ install(PROGRAMS
   rebar_base_control/ezi_io_controller.py
   rebar_base_control/authority_controller.py
   rebar_base_control/navigator_base.py
+  rebar_base_control/encoder_odom.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

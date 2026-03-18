@@ -72,15 +72,24 @@ joint_controller:
     homing_timeout: 30.0          # 단계별 타임아웃 (초)
 
     # Yaw 0x90 절대 엔코더 (16-bit, 전원 꺼져도 유지)
-    yaw_home_encoder_90: 16328    # Yaw min (홈 센서) 위치 - 2026-03-05 6차 실측
-    yaw_max_encoder_90: 44710     # Yaw max 위치 - 2026-03-05 6차 실측
+    yaw_home_encoder_90: 61857    # Yaw min (홈 센서) 위치 - 2026-03-15 재실측2 (0x90 position 기준)
+    yaw_max_encoder_90: 25896     # Yaw max 위치 - 2026-03-15 재실측2 (0x92=395.56°)
     yaw_full_stroke_deg: 399.0    # Yaw 풀 스트로크 (0x92 출력축 기준, deg) - 6차 실측
 
     # 준비 위치 오프셋 (홈 위치 기준)
-    ready_x_mm: 0.0              # X축 (x_min 기준, mm)
+    ready_x_mm: -300.0           # X축 (음수=xMax 방향, 작업 시작포인트 P1 부근)
     ready_y_mm: 0.0              # Y축 (y_min 기준, mm)
     ready_z_mm: 0.0              # Z축 (z_min 기준, mm)
-    ready_yaw_deg: 0.0           # Yaw (홈 센서 기준, deg)
+    ready_yaw_deg: 0.0            # Yaw (홈 센서 기준, deg) - 2026-03-15 오프셋 0으로 변경
+
+encoder_odom:
+  ros__parameters:
+    wheel_radius: 0.02865     # m (1 rev = 0.18m)
+    wheel_base: 0.5           # m (바퀴 간 거리)
+    publish_rate: 20.0        # Hz
+    left_motor_id: 0x41       # CAN parser 변환 ID (0x141 → 0x41)
+    right_motor_id: 0x42      # CAN parser 변환 ID (0x142 → 0x42)
+    dps_to_mps_scale: 0.989   # 캘리브레이션 보정 계수 (실측: 710mm/718mm)
 
 ezi_io_controller:
   ros__parameters:

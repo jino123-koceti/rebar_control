@@ -228,12 +228,11 @@ class DriveController(Node):
             joy_linear = 0.0
             joy_angular = 0.0
 
-        # 데드존 적용 (정규화된 값 기준: -0.157 ~ 0.157 정도)
+        # 데드존 + soft ramp 적용
+        # 데드존 내: 0, 데드존 밖: 0부터 점진적으로 증가 (경계에서 뚝 끊김 방지)
         deadzone_normalized = self.joystick_deadzone / 127.0
-        if abs(joy_linear) < deadzone_normalized:
-            joy_linear = 0.0
-        if abs(joy_angular) < deadzone_normalized:
-            joy_angular = 0.0
+        joy_linear = self._apply_deadzone_ramp(joy_linear, deadzone_normalized)
+        joy_angular = self._apply_deadzone_ramp(joy_angular, deadzone_normalized)
 
         # 조이스틱 값 → 선속도/각속도 변환
         # AN3+: 전진, AN3-: 후진 (방향 반전)
@@ -284,6 +283,20 @@ class DriveController(Node):
             drive_msg.right_speed = 0.0
 
         return drive_msg
+
+    @staticmethod
+    def _apply_deadzone_ramp(value: float, deadzone: float) -> float:
+        """데드존 + soft ramp: 데드존 밖에서 0부터 점진적으로 증가.
+
+        입력 범위 [-1, 1] → 출력 범위 [-1, 1]
+        |value| < deadzone → 0
+        |value| >= deadzone → 부호 유지, 0 ~ ±1로 리매핑
+        """
+        if abs(value) < deadzone:
+            return 0.0
+        sign = 1.0 if value > 0 else -1.0
+        # deadzone~1.0 구간을 0~1.0으로 리매핑
+        return sign * (abs(value) - deadzone) / (1.0 - deadzone)
 
     # ========== 속도 측정 관련 메서드 ==========
 

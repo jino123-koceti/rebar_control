@@ -6,19 +6,48 @@ tying_orchestrator:
     # 스테이지 파라미터 (2026-03-04 실측)
     deg_per_mm_x: 4.497          # X축: 1mm = 4.497° (P2P 실측 보정)
     deg_per_mm_y: 4.462          # Y축: 1mm = 4.462° (P2P 실측 보정)
-    stage_max_speed_dps: 200.0   # 최대 속도 (degree/s)
-    stage_settling_time: 1.5     # 이동 후 안정 대기 시간 (초)
+    stage_max_speed_dps: 1000.0  # 최대 속도 (degree/s)
+    stage_settling_time: 1.5     # (미사용, goal 도달 확인 방식으로 전환)
     max_stage_timeout: 10.0      # 스테이지 이동 최대 대기 시간 (초)
-    position_tolerance_deg: 5.0  # 위치 허용오차 (~1.9mm)
+    position_tolerance_deg: 1.0  # 위치 허용오차 (~0.22mm)
 
     # 스테이지 이동 범위 제한 (2026-03-04 실측)
-    max_stage_x_mm: 420.0        # X축 스트로크 (실측)
-    max_stage_y_mm: 300.0        # Y축 스트로크 (실측)
-    max_yaw_deg: 243.0           # Yaw 회전 범위 (실측)
+    max_stage_x_mm: 411.0        # X축 최대 스트로크 (실측)
+    max_stage_y_mm: 288.0        # Y축 스트로크 (결속기 간섭 방지)
+    max_yaw_deg: 399.0           # Yaw 풀 스트로크
+
+    # Yaw 자세 (홈 기준 오프셋, 절대값 = home_ref_yaw + offset)
+    yaw_right_cam_offset: -3.0   # Right cam 작업자세 (홈 기준 -3°)
+    yaw_left_cam_offset: 393.0   # Left cam 최종 작업자세 (홈 기준 +393°)
+    yaw_left_cam_approach_offset: 390.0  # Left cam 접근자세 (긴 거리 이동, 오버슈트 방지)
+    yaw_mid_offset: 173.0        # 자세 변경 중간 경유각 (홈 기준 +173°)
+
+    # 자세 변경 시퀀스 Y 위치
+    pose_change_y_near_mm: 100.0   # 자세 변경 시 Y 근접 위치 (Right cam side)
+    pose_change_y_far_mm: 250.0    # 자세 변경 시 Y 원거리 위치 (Left cam side)
+
+    # Z축 결속 파라미터
+    z_home_offset_mm: 10.0       # 호밍 후 Z 대기위치 (홈에서 하강 거리)
+    tying_z_down_mm: 10.0        # 결속 시 추가 Z 하강 (대기위치에서)
+    deg_per_mm_z: 11.0           # Z축: 1mm = 11.0°
+    z_speed_dps: 1000.0          # Z축 속도 (degree/s)
+    z_settle_margin: 0.1         # Z축 이동 후 추가 대기 마진 (초)
+
+    # 트리거 파라미터
+    trigger_speed: 1.0           # 트리거 모터 속도 (-1.0 ~ 1.0)
+    trigger_duration: 0.3        # 트리거 동작 시간 (초)
 
     # 결속 시퀀스 타이밍
     inter_point_delay: 0.5       # 포인트 간 대기 시간 (초)
 
-    # 검출 재시도
+    # 멀티검출 파라미터
+    multi_detect_tries: 5        # 다중 검출 최대 시도 횟수
+    multi_detect_delay: 0.3      # 검출 간 대기 시간 (초)
+    cluster_distance_mm: 40.0    # 클러스터링 거리 임계값 (mm)
+    expected_points_per_cam: 3   # 카메라당 기대 포인트 수
+    detection_confidence: 0.3    # 검출 confidence 임계값
+    rebar_spacing_mm: 195.0      # 철근 배근 간격 (mm)
+
+    # 검출 재시도 (멀티검출 내 서비스 실패 시)
     detection_retry_count: 3     # 검출 실패 시 재시도 횟수
     detection_retry_delay: 1.0   # 재시도 대기 시간 (초)

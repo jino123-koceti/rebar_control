@@ -170,10 +170,11 @@ class CANParser(Node):
             command_type = data[0]
 
             # 0x90: Single-Turn Encoder 응답
+            # 프로토콜 V4.3: DATA[2:3]=position(raw-offset), DATA[4:5]=raw, DATA[6:7]=offset
             if command_type == 0x90:
-                encoder_position = struct.unpack('<H', data[2:4])[0]  # uint16
-                encoder_raw = struct.unpack('<H', data[4:6])[0]  # uint16
-                encoder_offset = struct.unpack('<H', data[6:8])[0]  # uint16
+                encoder_position = struct.unpack('<H', data[2:4])[0]  # uint16 position
+                encoder_raw = struct.unpack('<H', data[4:6])[0]  # uint16 raw
+                encoder_offset = struct.unpack('<H', data[6:8])[0]  # uint16 offset
 
                 # MotorFeedback 메시지 생성
                 feedback_msg = MotorFeedback()
@@ -304,6 +305,15 @@ class CANParser(Node):
                 self.get_logger().debug(
                     f"[CAN RX 0x243] RAW:{hex_data} angle:{angle_deg} speed:{speed}dps current:{torque_current:.2f}A temp:{temperature}°C"
                 )
+
+            # 스테이지 모터 전류/온도 모니터링 (0x44~0x47: X,Y,Z,Yaw)
+            if motor_id in (0x44, 0x45, 0x46, 0x47):
+                axis_name = {0x44: 'X', 0x45: 'Y', 0x46: 'Z', 0x47: 'Yaw'}[motor_id]
+                if abs(torque_current) > 1.0 or abs(speed) > 10:
+                    self.get_logger().info(
+                        f"[MON 0x{motor_id+0x100:03X}({axis_name})] {torque_current:.2f}A {speed}dps {temperature}°C",
+                        throttle_duration_sec=0.5
+                    )
 
         except Exception as e:
             self.get_logger().error(f"모터 피드백 파싱 오류 (ID: 0x{can_id:03X}): {e}")

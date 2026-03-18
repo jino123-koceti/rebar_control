@@ -10,7 +10,7 @@ Zenoh 구독 (UI → Robot):
 
 Zenoh 발행 (Robot → UI):
 - "rebar/status" ← /mission/status (String JSON → msgpack)
-- "rebar/pose" ← /robot_pose (PoseStamped → msgpack)
+- "rebar/pose" ← /encoder_odom (PoseStamped → msgpack)
 """
 
 import rclpy
@@ -41,7 +41,7 @@ class ZenohClient(Node):
 
         self.declare_parameter('mission_command_topic', '/mission/command')
         self.declare_parameter('mission_status_topic', '/mission/status')
-        self.declare_parameter('robot_pose_topic', '/robot_pose')
+        self.declare_parameter('robot_pose_topic', '/encoder_odom')
         self.declare_parameter('control_mode_topic', '/control_mode')
 
         self.declare_parameter('status_publish_rate', 10.0)  # Hz

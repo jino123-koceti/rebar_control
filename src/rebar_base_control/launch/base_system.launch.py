@@ -131,6 +131,16 @@ def generate_launch_description():
             emulate_tty=True
         ),
 
+        # Encoder Odometry Node (주행 모터 엔코더 기반 odometry)
+        Node(
+            package='rebar_base_control',
+            executable='encoder_odom.py',
+            name='encoder_odom',
+            output='screen',
+            parameters=[can_config],
+            emulate_tty=True
+        ),
+
         # Pololu Node (트리거 모터)
         Node(
             package='pololu_ros2',

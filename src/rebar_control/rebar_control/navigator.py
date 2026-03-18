@@ -28,6 +28,10 @@ from rebar_base_interfaces.msg import Waypoint, WaypointArray, JointControl
 from statemachine import StateMachine, State
 import json
 import math
+import sys
+import os
+import logging
+from datetime import datetime
 
 
 class RebarMissionStateMachine(StateMachine):
@@ -88,6 +92,9 @@ class Navigator(Node):
     def __init__(self):
         super().__init__('navigator')
 
+        # 파일 로거 설정
+        self._setup_file_logger()
+
         # State Machine 초기화
         self.sm = RebarMissionStateMachine(self)
 
@@ -144,6 +151,7 @@ class Navigator(Node):
 
         # 전체 경로 발행 완료 플래그
         self.path_published = False
+        self.mission_repeat = False  # repeat 모드 (핑퐁)
 
         # 일시정지 시 주행을 멈추기 위한 cmd_vel zero 발행용
         self.cmd_vel_pub = self.create_publisher(
@@ -155,6 +163,13 @@ class Navigator(Node):
         self.feedback_pub = self.create_publisher(
             String,
             '/mission/feedback',
+            10
+        )
+
+        # Mission command publisher (rebar_controller에 repeat 등 설정 전달)
+        self.mission_command_pub = self.create_publisher(
+            String,
+            '/mission/command',
             10
         )
 
@@ -204,10 +219,49 @@ class Navigator(Node):
         # 현재 제어 모드
         self.control_mode = "idle"
 
+        # 작업영역 설정
+        self.area_setup_active = False
+        self.work_area = None  # {'start': {x,y,theta}, 'end': {x,y,theta}, 'corners': [...], 'width': float, 'height': float}
+        self.current_pose = {'x': 0.0, 'y': 0.0, 'theta': 0.0}  # mm, mm, rad
+
+        # 로봇 위치 구독 - 엔코더 odometry 기반 (영역 설정/경로 추종 스케일 통일)
+        self.encoder_odom_sub = self.create_subscription(
+            PoseStamped,
+            '/encoder_odom',
+            self.encoder_odom_callback,
+            10
+        )
+
+        # 작업영역 발행 (rebar_publisher → UI)
+        self.work_area_pub = self.create_publisher(
+            String,
+            '/work_area',
+            10
+        )
+
         # 주기적 업데이트 타이머 (5Hz)
         self.timer = self.create_timer(0.2, self.update_mission)
 
         self.get_logger().info("Navigator 노드 초기화 완료")
+        self.flog("=== Navigator 시작 ===")
+
+    def _setup_file_logger(self):
+        """파일 로거 설정 (/tmp/navigator_YYYYMMDD_HHMMSS.log)"""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._log_path = f'/tmp/navigator_{timestamp}.log'
+        self._file_logger = logging.getLogger('navigator_file')
+        self._file_logger.setLevel(logging.DEBUG)
+        self._file_logger.handlers.clear()
+        fh = logging.FileHandler(self._log_path, mode='a', encoding='utf-8')
+        fh.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d %(message)s', datefmt='%H:%M:%S'))
+        self._file_logger.addHandler(fh)
+        self._file_handler = fh
+        self.get_logger().info(f"📝 파일 로그: {self._log_path}")
+
+    def flog(self, msg):
+        """파일 로거에 기록 + flush"""
+        self._file_logger.info(msg)
+        self._file_handler.flush()
 
     def mission_command_callback(self, msg):
         """
@@ -229,6 +283,7 @@ class Navigator(Node):
         command = msg.data
 
         self.get_logger().info(f"📥 명령 수신: {command[:100]}")
+        self.flog(f"CMD: {command[:200]}")
 
         # JSON 형식 명령 처리 (외부 PC에서 전송)
         if command.startswith("{"):
@@ -247,6 +302,11 @@ class Navigator(Node):
                     json_command = data["command"]
 
                     if json_command == "START_MISSION":
+                        # repeat 모드 파싱 (ON/OFF)
+                        self.mission_repeat = data.get("repeat", "OFF").upper() == "ON"
+                        self.get_logger().info(f"START_MISSION: repeat={'ON' if self.mission_repeat else 'OFF'}")
+                        self.flog(f"START_MISSION: repeat={'ON' if self.mission_repeat else 'OFF'}")
+
                         if self.sm.current_state == self.sm.planning:
                             self.sm.start()
                         elif self.sm.current_state == self.sm.idle:
@@ -289,8 +349,21 @@ class Navigator(Node):
                     elif json_command == "GO_HOME":
                         self.start_homing()
 
+                    elif json_command == "AREA_SETUP_START":
+                        self.handle_area_setup_start(data)
+
+                    elif json_command == "AREA_SETUP_COMPLETE":
+                        self.handle_area_setup_complete(data)
+
+                    elif json_command == "PATH_GEN":
+                        self.handle_path_gen(data)
+
                     elif json_command == "UPPER_BINDING_MOVE":
                         self.handle_upper_biding_move(data)
+
+                    elif json_command.startswith("CHN_POS="):
+                        # tying_orchestrator가 /mission/command에서 직접 수신
+                        self.get_logger().info(f"CHN_POS 명령: {json_command} (tying_orchestrator 처리)")
 
                     else:
                         self.get_logger().warn(f"알 수 없는 JSON 명령: {json_command}")
@@ -493,11 +566,11 @@ class Navigator(Node):
                 if 'max_speed' in wp:
                     max_speed = wp['max_speed']
                 else:
-                    # 기본값: differential=0.3m/s, lateral=200dps
+                    # 기본값: differential=0.15m/s, lateral=200dps
                     if motion_type == Waypoint.MOTION_LATERAL:
                         max_speed = 200.0  # dps
                     else:
-                        max_speed = 0.3  # m/s
+                        max_speed = 0.15  # m/s
 
                 waypoint_dict = {
                     'x': x_m,
@@ -571,17 +644,39 @@ class Navigator(Node):
         """
         전체 웨이포인트 배열을 한번에 발행 (tire_roller style)
 
+        미션 시작 시 엔코더가 (0,0)으로 리셋되므로,
+        현재 위치(미션 시작점)를 빼서 상대좌표로 변환하여 발행.
+        WP[0]≈(0,0), 마지막 WP이 영역 시작점(도착점)이 됨.
+
         rebar_controller가 내부 인덱스로 진행 관리
         """
         msg = WaypointArray()
 
-        for wp in self.waypoints:
-            msg.x.append(float(wp['x']))
-            msg.y.append(float(wp['y']))
+        # 현재 위치 기준 상대좌표 변환 (엔코더 리셋 후 (0,0) 기준과 일치시킴)
+        origin_x = self.current_pose['x'] / 1000.0  # mm → m
+        origin_y = self.current_pose['y'] / 1000.0
+
+        self.flog(f"경로 발행: {len(self.waypoints)}개 WP (origin=({origin_x:.3f},{origin_y:.3f})m)")
+        for i, wp in enumerate(self.waypoints):
+            rel_x = float(wp['x']) - origin_x  # wp['x']는 이미 m 단위
+            rel_y = float(wp['y']) - origin_y
+            msg.x.append(rel_x)
+            msg.y.append(rel_y)
             msg.motion_type.append(int(wp['motion_type']))
             msg.max_speed.append(float(wp['max_speed']))
+            mt = "LAT" if wp['motion_type'] == Waypoint.MOTION_LATERAL else "DIFF"
+            self.flog(f"  WP[{i}]: abs=({wp['x']:.3f},{wp['y']:.3f})m → rel=({rel_x:.3f},{rel_y:.3f})m @ {mt}")
 
         self.waypoint_array_pub.publish(msg)
+
+        # repeat 모드 전달 (rebar_controller에 JSON으로)
+        repeat_msg = String()
+        repeat_msg.data = json.dumps({
+            'command': 'SET_REPEAT',
+            'repeat': self.mission_repeat
+        })
+        self.mission_command_pub.publish(repeat_msg)
+        self.flog(f"repeat 모드 전달: {'ON' if self.mission_repeat else 'OFF'}")
 
     def publish_target(self, waypoint_dict):
         """
@@ -853,6 +948,311 @@ class Navigator(Node):
         }
         if detail:
             feedback_data['detail'] = detail
+        msg = String()
+        msg.data = json.dumps(feedback_data)
+        self.feedback_pub.publish(msg)
+
+    def encoder_odom_callback(self, msg):
+        """로봇 위치 업데이트 (엔코더 odometry - 영역설정/경로추종 스케일 통일)
+
+        전후면 반전 보정: encoder_odom은 물리적 방향 그대로이므로
+        제어용으로 부호 반전하여 cmd_vel 방향과 일치시킴
+        """
+        self.current_pose['x'] = -msg.pose.position.x * 1000.0  # m → mm, 부호 반전
+        self.current_pose['y'] = -msg.pose.position.y * 1000.0  # m → mm, 부호 반전
+        siny = 2.0 * (msg.pose.orientation.w * msg.pose.orientation.z +
+                       msg.pose.orientation.x * msg.pose.orientation.y)
+        cosy = 1.0 - 2.0 * (msg.pose.orientation.y ** 2 + msg.pose.orientation.z ** 2)
+        raw_yaw = math.atan2(siny, cosy)
+        # 전후면 반전: yaw도 π 회전
+        inv_yaw = raw_yaw + math.pi
+        self.current_pose['theta'] = math.atan2(math.sin(inv_yaw), math.cos(inv_yaw))
+
+        # 작업영역 설정 중이면 로컬 좌표 기준 최대·최소값 추적
+        if self.area_setup_active and hasattr(self, '_area_bounds'):
+            # odom → 시작점 헤딩 기준 로컬 좌표 변환
+            dx = self.current_pose['x'] - self._area_origin['x']
+            dy = self.current_pose['y'] - self._area_origin['y']
+            local_x = dx * self._area_cos - dy * self._area_sin
+            local_y = dx * self._area_sin + dy * self._area_cos
+            self._area_bounds['min_x'] = min(self._area_bounds['min_x'], local_x)
+            self._area_bounds['max_x'] = max(self._area_bounds['max_x'], local_x)
+            self._area_bounds['min_y'] = min(self._area_bounds['min_y'], local_y)
+            self._area_bounds['max_y'] = max(self._area_bounds['max_y'], local_y)
+
+            # 주행 중 pose 로그 (1초 간격)
+            now = self.get_clock().now()
+            if not hasattr(self, '_area_last_log_time') or (now - self._area_last_log_time).nanoseconds > 1e9:
+                self._area_last_log_time = now
+                heading_deg = math.degrees(self.current_pose['theta'])
+                self.get_logger().info(
+                    f'  [AREA] enc=({self.current_pose["x"]:.0f},{self.current_pose["y"]:.0f}) '
+                    f'heading={heading_deg:.1f}° local=({local_x:.0f},{local_y:.0f})'
+                )
+
+    def handle_area_setup_start(self, data=None):
+        """
+        작업영역 설정 시작
+
+        현재 로봇 위치를 시작 꼭지점(P1)으로 기록하고,
+        사용자가 리모컨으로 대각 꼭지점까지 주행하도록 대기.
+
+        UI 명령 형식:
+        {"command": "AREA_SETUP_START"}
+        {"command": "AREA_SETUP_START", "area_type": "line"}
+        {"command": "AREA_SETUP_START", "area_type": "rectangle"}
+        """
+        if data is None:
+            data = {}
+        start = {
+            'x': self.current_pose['x'],
+            'y': self.current_pose['y'],
+            'theta': self.current_pose['theta'],
+        }
+
+        self.area_setup_active = True
+        self.work_area = None  # 이전 작업영역 초기화
+        self._area_type_hint = data.get('area_type', None)  # UI 지정 타입
+
+        # 시작 헤딩 기준 로컬 좌표계 (헤딩 방향 = 로컬 X, 수직 = 로컬 Y)
+        self._area_origin = {'x': start['x'], 'y': start['y'], 'theta': start['theta']}
+        self._area_cos = math.cos(-start['theta'])
+        self._area_sin = math.sin(-start['theta'])
+
+        # 로컬 좌표 기준 경계 추적
+        self._area_bounds = {
+            'min_x': 0.0, 'max_x': 0.0,
+            'min_y': 0.0, 'max_y': 0.0,
+        }
+
+        self.get_logger().info("=" * 60)
+        self.get_logger().info(f"작업영역 설정 시작 - 시작점: ({start['x']:.1f}, {start['y']:.1f}) mm")
+        self.get_logger().info("작업영역 경계를 따라 주행 후 AREA_SETUP_COMPLETE 전송")
+        self.get_logger().info("=" * 60)
+
+        # 시작점 임시 저장
+        self._area_start = start
+
+        # UI에 상태 피드백
+        self._publish_area_feedback('area_setup_active', {
+            'start': start,
+        })
+
+    def handle_area_setup_complete(self, data=None):
+        """
+        작업영역 설정 완료
+
+        현재 위치를 종료 꼭지점(P2)으로 기록하고,
+        시작점(P1)과 종료점(P2)로 직사각형 작업영역 생성.
+
+        P1(start) ---- P4
+        |               |
+        |               |
+        P3 ---- P2(end)
+
+        좌표계: 로봇 오도메트리 기준 (mm)
+        """
+        if not self.area_setup_active or not hasattr(self, '_area_start'):
+            self.get_logger().warn("작업영역 설정이 시작되지 않았습니다. AREA_SETUP_START를 먼저 전송하세요.")
+            self._publish_area_feedback('area_setup_failed', {
+                'reason': 'not_started',
+            })
+            return
+
+        end = {
+            'x': self.current_pose['x'],
+            'y': self.current_pose['y'],
+            'theta': self.current_pose['theta'],
+        }
+
+        start = self._area_start
+        self.area_setup_active = False
+
+        # 시작 헤딩 기준 로컬 좌표에서 추적된 경계값
+        bounds = self._area_bounds
+        min_x = bounds['min_x']
+        max_x = bounds['max_x']
+        min_y = bounds['min_y']
+        max_y = bounds['max_y']
+
+        width = max_x - min_x    # mm
+        height = max_y - min_y   # mm
+
+        # 영역 타입: UI 지정(area_type) 우선, 미지정 시 자동 판별
+        # COMPLETE 또는 START 어디서든 area_type 수신 가능
+        if data is None:
+            data = {}
+        complete_hint = data.get('area_type', None)
+        if complete_hint in ('line', 'rectangle'):
+            area_type = complete_hint
+        elif hasattr(self, '_area_type_hint') and self._area_type_hint in ('line', 'rectangle'):
+            area_type = self._area_type_hint
+        else:
+            area_type = 'line' if height < 100.0 else 'rectangle'
+
+        if area_type == 'line':
+            center_y = (min_y + max_y) / 2.0
+            corners = [
+                {'x': min_x, 'y': center_y},  # P1 (시작)
+                {'x': max_x, 'y': center_y},  # P2 (끝)
+            ]
+        else:
+            corners = [
+                {'x': min_x, 'y': max_y},  # P1 (좌상)
+                {'x': max_x, 'y': max_y},  # P2 (우상)
+                {'x': max_x, 'y': min_y},  # P3 (우하)
+                {'x': min_x, 'y': min_y},  # P4 (좌하)
+            ]
+
+        self.work_area = {
+            'type': area_type,
+            'start': start,
+            'end': end,
+            'corners': corners,
+            'width': width,
+            'height': height,
+            'area': width * height,  # mm²
+            'min_x': min_x,
+            'max_x': max_x,
+            'min_y': min_y,
+            'max_y': max_y,
+            'origin': self._area_origin,  # odom 원점 + 헤딩 (로컬→odom 변환용)
+        }
+
+        heading_deg = math.degrees(self._area_origin['theta'])
+        self.get_logger().info("=" * 60)
+        if area_type == 'line':
+            self.get_logger().info(f"작업영역 설정 완료! [직선]")
+            self.get_logger().info(f"  시작점(odom): ({start['x']:.1f}, {start['y']:.1f}) mm, 헤딩: {heading_deg:.1f}°")
+            self.get_logger().info(f"  종료점(odom): ({end['x']:.1f}, {end['y']:.1f}) mm")
+            self.get_logger().info(f"  길이(W): {width:.1f} mm, 횡편차(H): {height:.1f} mm (로컬좌표)")
+        else:
+            self.get_logger().info(f"작업영역 설정 완료! [직사각형]")
+            self.get_logger().info(f"  시작점(odom): ({start['x']:.1f}, {start['y']:.1f}) mm, 헤딩: {heading_deg:.1f}°")
+            self.get_logger().info(f"  종료점(odom): ({end['x']:.1f}, {end['y']:.1f}) mm")
+            self.get_logger().info(f"  로컬 Bounds: X[{min_x:.1f} ~ {max_x:.1f}], Y[{min_y:.1f} ~ {max_y:.1f}]")
+            self.get_logger().info(f"  가로(W): {width:.1f} mm, 세로(H): {height:.1f} mm")
+            self.get_logger().info(f"  면적: {width * height / 1e6:.2f} m²")
+        self.get_logger().info("=" * 60)
+
+        # 작업영역 토픽 발행 (rebar_publisher가 UI에 전달)
+        area_msg = String()
+        area_msg.data = json.dumps(self.work_area)
+        self.work_area_pub.publish(area_msg)
+
+        # UI에 완료 피드백
+        self._publish_area_feedback('area_setup_complete', {
+            'work_area': self.work_area,
+        })
+
+    def handle_path_gen(self, data):
+        """
+        RL 모델 기반 경로 생성 (PATH_GEN 커맨드)
+
+        UI 명령 형식:
+        {"command": "PATH_GEN"}
+        {"command": "PATH_GEN", "obstacles": [{"x": 1500, "y": 800}]}
+
+        work_area가 설정된 상태에서만 동작.
+        경로 생성 후 자동으로 planning 상태로 전환.
+        """
+        if self.work_area is None:
+            self.get_logger().warn("작업영역이 설정되지 않았습니다. AREA_SETUP을 먼저 수행하세요.")
+            self._publish_area_feedback('path_gen_failed', {
+                'reason': 'no_work_area',
+            })
+            return
+
+        obstacles_mm = data.get('obstacles', None)
+
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("경로 생성 시작 (PATH_GEN)")
+        self.get_logger().info(f"  작업영역: {self.work_area['width']:.0f} x {self.work_area['height']:.0f} mm")
+        if obstacles_mm:
+            self.get_logger().info(f"  장애물: {len(obstacles_mm)}개")
+
+        # UI에 경로 생성 시작 피드백 (추론 중 표시용)
+        self._publish_area_feedback('path_gen_started', {
+            'work_area': self.work_area,
+            'obstacle_count': len(obstacles_mm) if obstacles_mm else 0,
+        })
+
+        try:
+            # RLPathGenerator import (lazy load)
+            rl_path = os.path.join(
+                os.path.expanduser('~'), 'ros2_ws',
+                'path_generation', 'reinforcement_learning_sim'
+            )
+            if rl_path not in sys.path:
+                sys.path.insert(0, rl_path)
+
+            from path_generator import RLPathGenerator
+
+            model_path = os.path.join(rl_path, 'models', 'cnn_ppo_agent.pth')
+            generator = RLPathGenerator(model_path)
+
+            waypoints = generator.generate(self.work_area, obstacles_mm)
+
+            if not waypoints:
+                self.get_logger().error("경로 생성 실패: 웨이포인트 없음")
+                self._publish_area_feedback('path_gen_failed', {
+                    'reason': 'empty_path',
+                })
+                return
+
+            # 로컬 좌표 → odom 좌표 변환
+            origin = self.work_area.get('origin')
+            if origin:
+                cos_t = math.cos(origin['theta'])
+                sin_t = math.sin(origin['theta'])
+                for wp in waypoints:
+                    lx, ly = wp['x'], wp['y']
+                    wp['x'] = origin['x'] + lx * cos_t - ly * sin_t
+                    wp['y'] = origin['y'] + lx * sin_t + ly * cos_t
+
+            # 경로 시작점을 현재 위치(설정 완료 지점)에 가까운 쪽으로 정렬
+            if len(waypoints) >= 2:
+                cx, cy = self.current_pose['x'], self.current_pose['y']
+                d_first = (waypoints[0]['x'] - cx)**2 + (waypoints[0]['y'] - cy)**2
+                d_last = (waypoints[-1]['x'] - cx)**2 + (waypoints[-1]['y'] - cy)**2
+                if d_last < d_first:
+                    waypoints.reverse()
+                    self.get_logger().info("  경로 역순 정렬 (현재 위치 → 시작점 방향)")
+
+            # 웨이포인트를 기존 load_waypoints_from_json 형식으로 변환
+            wp_json = json.dumps({'waypoints': waypoints})
+            self.load_waypoints_from_json(wp_json)
+
+            self.get_logger().info(f"  생성된 웨이포인트: {len(waypoints)}개")
+            self.get_logger().info("  START_MISSION 명령으로 주행을 시작하세요")
+            self.get_logger().info("=" * 60)
+
+            # UI에 피드백 (물리적 좌표로 변환하여 전송)
+            # navigator 내부는 전후면 반전 좌표 → UI용으로 부호 복원
+            ui_waypoints = [
+                {**wp, 'x': -wp['x'], 'y': -wp['y']} for wp in waypoints
+            ]
+            self._publish_area_feedback('path_gen_complete', {
+                'waypoint_count': len(ui_waypoints),
+                'waypoints': ui_waypoints,
+                'work_area': self.work_area,
+            })
+
+        except Exception as e:
+            self.get_logger().error(f"경로 생성 오류: {e}")
+            self._publish_area_feedback('path_gen_failed', {
+                'reason': str(e),
+            })
+
+    def _publish_area_feedback(self, state, data=None):
+        """작업영역 설정 피드백 발행"""
+        feedback_data = {
+            'current_waypoint': 0,
+            'total_waypoints': 0,
+            'state': state,
+        }
+        if data:
+            feedback_data.update(data)
         msg = String()
         msg.data = json.dumps(feedback_data)
         self.feedback_pub.publish(msg)

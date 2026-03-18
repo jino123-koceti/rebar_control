@@ -54,10 +54,13 @@ def generate_launch_description():
                 'front_odom_topic': '/zed_back/zed_node/odom',
                 'back_odom_topic': '/zed_front/zed_node/odom',
                 'output_topic': '/robot_pose',
-                'direction_source': 'cmd_vel',
+                'direction_source': 'topic',
+                'direction_topic': '/travel_direction',
                 'velocity_deadband': 0.02,
-                'prefer_front_when_stationary': True,
+                'prefer_front_when_stationary': False,
                 'output_frame': 'odom',
+                'front_camera_offset': -0.49,   # front cam offset from robot center
+                'back_camera_offset': 0.49,     # back cam offset from robot center
             }],
             condition=IfCondition(LaunchConfiguration('use_dual_zed')),
             emulate_tty=True

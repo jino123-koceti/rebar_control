@@ -3,13 +3,14 @@
 Rebar Controller Node
 경로 추종 제어
 
-navigator로부터 목표 위치를 받아 ZED X 위치 기반으로
+navigator로부터 목표 위치를 받아 엔코더 odometry 기반으로
 /cmd_vel을 발행하여 목표 지점까지 주행합니다.
 
 제어 알고리즘: Simple PID
 
 구독:
-- /robot_pose (PoseStamped) - ZED X에서
+- /encoder_odom (PoseStamped) - 엔코더 odometry (주 제어용)
+- /robot_pose (PoseStamped) - ZED X VSLAM (보조/모니터링)
 - /mission/target_pose (PoseStamped) - navigator에서
 
 발행:
@@ -21,7 +22,12 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist, PoseStamped
 from std_msgs.msg import String
 from rebar_base_interfaces.msg import Waypoint, WaypointArray, JointControl
+import json
 import math
+import time
+import logging
+import os
+from datetime import datetime
 
 
 class RebarController(Node):
@@ -30,13 +36,17 @@ class RebarController(Node):
     def __init__(self):
         super().__init__('rebar_controller')
 
+        # 파일 로거 설정
+        self._setup_file_logger()
+
         # 파라미터 선언
         self.declare_parameter('control_rate', 20.0)  # Hz
-        self.declare_parameter('max_linear_vel', 0.5)  # m/s
+        self.declare_parameter('max_linear_vel', 0.25)  # m/s (0.5 → 0.25 감속)
         self.declare_parameter('max_angular_vel', 1.0)  # rad/s
 
-        self.declare_parameter('distance_tolerance', 0.025)  # m (25mm)
+        self.declare_parameter('distance_tolerance', 0.05)  # m (50mm) - VSLAM 드리프트 환경 고려
         self.declare_parameter('heading_tolerance', 0.1)  # rad (~6도)
+        self.declare_parameter('max_tying_points', 100)  # repeat 모드 종료 기준 (총 결속 포인트)
 
         # PID 파라미터
         self.declare_parameter('kp_linear', 1.0)  # 0.5 → 1.0 (응답성 향상)
@@ -75,6 +85,38 @@ class RebarController(Node):
         self.first_pose_received = False  # 최초 pose 수신 플래그
         self.reference_heading = None  # 기준 heading (첫 목표 수신 시 현재 heading으로 설정)
         self.waypoint_reached_sent = False  # 웨이포인트 도달 알림 발행 플래그 (중복 방지)
+        self.min_approach_distance = float('inf')  # 최근접 거리 추적
+
+        # 웨이포인트 도달 후 결속 프로세스
+        self.tying_in_progress = False  # 결속 진행 중 플래그
+        self.tying_complete_received = False  # TYING_COMPLETE 수신 플래그
+        self.waypoint_reached_time = 0.0  # 도달 확정 시각
+        self.waypoint_dwelling = False  # 대기 중 플래그
+
+        # Repeat 모드 (핑퐁)
+        self.repeat_mode = False  # repeat ON/OFF
+        self.max_tying_points = self.get_parameter('max_tying_points').value
+        self.total_tying_points = 0  # 총 결속 포인트 누적
+        self.total_wp_count = 0  # 전체 WP 처리 카운트 (교번 방향용)
+        self.original_waypoints_x = []  # 원본 WP 저장 (핑퐁용)
+        self.original_waypoints_y = []
+        self.original_waypoints_motion_type = []
+        self.original_waypoints_max_speed = []
+        self.pingpong_lap = 0  # 핑퐁 회차 (0=1회차 정방향, 1=역방향, 2=정방향...)
+
+        # VSLAM 트래킹 유실 감지
+        self.vslam_last_pose = None  # 마지막 수신 위치
+        self.vslam_last_pose_time = 0.0  # 마지막 위치 변화 시각
+        self.vslam_last_update_time = 0.0  # 마지막 pose 수신 시각
+        self.vslam_frozen_threshold = 3.0  # pose 수신 중단 판정 시간 (초)
+        self.vslam_move_check_interval = 5.0  # 이동 중 위치 변화 체크 주기 (초)
+        self.vslam_move_check_pose = None  # 이동 체크 시작 위치
+        self.vslam_move_check_time = 0.0  # 이동 체크 시작 시각
+        self.vslam_min_move_distance = 0.01  # 이동 체크 주기 동안 최소 이동량 (10mm)
+        self.last_cmd_linear = 0.0  # 마지막 발행한 cmd_vel linear
+        self.vslam_jump_threshold = 0.5  # 위치 점프 판정 거리 (m) - 1사이클에 이 이상 이동 불가
+        self.vslam_lost = False  # 트래킹 유실 상태
+        self.vslam_lost_time = 0.0  # 유실 감지 시각
 
         # Lateral motion 파라미터
         self.lateral_tolerance = 0.005  # 5mm
@@ -110,7 +152,24 @@ class RebarController(Node):
         self.integral_distance = 0.0
         self.integral_heading = 0.0
 
+        # 엔코더 odometry 상태
+        self.encoder_pose = None  # 엔코더 기반 위치 (주 제어용)
+
+        # 미션 원점 (encoder 리셋 대신 상대좌표 계산용)
+        self.mission_origin_x = 0.0
+        self.mission_origin_y = 0.0
+        self.mission_origin_yaw = 0.0
+
         # ROS2 구독자
+        # 엔코더 odometry (주 제어용)
+        self.encoder_odom_sub = self.create_subscription(
+            PoseStamped,
+            '/encoder_odom',
+            self.encoder_odom_callback,
+            10
+        )
+
+        # VSLAM (보조/모니터링용, 기존 호환)
         self.pose_sub = self.create_subscription(
             PoseStamped,
             '/robot_pose',
@@ -165,6 +224,14 @@ class RebarController(Node):
             10
         )
 
+        # 결속 완료 신호 구독 (tying_orchestrator로부터)
+        self.tying_complete_sub = self.create_subscription(
+            String,
+            '/rebar_motion_cmd',
+            self.tying_complete_callback,
+            10
+        )
+
         # 미션 피드백 구독 (mission_done 감지용)
         self.feedback_sub = self.create_subscription(
             String,
@@ -194,6 +261,20 @@ class RebarController(Node):
             10
         )
 
+        # 카메라 방향 제어 (pose_mux에 전진/후진 알림)
+        self.travel_direction_pub = self.create_publisher(
+            String,
+            '/travel_direction',
+            10
+        )
+
+        # 결속 명령 발행 (tying_orchestrator에 TYING_START 전달)
+        self.mission_command_pub = self.create_publisher(
+            String,
+            '/mission/command',
+            10
+        )
+
         # 제어 루프 타이머
         self.timer = self.create_timer(1.0 / self.control_rate, self.control_loop)
 
@@ -201,6 +282,28 @@ class RebarController(Node):
         self.get_logger().info(f"  - 제어 주기: {self.control_rate} Hz")
         self.get_logger().info(f"  - 최대 선속도: {self.max_linear} m/s")
         self.get_logger().info(f"  - 최대 각속도: {self.max_angular} rad/s")
+        self.flog(f"=== Rebar Controller 시작 ===")
+        self.flog(f"제어 주기: {self.control_rate}Hz, max_lin: {self.max_linear}, max_ang: {self.max_angular}")
+
+    def _setup_file_logger(self):
+        """파일 로거 설정 (/tmp/rebar_controller_YYYYMMDD_HHMMSS.log)"""
+        log_dir = '/tmp'
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._log_path = os.path.join(log_dir, f'rebar_controller_{timestamp}.log')
+        self._file_logger = logging.getLogger('rebar_controller_file')
+        self._file_logger.setLevel(logging.DEBUG)
+        # 기존 핸들러 제거 (중복 방지)
+        self._file_logger.handlers.clear()
+        fh = logging.FileHandler(self._log_path, mode='a', encoding='utf-8')
+        fh.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d %(message)s', datefmt='%H:%M:%S'))
+        self._file_logger.addHandler(fh)
+        self._file_handler = fh
+        self.get_logger().info(f"📝 파일 로그: {self._log_path}")
+
+    def flog(self, msg):
+        """파일 로거에 기록 + flush"""
+        self._file_logger.info(msg)
+        self._file_handler.flush()
 
     def waypoint_array_callback(self, msg: WaypointArray):
         """
@@ -209,7 +312,21 @@ class RebarController(Node):
         Navigator가 전체 웨이포인트 배열을 한번에 전달
         이후 내부 인덱스로 진행 관리 (외부 간섭 없음)
         """
-        # 경로 저장
+        # VSLAM 유실 상태 리셋
+        self.vslam_lost = False
+        self.vslam_last_pose_time = time.monotonic()
+
+        # 미션 원점 저장 (encoder 리셋 대신 현재 위치를 origin으로)
+        if self.encoder_pose is not None:
+            self.mission_origin_x = self.encoder_pose.pose.position.x
+            self.mission_origin_y = self.encoder_pose.pose.position.y
+            self.mission_origin_yaw = self._quaternion_to_yaw(self.encoder_pose.pose.orientation)
+        else:
+            self.mission_origin_x = 0.0
+            self.mission_origin_y = 0.0
+            self.mission_origin_yaw = 0.0
+
+        # 경로 저장 (상대좌표 - navigator가 current_pose 기준으로 변환 완료)
         self.waypoint_array_x = list(msg.x)
         self.waypoint_array_y = list(msg.y)
         self.waypoint_array_motion_type = list(msg.motion_type)
@@ -217,50 +334,52 @@ class RebarController(Node):
         self.current_waypoint_index = 0
         self.path_received = True
 
-        # 경로 방향 결정 (상대좌표 기준: 마지막 WP의 X가 음수면 후진)
+        # 원본 WP 저장 (repeat 핑퐁용)
+        self.original_waypoints_x = list(msg.x)
+        self.original_waypoints_y = list(msg.y)
+        self.original_waypoints_motion_type = list(msg.motion_type)
+        self.original_waypoints_max_speed = list(msg.max_speed)
+        self.pingpong_lap = 0
+        self.total_tying_points = 0
+
+        # 경로 방향 결정 (WP[0]≈현재위치이므로 WP[1]의 X 부호로 판정)
         if len(self.waypoint_array_x) > 1:
-            last_rel_x = self.waypoint_array_x[-1] - self.waypoint_array_x[0]
-            self.path_is_backward = (last_rel_x < 0)
+            self.path_is_backward = (self.waypoint_array_x[1] < 0)
+        elif len(self.waypoint_array_x) == 1:
+            self.path_is_backward = (self.waypoint_array_x[0] < 0)
         else:
             self.path_is_backward = False
+
+        # 카메라 방향 발행 (pose_mux에 전달 → 미션 중 카메라 고정)
+        direction_msg = String()
+        direction_msg.data = 'backward' if self.path_is_backward else 'forward'
+        self.travel_direction_pub.publish(direction_msg)
+        self.get_logger().info(f"📷 카메라 방향 설정: {direction_msg.data}")
 
         # reference_heading = 로봇의 현재 facing 방향 (직진 유지 기준)
         self.reference_heading = None
 
-        # 상대좌표 → 절대좌표 변환 (로봇 현재 위치+heading 기준으로 회전+이동)
-        if self.current_pose is not None and len(self.waypoint_array_x) > 0:
-            curr_x = self.current_pose.pose.position.x
-            curr_y = self.current_pose.pose.position.y
-            curr_yaw = self._quaternion_to_yaw(self.current_pose.pose.orientation)
-
-            # 첫 웨이포인트를 원점으로, 현재 heading 방향으로 회전하여 odom 프레임으로 변환
-            origin_x = self.waypoint_array_x[0]
-            origin_y = self.waypoint_array_y[0]
-            cos_yaw = math.cos(curr_yaw)
-            sin_yaw = math.sin(curr_yaw)
-
+        # 엔코더 odom 기반: 상대좌표 직접 사용 (heading 회전 변환 불필요)
+        if len(self.waypoint_array_x) > 0:
             direction_str = "후진" if self.path_is_backward else "전진"
             self.get_logger().info("=" * 70)
-            self.get_logger().info(f"📥 전체 경로 수신: {len(self.waypoint_array_x)}개 웨이포인트 [{direction_str}]")
-            self.get_logger().info(f"  현재 위치: ({curr_x:.3f}, {curr_y:.3f}) m, yaw={math.degrees(curr_yaw):.1f}")
-            self.get_logger().info(f"  첫 WP (상대): ({origin_x:.3f}, {origin_y:.3f}) m")
-
+            self.get_logger().info(f"📥 전체 경로 수신: {len(self.waypoint_array_x)}개 웨이포인트 [{direction_str}] [엔코더 odom]")
+            self.get_logger().info(f"  미션 origin: ({self.mission_origin_x:.3f}, {self.mission_origin_y:.3f}) m")
+            self.get_logger().info(f"  첫 WP: ({self.waypoint_array_x[0]:.3f}, {self.waypoint_array_y[0]:.3f}) m")
+            self.flog(f"========== 경로 수신: {len(self.waypoint_array_x)}개 WP [{direction_str}] ==========")
+            self.flog(f"미션 origin: ({self.mission_origin_x:.3f}, {self.mission_origin_y:.3f}) m")
             for i in range(len(self.waypoint_array_x)):
-                # 첫 웨이포인트 기준 상대좌표
-                dx = self.waypoint_array_x[i] - origin_x
-                dy = self.waypoint_array_y[i] - origin_y
-                # 현재 heading으로 회전 후 현재 위치에 더함
-                self.waypoint_array_x[i] = curr_x + dx * cos_yaw - dy * sin_yaw
-                self.waypoint_array_y[i] = curr_y + dx * sin_yaw + dy * cos_yaw
+                mt = "LAT" if self.waypoint_array_motion_type[i] == Waypoint.MOTION_LATERAL else "DIFF"
+                self.flog(f"  WP[{i}]: ({self.waypoint_array_x[i]:.3f}, {self.waypoint_array_y[i]:.3f}) @ {mt} spd={self.waypoint_array_max_speed[i]:.2f}")
 
-            # 오프셋 불필요 (이미 절대좌표로 변환됨)
+            # 오프셋 불필요 (상대좌표 직접 사용)
             self.mission_offset_x = 0.0
             self.mission_offset_y = 0.0
 
             if len(self.waypoint_array_x) > 1:
                 last_idx = len(self.waypoint_array_x) - 1
                 self.get_logger().info(
-                    f"  최종 WP (절대): ({self.waypoint_array_x[last_idx]:.3f}, "
+                    f"  최종 WP: ({self.waypoint_array_x[last_idx]:.3f}, "
                     f"{self.waypoint_array_y[last_idx]:.3f}) m"
                 )
             self.get_logger().info("=" * 70)
@@ -273,8 +392,21 @@ class RebarController(Node):
     def _set_current_waypoint_as_target(self):
         """현재 인덱스의 웨이포인트를 목표로 설정"""
         if self.current_waypoint_index >= len(self.waypoint_array_x):
+            # repeat 모드: 핑퐁 반복
+            if self.repeat_mode and self.total_tying_points < self.max_tying_points:
+                self._start_pingpong_next_lap()
+                return
+
             # 모든 웨이포인트 완료
-            self.get_logger().info("✅ 모든 웨이포인트 완료!")
+            if self.repeat_mode:
+                self.get_logger().info(
+                    f"미션 완료! 총 {self.total_tying_points}pt 결속 "
+                    f"(목표 {self.max_tying_points}pt, {self.pingpong_lap + 1}회차)")
+                self.flog(f"========== 미션 완료: {self.total_tying_points}pt / "
+                          f"{self.max_tying_points}pt ({self.pingpong_lap + 1}회차) ==========")
+            else:
+                self.get_logger().info("모든 웨이포인트 완료!")
+                self.flog("========== 미션 완료: 모든 웨이포인트 도달 ==========")
             self._publish_mission_complete()
             return
 
@@ -324,10 +456,65 @@ class RebarController(Node):
             f"({x:.3f}, {y:.3f}) @ {motion_str}"
         )
 
+    def _start_pingpong_next_lap(self):
+        """핑퐁 모드: 경로를 역순으로 뒤집어 다음 회차 시작
+
+        예: 정방향 WP[0]→WP[1]→WP[2] 완료 후
+            역방향 WP[1]→WP[0] (양 끝 중복 제거)
+            다시 정방향 WP[1]→WP[2]
+            ...
+        """
+        self.pingpong_lap += 1
+        n = len(self.original_waypoints_x)
+
+        if self.pingpong_lap % 2 == 1:
+            # 역방향: 끝에서 두번째 → 처음 (마지막=현재위치 제외)
+            indices = list(range(n - 2, -1, -1))
+        else:
+            # 정방향: 두번째 → 끝 (처음=현재위치 제외)
+            indices = list(range(1, n))
+
+        self.waypoint_array_x = [self.original_waypoints_x[i] for i in indices]
+        self.waypoint_array_y = [self.original_waypoints_y[i] for i in indices]
+        self.waypoint_array_motion_type = [self.original_waypoints_motion_type[i] for i in indices]
+        self.waypoint_array_max_speed = [self.original_waypoints_max_speed[i] for i in indices]
+        self.current_waypoint_index = 0
+
+        # 경로 방향 업데이트
+        if len(self.waypoint_array_x) > 0:
+            # 현재 위치에서 첫 WP까지의 방향으로 판정
+            curr_x = self.encoder_pose.pose.position.x - self.mission_origin_x if self.encoder_pose else 0.0
+            dx = self.waypoint_array_x[0] - curr_x
+            self.path_is_backward = (dx < 0)
+
+        direction_str = "후진" if self.path_is_backward else "전진"
+        self.get_logger().info(
+            f"핑퐁 {self.pingpong_lap + 1}회차: {len(self.waypoint_array_x)}개 WP [{direction_str}] "
+            f"(누적 {self.total_tying_points}/{self.max_tying_points}pt)")
+        self.flog(
+            f"========== 핑퐁 {self.pingpong_lap + 1}회차: {len(self.waypoint_array_x)}WP "
+            f"[{direction_str}] 누적={self.total_tying_points}pt ==========")
+        for i in range(len(self.waypoint_array_x)):
+            self.flog(f"  WP[{i}]: ({self.waypoint_array_x[i]:.3f}, {self.waypoint_array_y[i]:.3f})")
+
+        # 카메라 방향 업데이트
+        direction_msg = String()
+        direction_msg.data = 'backward' if self.path_is_backward else 'forward'
+        self.travel_direction_pub.publish(direction_msg)
+
+        # 첫 WP 설정
+        self._set_current_waypoint_as_target()
+
     def _advance_to_next_waypoint(self):
         """다음 웨이포인트로 이동"""
         # 현재 웨이포인트 완료 알림
         self._publish_waypoint_index_reached(self.current_waypoint_index)
+
+        # 최근접 거리 추적 리셋
+        self.min_approach_distance = float('inf')
+
+        # 플래그 리셋 (다음 WP 추종 시작을 위해)
+        self.waypoint_reached_sent = False
 
         # 인덱스 증가
         self.current_waypoint_index += 1
@@ -364,16 +551,49 @@ class RebarController(Node):
         self.reference_heading = None
         self.target_pose = None
         self.lateral_total_rotations = 0
+        self.min_approach_distance = float('inf')
         self.lateral_current_rotation = 0
         self.lateral_command_sent = False
         self.path_is_backward = False
+        self.vslam_lost = False
+        self.vslam_last_pose = None
+        self.vslam_last_pose_time = 0.0
+        self.tying_in_progress = False
+        self.tying_complete_received = False
+        self.waypoint_reached_time = 0.0
+        self.repeat_mode = False
+        self.total_tying_points = 0
+        self.total_wp_count = 0
+        self.original_waypoints_x = []
+        self.original_waypoints_y = []
+        self.original_waypoints_motion_type = []
+        self.original_waypoints_max_speed = []
+        self.pingpong_lap = 0
+        # 미션 종료 시 카메라를 forward로 복귀
+        direction_msg = String()
+        direction_msg.data = 'forward'
+        self.travel_direction_pub.publish(direction_msg)
 
     def mission_command_callback(self, msg: String):
-        """미션 명령 처리 (CANCEL 등)"""
+        """미션 명령 처리 (CANCEL, SET_REPEAT 등)"""
         command = msg.data
+
+        # JSON 명령 처리
+        if command.startswith('{'):
+            try:
+                data = json.loads(command)
+                if data.get('command') == 'SET_REPEAT':
+                    self.repeat_mode = bool(data.get('repeat', False))
+                    self.get_logger().info(f"Repeat 모드: {'ON' if self.repeat_mode else 'OFF'} "
+                                           f"(max={self.max_tying_points}pt)")
+                    self.flog(f"SET_REPEAT: {'ON' if self.repeat_mode else 'OFF'} max={self.max_tying_points}")
+                    return
+            except json.JSONDecodeError:
+                pass
 
         if "CANCEL" in command or "STOP" in command or "ABORT" in command:
             self.get_logger().warn(f"🛑 긴급 정지 명령 수신: {command}")
+            self.flog(f"========== 긴급 정지: {command} ==========")
 
             # 즉시 정지
             self.publish_cmd_vel(0.0, 0.0)
@@ -388,8 +608,27 @@ class RebarController(Node):
 
             self.get_logger().info("✅ 정지 완료 및 상태 초기화")
 
+    def encoder_odom_callback(self, msg: PoseStamped):
+        """엔코더 odometry 업데이트 (주 제어용)
+
+        전후면 반전 보정: encoder_odom은 물리적 방향 그대로 출력하므로
+        제어용으로 부호 반전하여 cmd_vel +전진 = encoder_x 증가와 일치시킴
+        """
+        inverted = PoseStamped()
+        inverted.header = msg.header
+        inverted.pose.position.x = -msg.pose.position.x
+        inverted.pose.position.y = -msg.pose.position.y
+        inverted.pose.position.z = msg.pose.position.z
+        # yaw도 반전 (π 회전)
+        yaw = self._quaternion_to_yaw(msg.pose.orientation)
+        inv_yaw = yaw + math.pi
+        inv_yaw = math.atan2(math.sin(inv_yaw), math.cos(inv_yaw))
+        inverted.pose.orientation.z = math.sin(inv_yaw / 2.0)
+        inverted.pose.orientation.w = math.cos(inv_yaw / 2.0)
+        self.encoder_pose = inverted
+
     def pose_callback(self, msg):
-        """현재 위치 업데이트 (ZED X에서)"""
+        """현재 위치 업데이트 (ZED X에서, VSLAM 모니터링용)"""
         # 최초 pose 수신 시 초기 상태 출력
         if not self.first_pose_received:
             self.first_pose_received = True
@@ -421,6 +660,40 @@ class RebarController(Node):
             self.get_logger().info("=" * 70)
 
         self.current_pose = msg
+
+        # VSLAM 트래킹 유실 감지
+        now = time.monotonic()
+        curr_x = msg.pose.position.x
+        curr_y = msg.pose.position.y
+
+        if self.vslam_last_pose is not None:
+            lx, ly = self.vslam_last_pose
+            move = math.sqrt((curr_x - lx)**2 + (curr_y - ly)**2)
+
+            # 위치 점프 감지 (1사이클에 물리적으로 불가능한 이동)
+            dt_since_update = now - self.vslam_last_update_time
+            if dt_since_update > 0 and move > self.vslam_jump_threshold and dt_since_update < 1.0:
+                if not self.vslam_lost:
+                    self.vslam_lost = True
+                    self.vslam_lost_time = now
+                    self.get_logger().error(
+                        f"⚠️ VSLAM 위치 점프 감지! "
+                        f"({lx:.3f},{ly:.3f})→({curr_x:.3f},{curr_y:.3f}) "
+                        f"이동={move*1000:.0f}mm / {dt_since_update*1000:.0f}ms"
+                    )
+
+        # pose 수신 자체가 살아있으면 타이머 갱신 (위치 변화량 무관)
+        self.vslam_last_pose_time = now
+
+        # VSLAM 유실 상태에서 pose가 계속 수신되면 복구
+        if self.vslam_lost and not self._is_vslam_jump_lost():
+            self.vslam_lost = False
+            self.get_logger().info(
+                f"✅ VSLAM 트래킹 복구 ({now - self.vslam_lost_time:.1f}초 후)"
+            )
+
+        self.vslam_last_pose = (curr_x, curr_y)
+        self.vslam_last_update_time = now
 
     def waypoint_callback(self, msg):
         """Enhanced Waypoint 수신 (motion type 포함)"""
@@ -620,8 +893,8 @@ class RebarController(Node):
         - DIFFERENTIAL: PID 제어로 전진/후진
         - LATERAL: 횡이동 제어 (joint_control)
         """
-        if self.current_pose is None or self.target_pose is None:
-            # 위치 또는 목표가 없으면 정지
+        if self.encoder_pose is None or self.target_pose is None:
+            # 엔코더 odometry 또는 목표가 없으면 정지
             self.publish_cmd_vel(0.0, 0.0)
             return
 
@@ -636,40 +909,126 @@ class RebarController(Node):
 
         제어 원칙:
         - 전진/후진은 경로(웨이포인트)에서 결정 (heading_error 기반 판단 안 함)
-        - heading 보정은 직진 유지용 (reference_heading = 경로 시작 시 로봇 facing 방향)
+        - 엔코더 odometry 기반 위치 추적 (VSLAM drift 영향 없음)
         - 제자리 선회 없음 (횡이동은 별도 모션으로 처리)
         """
-        # 현재 위치
-        curr_x = self.current_pose.pose.position.x
-        curr_y = self.current_pose.pose.position.y
-        curr_yaw = self._quaternion_to_yaw(self.current_pose.pose.orientation)
+        # 현재 위치 (엔코더 odometry - mission_origin 기준 상대좌표)
+        curr_x = self.encoder_pose.pose.position.x - self.mission_origin_x
+        curr_y = self.encoder_pose.pose.position.y - self.mission_origin_y
+        curr_yaw = self._quaternion_to_yaw(self.encoder_pose.pose.orientation)
 
         # 목표 위치
         target_x = self.target_pose.pose.position.x
         target_y = self.target_pose.pose.position.y
 
-        # 목표까지 거리
+        # 목표까지 거리 (유클리드)
         dx = target_x - curr_x
         dy = target_y - curr_y
         distance = math.sqrt(dx**2 + dy**2)
 
+        # 경로 방향 along-path 거리 계산 (Y드리프트에 강건한 도달 판정)
+        # 이전 WP → 현재 WP 방향으로 투영하여 남은 along-path 거리 산출
+        along_path_remaining = distance  # fallback: 유클리드 거리
+        idx = self.current_waypoint_index
+        # along-path 계산: 이전WP→현재WP 방향 사용, WP[0]이면 현재WP→다음WP 방향 사용
+        path_ref_valid = False
+        if idx > 0 and idx < len(self.waypoint_array_x):
+            prev_x = self.waypoint_array_x[idx - 1]
+            prev_y = self.waypoint_array_y[idx - 1]
+            path_dx = target_x - prev_x
+            path_dy = target_y - prev_y
+            path_ref_valid = True
+        elif idx == 0 and len(self.waypoint_array_x) > 1:
+            # WP[0]: 다음 WP 방향으로 경로 방향 추정
+            next_x = self.waypoint_array_x[1]
+            next_y = self.waypoint_array_y[1]
+            path_dx = next_x - target_x
+            path_dy = next_y - target_y
+            path_ref_valid = True
+        if path_ref_valid:
+            # 경로 방향 벡터
+            path_len = math.sqrt(path_dx**2 + path_dy**2)
+            if path_len > 0.001:
+                # 경로 방향 단위벡터
+                path_ux = path_dx / path_len
+                path_uy = path_dy / path_len
+                # 현재 위치 → 목표까지 벡터를 경로 방향에 투영
+                along_path_remaining = dx * path_ux + dy * path_uy
+
+        # 최근접 거리 추적
+        self.min_approach_distance = min(self.min_approach_distance, distance)
+
         # 목표 도달 확인
+        waypoint_reached = False
+
         if distance < self.distance_tolerance:
+            waypoint_reached = True
+        elif along_path_remaining <= 0.0:
+            # 경로 방향으로 목표 지점을 통과함 (along-path 기준)
+            self.get_logger().info(
+                f"📍 경로상 WP 통과: along={along_path_remaining*1000:.1f}mm, "
+                f"유클리드={distance*1000:.1f}mm → 도달 판정"
+            )
+            waypoint_reached = True
+
+        if waypoint_reached:
             if not self.waypoint_reached_sent:
                 self.publish_cmd_vel(0.0, 0.0)
                 self.waypoint_reached_sent = True
-                self.get_logger().info(
-                    f"🎯 목표 근접: 거리={distance*1000:.1f}mm < tolerance={self.distance_tolerance*1000:.0f}mm"
-                )
-            elif not hasattr(self, '_waypoint_reached_published'):
-                self.publish_cmd_vel(0.0, 0.0)
-                self._waypoint_reached_published = True
-                self.get_logger().info(f"✅ 웨이포인트 도달 확정: 거리={distance*1000:.1f}mm")
+                self.waypoint_reached_time = time.monotonic()
+                # VSLAM 동결 감지 타이머 리셋 (정지 중 동결 오탐 방지)
+                self.vslam_last_pose_time = time.monotonic()
 
-                if self.path_received and len(self.waypoint_array_x) > 0:
-                    self._advance_to_next_waypoint()
+                # 결속 방향 결정: 전체 WP 카운트 기반 교번 (핑퐁에서도 연속 교번)
+                tying_dir = 'forward' if self.total_wp_count % 2 == 0 else 'reverse'
+                self.total_wp_count += 1
+
+                self.get_logger().info(
+                    f"🎯 웨이포인트 도달: 거리={distance*1000:.1f}mm "
+                    f"(min={self.min_approach_distance*1000:.1f}mm) "
+                    f"→ 결속 시작 [direction={tying_dir}]"
+                )
+                self.flog(
+                    f"WP[{self.current_waypoint_index}] 도달: enc=({curr_x:.3f},{curr_y:.3f}) "
+                    f"dist={distance*1000:.1f}mm → TYING_START direction={tying_dir}"
+                )
+
+                # TYING_START 발행
+                tying_cmd = json.dumps({
+                    'command': 'TYING_START',
+                    'speed': 50,
+                    'direction': tying_dir,
+                })
+                cmd_msg = String()
+                cmd_msg.data = tying_cmd
+                self.mission_command_pub.publish(cmd_msg)
+                self.tying_in_progress = True
+                self.tying_complete_received = False
+
+            elif self.tying_in_progress:
+                # 결속 진행 중 → TYING_COMPLETE 대기
+                self.publish_cmd_vel(0.0, 0.0)
+                self.vslam_last_pose_time = time.monotonic()
+
+                if self.tying_complete_received:
+                    # 결속 완료 → 다음 WP로 진행
+                    self.tying_in_progress = False
+                    self.tying_complete_received = False
+                    elapsed = time.monotonic() - self.waypoint_reached_time
+                    self.get_logger().info(
+                        f"✅ 결속 완료 ({elapsed:.1f}초) → 다음 웨이포인트로 진행"
+                    )
+                    self.flog(f"WP[{self.current_waypoint_index}] 결속 완료 ({elapsed:.1f}초) → 다음 WP")
+                    if self.path_received and len(self.waypoint_array_x) > 0:
+                        self._advance_to_next_waypoint()
+                    else:
+                        self.publish_waypoint_reached()
                 else:
-                    self.publish_waypoint_reached()
+                    elapsed = time.monotonic() - self.waypoint_reached_time
+                    self.get_logger().info(
+                        f"🔧 결속 진행 중... ({elapsed:.0f}초 경과)",
+                        throttle_duration_sec=5.0
+                    )
                 return
             else:
                 self.publish_cmd_vel(0.0, 0.0)
@@ -680,11 +1039,10 @@ class RebarController(Node):
                 if hasattr(self, '_waypoint_reached_published'):
                     delattr(self, '_waypoint_reached_published')
 
-        # Heading 보정: reference_heading(직진 방향)에서 벗어난 정도
-        # 전진/후진 관계없이 동일 - 로봇이 직선에서 벗어나면 보정
+        # Heading 보정 비활성 (직선 경로)
+        # VSLAM heading drift가 심한 환경에서는 angular 보정이 오히려 역효과
+        # 순수 거리 기반 직진/직후진만 수행, tolerance 내 도달 시 다음 WP로 진행
         heading_error = 0.0
-        if self.reference_heading is not None:
-            heading_error = self._normalize_angle(self.reference_heading - curr_yaw)
 
         # PID 제어
         dt = 1.0 / self.control_rate
@@ -704,7 +1062,7 @@ class RebarController(Node):
         if self.path_is_backward:
             linear_vel = -abs(linear_vel)
 
-        # Heading PID (직선 유지 보정)
+        # Heading PID (bearing 기반 목표 방향 추종)
         self.integral_heading += heading_error * dt
         self.integral_heading = max(-self.integral_heading_limit, min(self.integral_heading_limit, self.integral_heading))
         derivative_heading = (heading_error - self.prev_heading_error) / dt
@@ -721,18 +1079,40 @@ class RebarController(Node):
 
         # 로깅
         mode_str = "후진" if self.path_is_backward else "전진"
+        # VSLAM 위치도 참고 출력
+        vslam_str = ""
+        if self.current_pose is not None:
+            vx = self.current_pose.pose.position.x
+            vy = self.current_pose.pose.position.y
+            vslam_str = f" | vslam=({vx:.3f},{vy:.3f})"
         self.get_logger().info(
-            f"[{mode_str}] VSLAM: ({curr_x:.3f}, {curr_y:.3f}) yaw={math.degrees(curr_yaw):.1f}° | "
+            f"[{mode_str}] enc: ({curr_x:.3f}, {curr_y:.3f}) yaw={math.degrees(curr_yaw):.1f}° | "
             f"목표: ({target_x:.3f}, {target_y:.3f}) | "
-            f"거리: {distance*1000:.1f}mm, 헤딩보정: {math.degrees(heading_error):.1f}° | "
+            f"거리: {distance*1000:.1f}mm | "
             f"cmd: lin={linear_vel:.3f}, ang={angular_vel:.3f}",
             throttle_duration_sec=1.0
+        )
+        # 파일 로그 (1Hz throttle 대신 매 호출 기록 - 20Hz)
+        self.flog(
+            f"[{mode_str}] WP[{self.current_waypoint_index}] "
+            f"enc=({curr_x:.3f},{curr_y:.3f}) θ={math.degrees(curr_yaw):.1f}° "
+            f"→ tgt=({target_x:.3f},{target_y:.3f}) "
+            f"dist={distance*1000:.1f}mm along={along_path_remaining*1000:.1f}mm "
+            f"cmd=({linear_vel:.3f},{angular_vel:.3f})"
+            f"{vslam_str}"
         )
 
         self.publish_cmd_vel(linear_vel, angular_vel)
 
+    def _is_vslam_jump_lost(self):
+        """점프 감지에 의한 VSLAM 유실인지 확인"""
+        # 점프 감지로 유실된 경우, pose 수신만으로는 복구 불가
+        # → pose_callback에서 점프 없이 정상 수신되면 자동 복구
+        return False
+
     def publish_cmd_vel(self, linear, angular):
         """cmd_vel 발행 (drive_controller에서 linear 반전 처리함)"""
+        self.last_cmd_linear = linear
         msg = Twist()
         msg.linear.x = linear
         msg.angular.z = angular
@@ -759,15 +1139,43 @@ class RebarController(Node):
             self.reference_heading = None  # 기준 heading도 초기화
             self.publish_cmd_vel(0.0, 0.0)
 
+    def tying_complete_callback(self, msg: String):
+        """결속 완료 신호 수신 (tying_orchestrator로부터)
+
+        형식: 'TYING_COMPLETE:N' (N=결속 포인트 수) 또는 'TYING_COMPLETE'
+        """
+        if not self.tying_in_progress:
+            return
+        data = msg.data
+        if data.startswith('TYING_COMPLETE'):
+            self.tying_complete_received = True
+            # 포인트 수 파싱
+            pts = 0
+            if ':' in data:
+                try:
+                    pts = int(data.split(':')[1])
+                except (ValueError, IndexError):
+                    pts = 0
+            self.total_tying_points += pts
+            elapsed = time.monotonic() - self.waypoint_reached_time
+            self.get_logger().info(
+                f"TYING_COMPLETE 수신: {pts}pt (누적 {self.total_tying_points}/{self.max_tying_points}pt) "
+                f"WP[{self.current_waypoint_index}] {elapsed:.1f}초")
+            self.flog(
+                f"TYING_COMPLETE 수신 (WP[{self.current_waypoint_index}]) "
+                f"{pts}pt 누적={self.total_tying_points}/{self.max_tying_points}")
+
     def feedback_callback(self, msg: String):
         """미션 피드백 처리 (mission_done 감지용)"""
         try:
-            import json
             feedback = json.loads(msg.data)
             state = feedback.get('state', '')
 
             # 미션 완료 또는 idle 상태가 되면 다음 미션을 위해 상태 리셋
+            # repeat 핑퐁 진행 중이면 무시 (내부에서 미션 관리)
             if state in ('mission_done', 'idle'):
+                if self.path_received:
+                    return  # 미션 진행 중 (핑퐁 포함) → 리셋 금지
                 if not self.first_waypoint_of_mission:
                     # 미션이 완료되었으므로 다음 미션을 위해 리셋
                     self.first_waypoint_of_mission = True
@@ -825,7 +1233,7 @@ class RebarController(Node):
         actual_dy = self.lateral_total_rotations * self.mm_per_rotation / 1000.0 * self.lateral_rotation_sign
 
         # 시작 위치가 저장되어 있다면 오차 계산 (로그용)
-        if hasattr(self, 'lateral_start_y'):
+        if hasattr(self, 'lateral_start_y') and self.current_pose is not None:
             zed_y = self.current_pose.pose.position.y
             zed_dy = zed_y - self.lateral_start_y
 
@@ -883,7 +1291,7 @@ class RebarController(Node):
         예: 100mm → 360° + 360° (2회 전송)
         엔코더 기반 완료 감지 + 위치 보정
         """
-        curr_y = self.current_pose.pose.position.y
+        curr_y = self.encoder_pose.pose.position.y
         target_y = self.target_pose.pose.position.y
         dy = target_y - curr_y
 
@@ -940,9 +1348,9 @@ class RebarController(Node):
 
         # 완료 감지는 lateral_complete_callback에서 처리됨 (엔코더 기반)
 
-        # Heading 유지를 위한 cmd_vel 발행 (각속도만)
-        if self.reference_heading is not None:
-            curr_yaw = self._quaternion_to_yaw(self.current_pose.pose.orientation)
+        # Heading 유지를 위한 cmd_vel 발행 (각속도만, 엔코더 odom 기반)
+        if self.reference_heading is not None and self.encoder_pose is not None:
+            curr_yaw = self._quaternion_to_yaw(self.encoder_pose.pose.orientation)
             heading_error = self._normalize_angle(self.reference_heading - curr_yaw)
             angular_z = heading_error * 1.0  # kp_angular
             self.publish_cmd_vel(0.0, angular_z)

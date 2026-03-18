@@ -18,6 +18,8 @@ from rclpy.qos import qos_profile_sensor_data, qos_profile_system_default
 from rebar_base_interfaces.msg import RemoteControl, JointControl, MotorFeedback
 from std_msgs.msg import String, Bool
 import time
+import os
+from datetime import datetime
 from enum import Enum
 
 
@@ -37,6 +39,12 @@ class JointController(Node):
         super().__init__('joint_controller')
         self.nodeName = self.get_name()
         self.get_logger().info(f'{self.nodeName} started')
+
+        # 파일 로거
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._log_path = f'/tmp/joint_controller_{ts}.log'
+        self._log_file = open(self._log_path, 'a')
+        self.flog(f'=== Joint Controller 시작 ===')
 
         # Parameters - 횡이동 (0x143)
         self.declare_parameter('lateral_step_deg', 360.0)
@@ -183,6 +191,10 @@ class JointController(Node):
             String, '/homing_cmd', self._recv_homing_cmd, 10)
         self.homing_status_pub = self.create_publisher(
             String, '/homing_status', 10)
+
+        # 비상정지: /mission/command의 EMERGENCY_STOP/CANCEL → 호밍 중지
+        self.mission_cmd_sub = self.create_subscription(
+            String, '/mission/command', self._mission_command_callback, 10)
 
         # Auto 모드 횡이동 추적 상태
         self.auto_lateral_target_encoder = None  # 목표 엔코더 값
@@ -496,6 +508,13 @@ class JointController(Node):
                 self.yaw_encoder_90 = enc_16
                 self.yaw_encoder_90_time = time.monotonic()
                 self.get_logger().debug(f"[0x147 Yaw] 0x90 encoder: {enc_16}")
+
+    def flog(self, msg):
+        """파일 로거"""
+        ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        line = f'{ts} {msg}\n'
+        self._log_file.write(line)
+        self._log_file.flush()
 
     def process_joint_control(self):
         """주기적으로 리모콘 입력 처리 및 Auto 모드 횡이동 완료 감지"""
@@ -1154,6 +1173,24 @@ class JointController(Node):
                 self._request_output_angle(0x143)
                 self.get_logger().warn("📡 0x92 각도 요청 중... (다음 사이클에서 재시도)")
 
+    def _mission_command_callback(self, msg: String):
+        """UI 비상정지 명령 수신 → 호밍 중이면 즉시 정지"""
+        try:
+            import json
+            data = json.loads(msg.data)
+            cmd = data.get('command', '')
+        except (json.JSONDecodeError, AttributeError):
+            cmd = msg.data.strip().upper()
+
+        if cmd in ('EMERGENCY_STOP', 'CANCEL', 'E-STOP', 'STOP'):
+            if self.homing_state != HomingState.IDLE:
+                self.get_logger().error(
+                    f"🛑 비상정지({cmd}) → 호밍 즉시 중지!")
+                for motor_id in [0x144, 0x145, 0x146, 0x147]:
+                    self._send_speed_command(motor_id, 0.0)
+                self.homing_state = HomingState.IDLE
+                self._publish_homing_status("EMERGENCY_STOPPED")
+
     # ==================== Homing Methods ====================
 
     def _recv_homing_cmd(self, msg: String):
@@ -1164,9 +1201,12 @@ class JointController(Node):
             if self.homing_state != HomingState.IDLE:
                 self.get_logger().warn("Homing already in progress")
                 return
+            # TODO: Yaw 안전 체크 - 하드웨어 리밋센서 추가 후 구현 예정
+            # (0x90 기반 체크는 기어 백래쉬/슬립으로 신뢰 불가)
             self.get_logger().info("=" * 60)
             self.get_logger().info("  HOMING SEQUENCE START")
             self.get_logger().info("=" * 60)
+            self.flog("========== HOMING SEQUENCE START ==========")
             self.homing_start_time = time.monotonic()
             self.homing_references = {}
             self.homing_axes_done = set()
@@ -1347,12 +1387,78 @@ class JointController(Node):
         # === MOVE_TO_READY ===
         elif self.homing_state == HomingState.MOVE_TO_READY:
             if not self.homing_cmd_sent:
+                self.flog("MOVE_TO_READY: 준비자세 이동 시작")
                 self._move_axes_to_ready()
                 self.homing_cmd_sent = True
                 self.homing_state_start_time = time.monotonic()  # 타임아웃 리셋
             else:
-                # 2초 안정화 후 완료
-                if now - self.homing_state_start_time > 2.0:
+                # 최소 1초 대기 후 도달 판정 (0x92 피드백 기반)
+                if now - self.homing_state_start_time < 1.0:
+                    return
+                tolerance = 5.0  # deg
+                angle_map = {
+                    0x144: self.stage_x_angle,
+                    0x145: self.stage_y_angle,
+                    0x146: self.stage_z_angle,
+                    0x147: self.yaw_angle,
+                }
+                phase = getattr(self, 'ready_phase', 2)
+
+                # X축 phase 1→2→3 별도 판정
+                if phase in (1, 2) and hasattr(self, 'ready_x_final'):
+                    x_current = angle_map.get(0x144)
+                    x_target = self.ready_targets.get(0x144)
+                    if x_current is not None and x_target is not None:
+                        if abs(x_current - x_target) <= tolerance:
+                            if phase == 1:
+                                # phase 1 도달 → phase 2 (2/3 지점)
+                                self.ready_phase = 2
+                                self._send_joint_command_abs(
+                                    0x144, self.ready_x_step2,
+                                    self.stage_x_speed, 'Ready: X (2/3)')
+                                self.ready_targets[0x144] = self.ready_x_step2
+                                self.homing_state_start_time = time.monotonic()
+                                self.get_logger().info(
+                                    f"Homing: X phase 2 → {self.ready_x_step2:.1f}°")
+                                self.flog(f"MOVE_TO_READY: X phase 1 도달 → phase 2 ({self.ready_x_step2:.1f}°)")
+                                return
+                            else:
+                                # phase 2 도달 → phase 3 (최종)
+                                self.ready_phase = 3
+                                self._send_joint_command_abs(
+                                    0x144, self.ready_x_final,
+                                    self.stage_x_speed, 'Ready: X (3/3)')
+                                self.ready_targets[0x144] = self.ready_x_final
+                                self.homing_state_start_time = time.monotonic()
+                                self.get_logger().info(
+                                    f"Homing: X phase 3 → {self.ready_x_final:.1f}°")
+                                self.flog(f"MOVE_TO_READY: X phase 2 도달 → phase 3 ({self.ready_x_final:.1f}°)")
+                                return
+
+                # 전체 축 도달 판정 (X는 phase 2 타겟 기준)
+                all_reached = True
+                for motor_id, target in getattr(self, 'ready_targets', {}).items():
+                    current = angle_map.get(motor_id)
+                    if current is None:
+                        all_reached = False
+                        continue
+                    if abs(current - target) > tolerance:
+                        all_reached = False
+                        break
+                if all_reached:
+                    self.get_logger().info("Homing: All axes reached ready position")
+                    self.flog("MOVE_TO_READY: 전축 도달 완료")
+                    self._homing_enter_state(HomingState.COMPLETE)
+                elif now - self.homing_state_start_time > 15.0:
+                    # 타임아웃 - 도달 못해도 완료 처리
+                    remaining = {
+                        hex(mid): f'{angle_map.get(mid, 0):.1f}/{tgt:.1f}'
+                        for mid, tgt in getattr(self, 'ready_targets', {}).items()
+                        if angle_map.get(mid) is not None and abs(angle_map[mid] - tgt) > tolerance
+                    }
+                    self.get_logger().warn(
+                        f"Homing: Ready position timeout (15s), remaining: {remaining}")
+                    self.flog(f"MOVE_TO_READY: 타임아웃(15s) remaining={remaining}")
                     self._homing_enter_state(HomingState.COMPLETE)
 
         elif self.homing_state == HomingState.COMPLETE:
@@ -1371,6 +1477,8 @@ class JointController(Node):
             self.get_logger().info(f"  HOMING COMPLETE ({elapsed:.1f}s)")
             self.get_logger().info(f"  References: {self.homing_references}")
             self.get_logger().info("=" * 60)
+            self.flog(f"========== HOMING COMPLETE ({elapsed:.1f}s) ==========")
+            self.flog(f"  References: {self.homing_references}")
             self.homing_state = HomingState.IDLE
 
     def _homing_on_limit_triggered(self, sensor_name: str):
@@ -1417,7 +1525,6 @@ class JointController(Node):
                 self.get_logger().info(f"Homing {phase}: All axes done -> {next_state.name}")
                 self._homing_enter_state(next_state)
 
-
     def _homing_fail(self, reason: str):
         """호밍 실패 처리"""
         self._send_homing_speeds([
@@ -1428,31 +1535,51 @@ class JointController(Node):
         self.get_logger().error(f"Homing FAILED: {reason}")
 
     def _move_axes_to_ready(self):
-        """호밍 완료 후 준비 위치로 이동 + can_sender joint_positions 동기화"""
-        self.get_logger().info("Homing: Moving to ready positions...")
+        """호밍 완료 후 준비 위치로 이동 + can_sender joint_positions 동기화
 
-        # X: reference + offset (mm -> deg) - 항상 절대 위치 전송 (joint_positions 동기화)
+        X축은 이동량이 클 수 있어 3단계 분할 이동 (100mm × 3):
+        1차: homing_ref에서 1/3 지점까지
+        2차: 1/3에서 2/3 지점까지
+        3차: 2/3에서 최종 목표까지
+        """
+        self.get_logger().info("Homing: Moving to ready positions...")
+        self.flog("MOVE_TO_READY: 준비자세 명령 전송")
+        self.ready_targets = {}
+        self.ready_phase = 1  # X축 분할 이동 단계 (1→2→3)
+
+        # X: 3단계 분할 이동
         if 0x144 in self.homing_references:
             x_offset_deg = self.ready_x_mm * self.stage_x_step
             x_target = self.homing_references[0x144] + x_offset_deg
-            self._send_joint_command_abs(0x144, x_target, self.stage_x_speed, 'Ready: X')
+            x_ref = self.homing_references[0x144]
+            x_step1 = x_ref + (x_target - x_ref) / 3.0
+            x_step2 = x_ref + (x_target - x_ref) * 2.0 / 3.0
+            self.ready_x_final = x_target
+            self.ready_x_step2 = x_step2
+            # 1차: 1/3 지점까지
+            self._send_joint_command_abs(0x144, x_step1, self.stage_x_speed, 'Ready: X (1/3)')
+            self.ready_targets[0x144] = x_step1
+            self.flog(f"  X: ref={x_ref:.1f} → step1={x_step1:.1f} → step2={x_step2:.1f} → final={x_target:.1f}")
 
         # Y: reference + offset (mm -> deg)
         if 0x145 in self.homing_references:
             y_offset_deg = self.ready_y_mm * self.stage_y_step
             y_target = self.homing_references[0x145] + y_offset_deg
             self._send_joint_command_abs(0x145, y_target, self.stage_y_speed, 'Ready: Y')
+            self.ready_targets[0x145] = y_target
 
         # Z: reference + offset (mm -> deg)
         if 0x146 in self.homing_references:
             z_offset_deg = self.ready_z_mm * self.stage_z_step
             z_target = self.homing_references[0x146] + z_offset_deg
             self._send_joint_command_abs(0x146, z_target, self.stage_z_speed, 'Ready: Z')
+            self.ready_targets[0x146] = z_target
 
         # Yaw: reference + offset (deg directly)
         if 0x147 in self.homing_references:
             yaw_target = self.homing_references[0x147] + self.ready_yaw_deg
             self._send_joint_command_abs(0x147, yaw_target, self.yaw_speed, 'Ready: Yaw')
+            self.ready_targets[0x147] = yaw_target
 
     def _set_ready_position(self):
         """현재 위치를 준비 위치로 기록 (YAML 업데이트 값 출력)"""

@@ -3,14 +3,16 @@
 검출 좌표 캘리브레이션 스크립트
 
 사용법:
-  python3 calibrate_detection.py
+  python3 calibrate_detection.py              # 우측 카메라 (기본)
+  python3 calibrate_detection.py --camera right
+  python3 calibrate_detection.py --camera left
 
 동작:
   1. 검출 서비스 호출 → 검출된 교차점 좌표 표시
   2. 각 포인트에 대해 실측값(cm) 입력 받음
-  3. calibration_data.json에 누적 저장
-  4. 4쌍 이상 모이면 Affine 매핑 행렬 자동 계산
-  5. 매핑 결과를 calibration_result.yaml로 저장
+  3. calibration_data_{camera}.json에 누적 저장
+  4. 6쌍 이상 모이면 다중선형회귀 매핑 자동 계산
+  5. 매핑 결과를 calibration_result_{camera}.yaml로 저장
 
 명령어:
   - 실측값 입력: "1.6 3" (X Y, cm 단위)
@@ -22,6 +24,7 @@
   - 'reset' : 수집 데이터 초기화
 """
 
+import argparse
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
@@ -35,20 +38,58 @@ import sys
 import time
 import yaml
 
-DATA_FILE = '/home/koceti/ros2_ws/calibration_data.json'
-RESULT_FILE = '/home/koceti/ros2_ws/calibration_result.yaml'
+CAMERA_CONFIG = {
+    'right': {
+        'camera_selection': 2,
+        'image_topic': '/zedxmini2/zed_node/left/image_rect_color',
+        'camera_name': 'Right Camera (zedxmini2)',
+        'data_file': '/home/koceti/ros2_ws/calibration_data_right.json',
+        'result_file': '/home/koceti/ros2_ws/calibration_result_right.yaml',
+        'viz_file': '/home/koceti/ros2_ws/calibration_detect_right.png',
+    },
+    'left': {
+        'camera_selection': 1,
+        'image_topic': '/zedxmini1/zed_node/left/image_rect_color',
+        'camera_name': 'Left Camera (zedxmini1)',
+        'data_file': '/home/koceti/ros2_ws/calibration_data_left.json',
+        'result_file': '/home/koceti/ros2_ws/calibration_result_left.yaml',
+        'viz_file': '/home/koceti/ros2_ws/calibration_detect_left.png',
+    },
+}
+
+# 기존 파일 호환 (right 카메라)
+LEGACY_DATA_FILE = '/home/koceti/ros2_ws/calibration_data.json'
+LEGACY_RESULT_FILE = '/home/koceti/ros2_ws/calibration_result.yaml'
 
 
 class CalibrationCollector(Node):
-    def __init__(self):
+    def __init__(self, camera_side='right'):
         super().__init__('calibration_collector')
         self.bridge = CvBridge()
-        self.right_image = None
+        self.camera_image = None
         self.got_image = False
+
+        # 카메라 설정
+        self.camera_side = camera_side
+        cfg = CAMERA_CONFIG[camera_side]
+        self.camera_selection = cfg['camera_selection']
+        self.camera_name = cfg['camera_name']
+        self.data_file = cfg['data_file']
+        self.result_file = cfg['result_file']
+        self.viz_file = cfg['viz_file']
+
+        # 기존 right 파일 마이그레이션 (calibration_data.json → calibration_data_right.json)
+        if camera_side == 'right' and not os.path.exists(self.data_file) and os.path.exists(LEGACY_DATA_FILE):
+            import shutil
+            shutil.copy2(LEGACY_DATA_FILE, self.data_file)
+            self.get_logger().info(f'기존 데이터 마이그레이션: {LEGACY_DATA_FILE} → {self.data_file}')
+        if camera_side == 'right' and not os.path.exists(self.result_file) and os.path.exists(LEGACY_RESULT_FILE):
+            import shutil
+            shutil.copy2(LEGACY_RESULT_FILE, self.result_file)
 
         self.image_sub = self.create_subscription(
             Image,
-            '/zedxmini2/zed_node/left/image_rect_color',
+            cfg['image_topic'],
             self.image_callback,
             1
         )
@@ -60,7 +101,7 @@ class CalibrationCollector(Node):
 
         # 캘리브레이션 데이터 로드
         self.cal_data = self._load_data()
-        # 다중 선형회귀 계수: (pixel_u, pixel_v, depth, pixel_u*depth, pixel_v*depth) → X, Y
+        # 다중 선형회귀 계수
         self.x_coeffs = None
         self.y_coeffs = None
 
@@ -68,21 +109,21 @@ class CalibrationCollector(Node):
         if len(self.cal_data) >= 6:
             self._compute_mapping_silent()
 
-        self.get_logger().info(f'기존 데이터: {len(self.cal_data)} 쌍')
+        self.get_logger().info(f'[{self.camera_name}] 기존 데이터: {len(self.cal_data)} 쌍')
 
     def image_callback(self, msg):
         if not self.got_image:
-            self.right_image = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+            self.camera_image = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
             self.got_image = True
 
     def _load_data(self):
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, 'r') as f:
+        if os.path.exists(self.data_file):
+            with open(self.data_file, 'r') as f:
                 return json.load(f)
         return []
 
     def _save_data(self):
-        with open(DATA_FILE, 'w') as f:
+        with open(self.data_file, 'w') as f:
             json.dump(self.cal_data, f, indent=2)
 
     def detect(self):
@@ -99,8 +140,8 @@ class CalibrationCollector(Node):
             return None, None
 
         request = DetectCrossings.Request()
-        request.camera_selection = 2  # 우측만
-        request.confidence_threshold = 0.5
+        request.camera_selection = self.camera_selection
+        request.confidence_threshold = 0.3
         request.expected_count = 6
 
         future = self.detect_client.call_async(request)
@@ -159,18 +200,18 @@ class CalibrationCollector(Node):
             print(line)
 
         # 시각화 저장
-        if self.right_image is not None:
+        if self.camera_image is not None:
             self._save_viz(detections)
 
         print('-' * 60)
-        print('각 포인트의 실측값을 입력하세요 (cm 단위, "X Y")')
+        print('각 포인트의 실측값을 입력하세요 (mm 단위, "X Y")')
         print("  's'=스킵  'q'=종료  'show'=데이터보기  'calc'=매핑계산  'test'=테스트")
         print()
 
         for i, det in enumerate(detections):
             label = f'P{i+1}'
             while True:
-                raw = input(f'  {label} 검출({det.x:.1f}, {det.y:.1f}) → 실측(cm): ').strip()
+                raw = input(f'  {label} 검출({det.x:.1f}, {det.y:.1f}) → 실측(mm): ').strip()
 
                 if raw == 'q':
                     return False
@@ -195,12 +236,10 @@ class CalibrationCollector(Node):
                 try:
                     parts = raw.replace(',', ' ').split()
                     if len(parts) != 2:
-                        print('    형식: X Y (예: 1.6 3)')
+                        print('    형식: X Y (예: 25.7 10.2)')
                         continue
-                    actual_x_cm = float(parts[0])
-                    actual_y_cm = float(parts[1])
-                    actual_x_mm = actual_x_cm * 10.0
-                    actual_y_mm = actual_y_cm * 10.0
+                    actual_x_mm = float(parts[0])
+                    actual_y_mm = float(parts[1])
 
                     pair = {
                         'detected_x': round(det.x, 2),
@@ -341,7 +380,7 @@ class CalibrationCollector(Node):
         print(f'  총합: 평균오차={np.mean(total_errors):.1f}mm, 최대={np.max(total_errors):.1f}mm')
 
         self._save_mapping(np.mean(total_errors), np.max(total_errors), x_r2, y_r2)
-        print(f'  저장: {RESULT_FILE}')
+        print(f'  저장: {self.result_file}')
         print()
 
     def _apply_mapping(self, pixel_u, pixel_v, depth_mm):
@@ -373,7 +412,7 @@ class CalibrationCollector(Node):
                 'num_points': len(self.cal_data),
                 'mean_error_mm': round(float(mean_err), 2),
                 'max_error_mm': round(float(max_err), 2),
-                'camera': 'right (zedxmini2)',
+                'camera': self.camera_name,
                 'x_mapping': {
                     'inputs': ['pixel_u', 'pixel_v', 'depth_mm', 'pixel_u*depth', 'pixel_v*depth', '1'],
                     'coeffs': [round(float(c), 6) for c in self.x_coeffs],
@@ -388,12 +427,16 @@ class CalibrationCollector(Node):
                 },
             }
         }
-        with open(RESULT_FILE, 'w') as f:
+        with open(self.result_file, 'w') as f:
             yaml.dump(data, f, default_flow_style=False)
+        # right 카메라는 기존 파일에도 동기화
+        if self.camera_side == 'right':
+            with open(LEGACY_RESULT_FILE, 'w') as f:
+                yaml.dump(data, f, default_flow_style=False)
 
-    def _save_viz(self, detections, camera_id='right'):
+    def _save_viz(self, detections):
         """검출 시각화 이미지 저장 (visualize_detection.py 스타일)"""
-        img = self.right_image.copy()
+        img = self.camera_image.copy()
         bbox_half = 30
 
         colors = {
@@ -445,23 +488,27 @@ class CalibrationCollector(Node):
                             font, 0.55, color, 2)
 
         # 상단 요약
-        cam_name = 'Right Camera (zedxmini2)' if camera_id == 'right' else 'Left Camera (zedxmini1)'
-        summary = f'{cam_name} | {len(detections)} detections | cal_data: {len(self.cal_data)} pairs'
+        summary = f'{self.camera_name} | {len(detections)} detections | cal_data: {len(self.cal_data)} pairs'
         cv2.putText(img, summary, (10, 30), font, 0.7, (0, 255, 0), 2)
 
-        output_path = '/home/koceti/ros2_ws/calibration_detect.png'
-        cv2.imwrite(output_path, img)
-        print(f'  [이미지] {output_path}')
+        cv2.imwrite(self.viz_file, img)
+        print(f'  [이미지] {self.viz_file}')
 
 
 def main():
-    rclpy.init()
-    node = CalibrationCollector()
+    parser = argparse.ArgumentParser(description='검출 좌표 캘리브레이션')
+    parser.add_argument('--camera', choices=['left', 'right'], default='right',
+                        help='카메라 선택: left(zedxmini1) / right(zedxmini2, 기본)')
+    args, ros_args = parser.parse_known_args()
+
+    rclpy.init(args=ros_args)
+    node = CalibrationCollector(camera_side=args.camera)
 
     print('=' * 60)
-    print(' 검출 좌표 캘리브레이션')
+    print(f' 검출 좌표 캘리브레이션 [{node.camera_name}]')
     print('=' * 60)
-    print(f' 데이터 파일: {DATA_FILE}')
+    print(f' 데이터 파일: {node.data_file}')
+    print(f' 결과 파일:   {node.result_file}')
     print(f' 기존 데이터: {len(node.cal_data)}쌍')
     print()
     print(' Enter=검출실행  q=종료  show=데이터  calc=매핑계산')
@@ -493,7 +540,7 @@ def main():
         node.destroy_node()
         rclpy.shutdown()
 
-    print(f'\n최종 데이터: {len(node.cal_data)}쌍 → {DATA_FILE}')
+    print(f'\n최종 데이터: {len(node.cal_data)}쌍 → {node.data_file}')
 
 
 if __name__ == '__main__':

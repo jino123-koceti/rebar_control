@@ -34,6 +34,7 @@ setup(
             'navigator_base = rebar_base_control.navigator_base:main',
             'ezi_io_controller = rebar_base_control.ezi_io_controller:main',
             'sequence_controller = rebar_base_control.sequence_controller:main',
+            'encoder_odom = rebar_base_control.encoder_odom:main',
         ],
     },
 )

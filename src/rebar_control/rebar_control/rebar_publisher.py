@@ -7,12 +7,13 @@ Rebar Publisher Node
 
 구독:
 - /control_mode (String) - navigator_base에서
-- /robot_pose (PoseStamped) - ZED X에서
+- /encoder_odom (PoseStamped) - 엔코더 odometry
 - /system_status (SystemStatus) - 하드웨어 상태
 - /motor_feedback (MotorFeedback) - 모터 피드백
+- /tying/status (String, JSON) - tying_orchestrator에서 결속 상태
 
 발행:
-- /mission/status (String, JSON) - zenoh_client로 전달
+- /mission/status (String, JSON) - zenoh_client로 전달 (tying_* 필드 포함)
 """
 
 from typing import Dict, List, Any, Optional
@@ -56,7 +57,7 @@ class RebarPublisher(Node):
 
         self.pose_sub = self.create_subscription(
             PoseStamped,
-            '/robot_pose',
+            '/encoder_odom',
             self.pose_callback,
             10
         )
@@ -73,6 +74,14 @@ class RebarPublisher(Node):
             MotorFeedback,
             '/motor_feedback',
             self.motor_feedback_callback,
+            10
+        )
+
+        # 결속 상태 피드백 (tying_orchestrator → rebar/status)
+        self.tying_status_sub = self.create_subscription(
+            String,
+            '/tying/status',
+            self.tying_status_callback,
             10
         )
 
@@ -99,6 +108,21 @@ class RebarPublisher(Node):
         self.left_motor_speed_dps = 0.0   # 좌측 모터 속도 (dps)
         self.right_motor_speed_dps = 0.0  # 우측 모터 속도 (dps)
         self.wheel_radius = 0.02865       # m (can_sender.py와 동일)
+
+        # 결속 상태 (tying_orchestrator로부터 수신)
+        self.tying_feedback = {}
+
+        # 경로 웨이포인트 (navigator의 path_gen_complete에서 수신)
+        self.waypoints = None  # 1회 전송 후 클리어
+
+        # 작업영역 (navigator로부터 수신)
+        self.work_area = None
+        self.work_area_sub = self.create_subscription(
+            String,
+            '/work_area',
+            self.work_area_callback,
+            10
+        )
 
         # 주기적 발행 타이머
         self.timer = self.create_timer(1.0 / publish_rate, self.publish_status)
@@ -127,8 +151,35 @@ class RebarPublisher(Node):
             self.current_waypoint = data.get('current_waypoint', self.current_waypoint)
             self.total_waypoints = data.get('total_waypoints', self.total_waypoints)
             self.mission_status = data.get('state', self.mission_status)
+
+            # path_gen_complete 시 waypoints 캡처 (UI 전달용)
+            if data.get('state') == 'path_gen_complete' and 'waypoints' in data:
+                self.waypoints = data['waypoints']
+                self.total_waypoints = data.get('waypoint_count', len(self.waypoints))
+                if 'work_area' in data:
+                    self.work_area = data['work_area']
+                self.get_logger().info(
+                    f"경로 수신: {len(self.waypoints)}개 웨이포인트 → status에 포함"
+                )
         except Exception as e:
             self.get_logger().warn(f"미션 피드백 파싱 실패: {e}")
+
+    def tying_status_callback(self, msg: String) -> None:
+        """결속 오케스트레이터의 상태 피드백 수신
+
+        JSON 필드: tying_state, tying_progress, tying_message, tying_result
+        """
+        try:
+            self.tying_feedback = json.loads(msg.data)
+        except Exception as e:
+            self.get_logger().warn(f"결속 상태 파싱 실패: {e}")
+
+    def work_area_callback(self, msg: String) -> None:
+        """작업영역 정보 수신 (navigator에서)"""
+        try:
+            self.work_area = json.loads(msg.data)
+        except Exception as e:
+            self.get_logger().warn(f"작업영역 파싱 실패: {e}")
 
     def io_status_callback(self, msg: IOStatus) -> None:
         """I/O 및 배터리 상태 업데이트"""
@@ -216,6 +267,23 @@ class RebarPublisher(Node):
                 'total_waypoints': self.total_waypoints,
                 'errors': self.errors
             }
+
+            # 결속 상태 필드 병합 (tying_orchestrator에서 수신)
+            if self.tying_feedback:
+                status_data.update(self.tying_feedback)
+
+            # 작업영역 정보 포함 (navigator에서 수신)
+            if self.work_area:
+                status_data['work_area'] = self.work_area
+
+            # 경로 웨이포인트 포함 (path_gen_complete 시 1회)
+            if self.waypoints is not None:
+                status_data['waypoints'] = self.waypoints
+                status_data['waypoint_count'] = len(self.waypoints)
+                self.get_logger().info(
+                    f"waypoints 발행: {len(self.waypoints)}개 (status에 포함)"
+                )
+                self.waypoints = None  # 1회 전송 후 클리어
 
             # JSON 변환
             json_str = json.dumps(status_data)

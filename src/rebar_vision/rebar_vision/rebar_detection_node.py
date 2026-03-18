@@ -22,6 +22,7 @@ import cv2
 import time
 import threading
 import os
+import yaml
 
 
 class RebarDetectionNode(Node):
@@ -34,14 +35,14 @@ class RebarDetectionNode(Node):
         # 파라미터 선언
         # ============================================
         self.declare_parameter('model_path',
-                               '/home/koceti/ros2_ws/src/rebar_vision/model/best.pt')
+                               '/home/koceti/ros2_ws/src/rebar_vision/model/best_260313.pt')
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('depth_kernel_size', 5)
         self.declare_parameter('max_depth_m', 2.0)
         self.declare_parameter('min_depth_m', 0.05)
         self.declare_parameter('grid_rows', 2)
         self.declare_parameter('grid_cols', 3)
-        self.declare_parameter('dedup_distance_mm', 20.0)
+        self.declare_parameter('dedup_distance_mm', 40.0)
         self.declare_parameter('detection_strategy', 'cross')  # cross, merge, single
 
         # 카메라 외부 파라미터 (position: mm, rotation: degrees)
@@ -73,6 +74,12 @@ class RebarDetectionNode(Node):
                 'side': 'right',
             }
         }
+
+        # ============================================
+        # 캘리브레이션 회귀 모델 로드
+        # ============================================
+        self.calibration_models = {}
+        self._load_calibration_models()
 
         # ============================================
         # YOLO 모델 로드
@@ -168,6 +175,13 @@ class RebarDetectionNode(Node):
             self.get_logger().info(
                 '    Left cam → Y- (먼쪽) 3pt, Right cam → Y+ (먼쪽) 3pt'
             )
+        for cam, model in self.calibration_models.items():
+            self.get_logger().info(
+                f'  캘리브레이션[{cam}]: {model["num_points"]}쌍, '
+                f'X R²={model["x_r2"]:.4f}, Y R²={model["y_r2"]:.4f}'
+            )
+        if not self.calibration_models:
+            self.get_logger().warn('  캘리브레이션 모델 없음 → 기하학적 변환 사용')
         self.get_logger().info('=' * 60)
 
     # ============================================
@@ -195,6 +209,45 @@ class RebarDetectionNode(Node):
             )
         except Exception as e:
             self.get_logger().error(f'모델 로드 실패: {e}')
+
+    def _load_calibration_models(self):
+        """캘리브레이션 YAML에서 회귀 계수 로드"""
+        calib_files = {
+            'left': '/home/koceti/ros2_ws/calibration_result_left.yaml',
+            'right': '/home/koceti/ros2_ws/calibration_result_right.yaml',
+        }
+        for cam, path in calib_files.items():
+            if not os.path.exists(path):
+                self.get_logger().info(f'캘리브레이션 파일 없음: {path}')
+                continue
+            try:
+                with open(path, 'r') as f:
+                    data = yaml.safe_load(f)
+                cal = data['calibration']
+                self.calibration_models[cam] = {
+                    'x_coeffs': np.array(cal['x_mapping']['coeffs']),
+                    'y_coeffs': np.array(cal['y_mapping']['coeffs']),
+                    'x_r2': cal['x_mapping']['r_squared'],
+                    'y_r2': cal['y_mapping']['r_squared'],
+                    'num_points': cal['num_points'],
+                }
+            except Exception as e:
+                self.get_logger().error(f'캘리브레이션 로드 실패 [{cam}]: {e}')
+
+    def _apply_calibration(self, pixel_u, pixel_v, depth_mm, camera_side):
+        """캘리브레이션 회귀 모델로 로봇 좌표 (X, Y) mm 계산
+
+        X = a*u + b*v + c*d + e*u*d + f*v*d + g
+        Y = a*u + b*v + c*d + e*u*d + f*v*d + g
+        """
+        model = self.calibration_models[camera_side]
+        features = np.array([
+            pixel_u, pixel_v, depth_mm,
+            pixel_u * depth_mm, pixel_v * depth_mm, 1.0
+        ])
+        x_mm = float(np.dot(model['x_coeffs'], features))
+        y_mm = float(np.dot(model['y_coeffs'], features))
+        return x_mm, y_mm
 
     # ============================================
     # 프레임 캐싱 콜백
@@ -355,11 +408,6 @@ class RebarDetectionNode(Node):
                         )
                         all_detections.extend(dets)
 
-                # merge 전략: 양쪽 카메라 중복 제거
-                if strategy == 'merge' and request.camera_selection == 0:
-                    if len(all_detections) > expected_count:
-                        all_detections = self._deduplicate(all_detections)
-
             total_detected = len(all_detections)
 
             # 2x3 그리드 정렬
@@ -412,6 +460,9 @@ class RebarDetectionNode(Node):
 
         boxes = results[0].boxes
 
+        camera_side = extrinsics.get('side', 'right')
+        use_calibration = camera_side in self.calibration_models
+
         for box in boxes:
             # 바운딩 박스 중심
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
@@ -424,24 +475,38 @@ class RebarDetectionNode(Node):
             if depth_m is None:
                 continue
 
-            # 픽셀 → 카메라 3D
-            point_cam = self._pixel_to_camera_3d(
-                cx, cy, depth_m, camera_info
-            )
+            depth_mm = depth_m * 1000.0
 
-            # 카메라 3D → 로봇 좌표
-            point_robot = self._camera_to_robot(point_cam, extrinsics)
+            if use_calibration:
+                # 캘리브레이션 회귀 모델로 직접 변환
+                robot_x, robot_y = self._apply_calibration(
+                    cx, cy, depth_mm, camera_side
+                )
+                robot_z = 0.0  # Z는 스테이지에서 별도 제어
+            else:
+                # fallback: 기하학적 변환
+                point_cam = self._pixel_to_camera_3d(
+                    cx, cy, depth_m, camera_info
+                )
+                point_robot = self._camera_to_robot(point_cam, extrinsics)
+                robot_x = float(point_robot[0])
+                robot_y = float(point_robot[1])
+                robot_z = float(point_robot[2])
 
             det = RebarDetection()
-            det.x = float(point_robot[0])
-            det.y = float(point_robot[1])
-            det.z = float(point_robot[2])
+            det.x = robot_x
+            det.y = robot_y
+            det.z = robot_z
             det.confidence = confidence
-            det.depth_mm = float(depth_m * 1000.0)
+            det.depth_mm = depth_mm
             det.pixel_u = cx
             det.pixel_v = cy
             det.camera_id = camera_id
             detections.append(det)
+
+        # 같은 카메라 내 근접 포인트 중복 제거
+        if len(detections) > 1:
+            detections = self._deduplicate(detections)
 
         return detections
 

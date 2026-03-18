@@ -185,6 +185,7 @@ def generate_launch_description():
     # Rebar Detection Node (from rebar_vision package)
     rebar_vision_share = get_package_share_directory('rebar_vision')
     camera_config = os.path.join(rebar_vision_share, 'config', 'camera_extrinsics.yaml')
+    tying_config = os.path.join(rebar_vision_share, 'config', 'tying_orchestrator.yaml')
 
     detection_node = Node(
         package='rebar_vision',
@@ -192,6 +193,17 @@ def generate_launch_description():
         name='rebar_detection_node',
         output='screen',
         parameters=[camera_config],
+        emulate_tty=True,
+        condition=IfCondition(LaunchConfiguration('use_vision'))
+    )
+
+    # Tying Orchestrator Node (from rebar_vision package)
+    orchestrator_node = Node(
+        package='rebar_vision',
+        executable='tying_orchestrator',
+        name='tying_orchestrator',
+        output='screen',
+        parameters=[tying_config],
         emulate_tty=True,
         condition=IfCondition(LaunchConfiguration('use_vision'))
     )
@@ -216,6 +228,7 @@ def generate_launch_description():
         zedxmini1,
         zedxmini2,
 
-        # Vision - rebar detection service
+        # Vision - rebar detection service & tying orchestrator
         detection_node,
+        orchestrator_node,
     ])
