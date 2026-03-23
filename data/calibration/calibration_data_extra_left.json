@@ -1,0 +1,102 @@
+[
+  {
+    "detected_x": -469.56,
+    "detected_y": 392.3,
+    "actual_x_mm": 455.0,
+    "actual_y_mm": 235.0,
+    "depth_mm": 313.9,
+    "pixel_u": 174,
+    "pixel_v": 219,
+    "confidence": 0.628
+  },
+  {
+    "detected_x": -495.05,
+    "detected_y": 410.31,
+    "actual_x_mm": 480.0,
+    "actual_y_mm": 241.0,
+    "depth_mm": 328.9,
+    "pixel_u": 160,
+    "pixel_v": 212,
+    "confidence": 0.398
+  },
+  {
+    "detected_x": -479.26,
+    "detected_y": 396.57,
+    "actual_x_mm": 445.0,
+    "actual_y_mm": 226.0,
+    "depth_mm": 319.1,
+    "pixel_u": 168,
+    "pixel_v": 220,
+    "confidence": 0.564
+  },
+  {
+    "detected_x": -447.58,
+    "detected_y": 376.92,
+    "actual_x_mm": 430.0,
+    "actual_y_mm": 217.0,
+    "depth_mm": 300.8,
+    "pixel_u": 187,
+    "pixel_v": 225,
+    "confidence": 0.799
+  },
+  {
+    "detected_x": 385.88,
+    "detected_y": 263.61,
+    "actual_x_mm": 414.0,
+    "actual_y_mm": 282.4,
+    "depth_mm": 403.6,
+    "pixel_u": 210,
+    "pixel_v": 202,
+    "confidence": 0.715
+  },
+  {
+    "detected_x": 403.21,
+    "detected_y": 236.68,
+    "actual_x_mm": 413.5,
+    "actual_y_mm": 246.4,
+    "depth_mm": 334.8,
+    "pixel_u": 232,
+    "pixel_v": 208,
+    "confidence": 0.765
+  },
+  {
+    "detected_x": 402.11,
+    "detected_y": 244.76,
+    "actual_x_mm": 435.0,
+    "actual_y_mm": 251.4,
+    "depth_mm": 354.8,
+    "pixel_u": 216,
+    "pixel_v": 207,
+    "confidence": 0.756
+  },
+  {
+    "detected_x": 460.19,
+    "detected_y": 247.28,
+    "actual_x_mm": 480.0,
+    "actual_y_mm": 250.0,
+    "depth_mm": 339.2,
+    "pixel_u": 170,
+    "pixel_v": 207,
+    "confidence": 0.627
+  },
+  {
+    "detected_x": 479.39,
+    "detected_y": 239.91,
+    "actual_x_mm": 490.0,
+    "actual_y_mm": 249.4,
+    "depth_mm": 333.8,
+    "pixel_u": 152,
+    "pixel_v": 209,
+    "confidence": 0.578
+  },
+  {
+    "detected_x": 477.99,
+    "detected_y": 249.49,
+    "actual_x_mm": 520.0,
+    "actual_y_mm": 249.4,
+    "depth_mm": 345.2,
+    "pixel_u": 130,
+    "pixel_v": 206,
+    "confidence": 0.421
+  }
+]

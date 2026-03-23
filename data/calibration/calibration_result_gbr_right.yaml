@@ -1,0 +1,20 @@
+calibration:
+  camera: Right Camera (zedxmini2)
+  cv_x_mae_mm: 12.13
+  cv_y_mae_mm: 10.97
+  gbr_params:
+    learning_rate: 0.05
+    max_depth: 4
+    n_estimators: 300
+    random_state: 42
+    subsample: 0.8
+  inputs:
+  - pixel_u
+  - pixel_v
+  - depth_mm
+  max_error_mm: 5.3
+  mean_error_mm: 1.67
+  method: gradient_boosting_regressor
+  model_x_file: /home/koceti/ros2_ws/data/calibration/calibration_model_x_gbr_right.joblib
+  model_y_file: /home/koceti/ros2_ws/data/calibration/calibration_model_y_gbr_right.joblib
+  num_points: 207

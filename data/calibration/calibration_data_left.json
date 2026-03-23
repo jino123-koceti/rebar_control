@@ -40,16 +40,6 @@
     "confidence": 0.727
   },
   {
-    "detected_x": -469.56,
-    "detected_y": 392.3,
-    "actual_x_mm": 455.0,
-    "actual_y_mm": 235.0,
-    "depth_mm": 313.9,
-    "pixel_u": 174,
-    "pixel_v": 219,
-    "confidence": 0.628
-  },
-  {
     "detected_x": -43.32,
     "detected_y": 484.01,
     "actual_x_mm": 33.0,
@@ -120,16 +110,6 @@
     "confidence": 0.821
   },
   {
-    "detected_x": -495.05,
-    "detected_y": 410.31,
-    "actual_x_mm": 480.0,
-    "actual_y_mm": 241.0,
-    "depth_mm": 328.9,
-    "pixel_u": 160,
-    "pixel_v": 212,
-    "confidence": 0.398
-  },
-  {
     "detected_x": -104.54,
     "detected_y": 414.82,
     "actual_x_mm": 81.8,
@@ -138,16 +118,6 @@
     "pixel_u": 593,
     "pixel_v": 204,
     "confidence": 0.811
-  },
-  {
-    "detected_x": -479.26,
-    "detected_y": 396.57,
-    "actual_x_mm": 445.0,
-    "actual_y_mm": 226.0,
-    "depth_mm": 319.1,
-    "pixel_u": 168,
-    "pixel_v": 220,
-    "confidence": 0.564
   },
   {
     "detected_x": -293.11,
@@ -168,16 +138,6 @@
     "pixel_u": 625,
     "pixel_v": 209,
     "confidence": 0.692
-  },
-  {
-    "detected_x": -447.58,
-    "detected_y": 376.92,
-    "actual_x_mm": 430.0,
-    "actual_y_mm": 217.0,
-    "depth_mm": 300.8,
-    "pixel_u": 187,
-    "pixel_v": 225,
-    "confidence": 0.799
   },
   {
     "detected_x": -62.92,
@@ -238,5 +198,1065 @@
     "pixel_u": 434,
     "pixel_v": 226,
     "confidence": 0.762
+  },
+  {
+    "detected_x": 327.06,
+    "detected_y": 261.83,
+    "actual_x_mm": 334.3,
+    "actual_y_mm": 273.5,
+    "depth_mm": 369.4,
+    "pixel_u": 317,
+    "pixel_v": 202,
+    "confidence": 0.408
+  },
+  {
+    "detected_x": 121.45,
+    "detected_y": 272.25,
+    "actual_x_mm": 134.3,
+    "actual_y_mm": 270.0,
+    "depth_mm": 446.8,
+    "pixel_u": 528,
+    "pixel_v": 191,
+    "confidence": 0.572
+  },
+  {
+    "detected_x": 204.87,
+    "detected_y": 227.84,
+    "actual_x_mm": 210.1,
+    "actual_y_mm": 236.0,
+    "depth_mm": 434.0,
+    "pixel_u": 449,
+    "pixel_v": 206,
+    "confidence": 0.616
+  },
+  {
+    "detected_x": 7.5,
+    "detected_y": 237.36,
+    "actual_x_mm": 3.3,
+    "actual_y_mm": 233.6,
+    "depth_mm": 343.5,
+    "pixel_u": 664,
+    "pixel_v": 200,
+    "confidence": 0.724
+  },
+  {
+    "detected_x": 403.42,
+    "detected_y": 211.63,
+    "actual_x_mm": 403.0,
+    "actual_y_mm": 218.0,
+    "depth_mm": 334.7,
+    "pixel_u": 222,
+    "pixel_v": 218,
+    "confidence": 0.755
+  },
+  {
+    "detected_x": 7.69,
+    "detected_y": 221.64,
+    "actual_x_mm": 3.2,
+    "actual_y_mm": 231.1,
+    "depth_mm": 335.1,
+    "pixel_u": 672,
+    "pixel_v": 203,
+    "confidence": 0.349
+  },
+  {
+    "detected_x": 4.6,
+    "detected_y": 247.19,
+    "actual_x_mm": 3.2,
+    "actual_y_mm": 240.1,
+    "depth_mm": 345.7,
+    "pixel_u": 664,
+    "pixel_v": 197,
+    "confidence": 0.776
+  },
+  {
+    "detected_x": 289.57,
+    "detected_y": 268.79,
+    "actual_x_mm": 289.5,
+    "actual_y_mm": 279.0,
+    "depth_mm": 397.1,
+    "pixel_u": 374,
+    "pixel_v": 194,
+    "confidence": 0.764
+  },
+  {
+    "detected_x": 93.52,
+    "detected_y": 249.17,
+    "actual_x_mm": 88.1,
+    "actual_y_mm": 240.0,
+    "depth_mm": 369.3,
+    "pixel_u": 572,
+    "pixel_v": 198,
+    "confidence": 0.721
+  },
+  {
+    "detected_x": 328.46,
+    "detected_y": 267.03,
+    "actual_x_mm": 353.4,
+    "actual_y_mm": 279.0,
+    "depth_mm": 374.8,
+    "pixel_u": 311,
+    "pixel_v": 199,
+    "confidence": 0.665
+  },
+  {
+    "detected_x": 173.17,
+    "detected_y": 245.82,
+    "actual_x_mm": 150.3,
+    "actual_y_mm": 240.3,
+    "depth_mm": 375.1,
+    "pixel_u": 506,
+    "pixel_v": 201,
+    "confidence": 0.592
+  },
+  {
+    "detected_x": 232.38,
+    "detected_y": 240.41,
+    "actual_x_mm": 236.9,
+    "actual_y_mm": 240.3,
+    "depth_mm": 348.1,
+    "pixel_u": 420,
+    "pixel_v": 203,
+    "confidence": 0.718
+  },
+  {
+    "detected_x": 49.28,
+    "detected_y": 285.23,
+    "actual_x_mm": 30.9,
+    "actual_y_mm": 269.3,
+    "depth_mm": 348.6,
+    "pixel_u": 617,
+    "pixel_v": 190,
+    "confidence": 0.463
+  },
+  {
+    "detected_x": 399.91,
+    "detected_y": 226.74,
+    "actual_x_mm": 396.5,
+    "actual_y_mm": 241.6,
+    "depth_mm": 328.3,
+    "pixel_u": 244,
+    "pixel_v": 211,
+    "confidence": 0.674
+  },
+  {
+    "detected_x": 194.31,
+    "detected_y": 277.17,
+    "actual_x_mm": 192.9,
+    "actual_y_mm": 269.3,
+    "depth_mm": 378.4,
+    "pixel_u": 466,
+    "pixel_v": 193,
+    "confidence": 0.593
+  },
+  {
+    "detected_x": 404.32,
+    "detected_y": 215.26,
+    "actual_x_mm": 398.3,
+    "actual_y_mm": 218.5,
+    "depth_mm": 328.1,
+    "pixel_u": 238,
+    "pixel_v": 217,
+    "confidence": 0.779
+  },
+  {
+    "detected_x": 195.6,
+    "detected_y": 255.7,
+    "actual_x_mm": 190.7,
+    "actual_y_mm": 249.9,
+    "depth_mm": 387.6,
+    "pixel_u": 467,
+    "pixel_v": 198,
+    "confidence": 0.706
+  },
+  {
+    "detected_x": 70.09,
+    "detected_y": 238.31,
+    "actual_x_mm": 80.5,
+    "actual_y_mm": 231.2,
+    "depth_mm": 483.9,
+    "pixel_u": 583,
+    "pixel_v": 202,
+    "confidence": 0.771
+  },
+  {
+    "detected_x": 203.97,
+    "detected_y": 225.14,
+    "actual_x_mm": 206.0,
+    "actual_y_mm": 220.4,
+    "depth_mm": 430.2,
+    "pixel_u": 455,
+    "pixel_v": 209,
+    "confidence": 0.489
+  },
+  {
+    "detected_x": 7.9,
+    "detected_y": 229.01,
+    "actual_x_mm": 3.2,
+    "actual_y_mm": 230.0,
+    "depth_mm": 335.9,
+    "pixel_u": 668,
+    "pixel_v": 202,
+    "confidence": 0.794
+  },
+  {
+    "detected_x": 2.59,
+    "detected_y": 216.58,
+    "actual_x_mm": 2.6,
+    "actual_y_mm": 210.6,
+    "depth_mm": 338.8,
+    "pixel_u": 679,
+    "pixel_v": 207,
+    "confidence": 0.53
+  },
+  {
+    "detected_x": 7.66,
+    "detected_y": 224.62,
+    "actual_x_mm": 2.6,
+    "actual_y_mm": 218.6,
+    "depth_mm": 326.4,
+    "pixel_u": 674,
+    "pixel_v": 204,
+    "confidence": 0.694
+  },
+  {
+    "detected_x": 404.13,
+    "detected_y": 211.12,
+    "actual_x_mm": 406.1,
+    "actual_y_mm": 215.0,
+    "depth_mm": 301.9,
+    "pixel_u": 224,
+    "pixel_v": 217,
+    "confidence": 0.741
+  },
+  {
+    "detected_x": 204.36,
+    "detected_y": 223.57,
+    "actual_x_mm": 198.4,
+    "actual_y_mm": 218.6,
+    "depth_mm": 411.0,
+    "pixel_u": 452,
+    "pixel_v": 210,
+    "confidence": 0.359
+  },
+  {
+    "detected_x": 9.96,
+    "detected_y": 226.79,
+    "actual_x_mm": 3.0,
+    "actual_y_mm": 226.8,
+    "depth_mm": 335.6,
+    "pixel_u": 665,
+    "pixel_v": 202,
+    "confidence": 0.766
+  },
+  {
+    "detected_x": 402.25,
+    "detected_y": 222.74,
+    "actual_x_mm": 404.2,
+    "actual_y_mm": 222.7,
+    "depth_mm": 317.1,
+    "pixel_u": 231,
+    "pixel_v": 215,
+    "confidence": 0.774
+  },
+  {
+    "detected_x": 7.57,
+    "detected_y": 239.91,
+    "actual_x_mm": 3.6,
+    "actual_y_mm": 237.9,
+    "depth_mm": 350.0,
+    "pixel_u": 665,
+    "pixel_v": 199,
+    "confidence": 0.815
+  },
+  {
+    "detected_x": 401.75,
+    "detected_y": 228.72,
+    "actual_x_mm": 404.5,
+    "actual_y_mm": 233.0,
+    "depth_mm": 320.0,
+    "pixel_u": 234,
+    "pixel_v": 213,
+    "confidence": 0.699
+  },
+  {
+    "detected_x": 5.54,
+    "detected_y": 245.14,
+    "actual_x_mm": 3.5,
+    "actual_y_mm": 245.1,
+    "depth_mm": 352.7,
+    "pixel_u": 665,
+    "pixel_v": 197,
+    "confidence": 0.775
+  },
+  {
+    "detected_x": 399.94,
+    "detected_y": 241.52,
+    "actual_x_mm": 404.0,
+    "actual_y_mm": 249.5,
+    "depth_mm": 310.8,
+    "pixel_u": 242,
+    "pixel_v": 207,
+    "confidence": 0.69
+  },
+  {
+    "detected_x": 209.52,
+    "detected_y": 259.25,
+    "actual_x_mm": 199.5,
+    "actual_y_mm": 259.3,
+    "depth_mm": 351.5,
+    "pixel_u": 455,
+    "pixel_v": 195,
+    "confidence": 0.693
+  },
+  {
+    "detected_x": 4.92,
+    "detected_y": 262.39,
+    "actual_x_mm": 3.0,
+    "actual_y_mm": 263.4,
+    "depth_mm": 367.4,
+    "pixel_u": 657,
+    "pixel_v": 191,
+    "confidence": 0.669
+  },
+  {
+    "detected_x": 207.25,
+    "detected_y": 272.49,
+    "actual_x_mm": 200.2,
+    "actual_y_mm": 270.4,
+    "depth_mm": 353.2,
+    "pixel_u": 454,
+    "pixel_v": 193,
+    "confidence": 0.688
+  },
+  {
+    "detected_x": 8.54,
+    "detected_y": 264.38,
+    "actual_x_mm": 3.2,
+    "actual_y_mm": 272.4,
+    "depth_mm": 368.5,
+    "pixel_u": 655,
+    "pixel_v": 188,
+    "confidence": 0.704
+  },
+  {
+    "detected_x": 385.54,
+    "detected_y": 263.86,
+    "actual_x_mm": 404.5,
+    "actual_y_mm": 279.4,
+    "depth_mm": 378.6,
+    "pixel_u": 250,
+    "pixel_v": 201,
+    "confidence": 0.722
+  },
+  {
+    "detected_x": 9.1,
+    "detected_y": 271.63,
+    "actual_x_mm": 3.5,
+    "actual_y_mm": 286.4,
+    "depth_mm": 397.3,
+    "pixel_u": 652,
+    "pixel_v": 186,
+    "confidence": 0.435
+  },
+  {
+    "detected_x": 66.47,
+    "detected_y": 288.36,
+    "actual_x_mm": 46.5,
+    "actual_y_mm": 286.4,
+    "depth_mm": 381.9,
+    "pixel_u": 597,
+    "pixel_v": 187,
+    "confidence": 0.533
+  },
+  {
+    "detected_x": 75.42,
+    "detected_y": 259.1,
+    "actual_x_mm": 61.0,
+    "actual_y_mm": 249.4,
+    "depth_mm": 352.5,
+    "pixel_u": 592,
+    "pixel_v": 197,
+    "confidence": 0.759
+  },
+  {
+    "detected_x": 275.67,
+    "detected_y": 252.99,
+    "actual_x_mm": 276.3,
+    "actual_y_mm": 249.4,
+    "depth_mm": 386.0,
+    "pixel_u": 380,
+    "pixel_v": 201,
+    "confidence": 0.799
+  },
+  {
+    "detected_x": 92.85,
+    "detected_y": 248.92,
+    "actual_x_mm": 80.4,
+    "actual_y_mm": 249.4,
+    "depth_mm": 365.5,
+    "pixel_u": 570,
+    "pixel_v": 195,
+    "confidence": 0.613
+  },
+  {
+    "detected_x": 300.16,
+    "detected_y": 244.81,
+    "actual_x_mm": 298.6,
+    "actual_y_mm": 249.4,
+    "depth_mm": 352.4,
+    "pixel_u": 359,
+    "pixel_v": 204,
+    "confidence": 0.785
+  },
+  {
+    "detected_x": 122.02,
+    "detected_y": 251.36,
+    "actual_x_mm": 106.4,
+    "actual_y_mm": 249.4,
+    "depth_mm": 375.5,
+    "pixel_u": 545,
+    "pixel_v": 198,
+    "confidence": 0.637
+  },
+  {
+    "detected_x": 327.75,
+    "detected_y": 256.66,
+    "actual_x_mm": 330.8,
+    "actual_y_mm": 249.4,
+    "depth_mm": 448.1,
+    "pixel_u": 333,
+    "pixel_v": 202,
+    "confidence": 0.771
+  },
+  {
+    "detected_x": 122.26,
+    "detected_y": 251.56,
+    "actual_x_mm": 135.5,
+    "actual_y_mm": 249.4,
+    "depth_mm": 468.3,
+    "pixel_u": 524,
+    "pixel_v": 197,
+    "confidence": 0.666
+  },
+  {
+    "detected_x": 325.1,
+    "detected_y": 248.3,
+    "actual_x_mm": 344.4,
+    "actual_y_mm": 249.4,
+    "depth_mm": 383.3,
+    "pixel_u": 309,
+    "pixel_v": 203,
+    "confidence": 0.722
+  },
+  {
+    "detected_x": 375.08,
+    "detected_y": 243.29,
+    "actual_x_mm": 375.2,
+    "actual_y_mm": 247.4,
+    "depth_mm": 356.7,
+    "pixel_u": 278,
+    "pixel_v": 205,
+    "confidence": 0.789
+  },
+  {
+    "detected_x": 400.31,
+    "detected_y": 241.44,
+    "actual_x_mm": 400.2,
+    "actual_y_mm": 247.4,
+    "depth_mm": 334.5,
+    "pixel_u": 254,
+    "pixel_v": 206,
+    "confidence": 0.717
+  },
+  {
+    "detected_x": 206.16,
+    "detected_y": 252.25,
+    "actual_x_mm": 199.9,
+    "actual_y_mm": 247.4,
+    "depth_mm": 360.4,
+    "pixel_u": 456,
+    "pixel_v": 200,
+    "confidence": 0.722
+  },
+  {
+    "detected_x": 1.89,
+    "detected_y": 251.1,
+    "actual_x_mm": 2.5,
+    "actual_y_mm": 251.4,
+    "depth_mm": 345.9,
+    "pixel_u": 662,
+    "pixel_v": 195,
+    "confidence": 0.627
+  },
+  {
+    "detected_x": 209.59,
+    "detected_y": 244.54,
+    "actual_x_mm": 217.5,
+    "actual_y_mm": 246.4,
+    "depth_mm": 365.1,
+    "pixel_u": 444,
+    "pixel_v": 201,
+    "confidence": 0.731
+  },
+  {
+    "detected_x": 12.48,
+    "detected_y": 254.62,
+    "actual_x_mm": 19.1,
+    "actual_y_mm": 251.4,
+    "depth_mm": 352.5,
+    "pixel_u": 644,
+    "pixel_v": 194,
+    "confidence": 0.497
+  },
+  {
+    "detected_x": 233.4,
+    "detected_y": 255.5,
+    "actual_x_mm": 234.0,
+    "actual_y_mm": 248.4,
+    "depth_mm": 353.1,
+    "pixel_u": 422,
+    "pixel_v": 201,
+    "confidence": 0.782
+  },
+  {
+    "detected_x": 46.43,
+    "detected_y": 257.25,
+    "actual_x_mm": 36.5,
+    "actual_y_mm": 248.4,
+    "depth_mm": 368.9,
+    "pixel_u": 623,
+    "pixel_v": 198,
+    "confidence": 0.714
+  },
+  {
+    "detected_x": 266.3,
+    "detected_y": 255.22,
+    "actual_x_mm": 269.5,
+    "actual_y_mm": 248.4,
+    "depth_mm": 403.1,
+    "pixel_u": 391,
+    "pixel_v": 202,
+    "confidence": 0.766
+  },
+  {
+    "detected_x": 73.53,
+    "detected_y": 253.65,
+    "actual_x_mm": 69.9,
+    "actual_y_mm": 248.4,
+    "depth_mm": 355.3,
+    "pixel_u": 588,
+    "pixel_v": 198,
+    "confidence": 0.68
+  },
+  {
+    "detected_x": 291.08,
+    "detected_y": 252.44,
+    "actual_x_mm": 287.4,
+    "actual_y_mm": 248.4,
+    "depth_mm": 367.9,
+    "pixel_u": 371,
+    "pixel_v": 202,
+    "confidence": 0.753
+  },
+  {
+    "detected_x": 93.76,
+    "detected_y": 249.02,
+    "actual_x_mm": 88.6,
+    "actual_y_mm": 249.4,
+    "depth_mm": 359.7,
+    "pixel_u": 566,
+    "pixel_v": 196,
+    "confidence": 0.686
+  },
+  {
+    "detected_x": 301.44,
+    "detected_y": 244.72,
+    "actual_x_mm": 305.9,
+    "actual_y_mm": 249.4,
+    "depth_mm": 353.7,
+    "pixel_u": 352,
+    "pixel_v": 203,
+    "confidence": 0.78
+  },
+  {
+    "detected_x": 333.1,
+    "detected_y": 247.19,
+    "actual_x_mm": 332.2,
+    "actual_y_mm": 249.4,
+    "depth_mm": 352.7,
+    "pixel_u": 331,
+    "pixel_v": 203,
+    "confidence": 0.745
+  },
+  {
+    "detected_x": 324.86,
+    "detected_y": 244.5,
+    "actual_x_mm": 352.0,
+    "actual_y_mm": 249.4,
+    "depth_mm": 376.0,
+    "pixel_u": 308,
+    "pixel_v": 206,
+    "confidence": 0.715
+  },
+  {
+    "detected_x": 365.01,
+    "detected_y": 245.43,
+    "actual_x_mm": 368.0,
+    "actual_y_mm": 249.4,
+    "depth_mm": 355.0,
+    "pixel_u": 291,
+    "pixel_v": 206,
+    "confidence": 0.693
+  },
+  {
+    "detected_x": 400.24,
+    "detected_y": 242.65,
+    "actual_x_mm": 400.0,
+    "actual_y_mm": 249.4,
+    "depth_mm": 333.3,
+    "pixel_u": 256,
+    "pixel_v": 206,
+    "confidence": 0.519
+  },
+  {
+    "detected_x": 197.98,
+    "detected_y": 261.4,
+    "actual_x_mm": 199.3,
+    "actual_y_mm": 250.4,
+    "depth_mm": 399.6,
+    "pixel_u": 459,
+    "pixel_v": 199,
+    "confidence": 0.654
+  },
+  {
+    "detected_x": 398.91,
+    "detected_y": 244.02,
+    "actual_x_mm": 403.1,
+    "actual_y_mm": 247.9,
+    "depth_mm": 338.3,
+    "pixel_u": 246,
+    "pixel_v": 206,
+    "confidence": 0.527
+  },
+  {
+    "detected_x": 2.7,
+    "detected_y": 251.31,
+    "actual_x_mm": 3.9,
+    "actual_y_mm": 249.9,
+    "depth_mm": 334.0,
+    "pixel_u": 665,
+    "pixel_v": 195,
+    "confidence": 0.692
+  },
+  {
+    "detected_x": 388.84,
+    "detected_y": 249.57,
+    "actual_x_mm": 388.8,
+    "actual_y_mm": 255.5,
+    "depth_mm": 360.7,
+    "pixel_u": 263,
+    "pixel_v": 206,
+    "confidence": 0.658
+  },
+  {
+    "detected_x": 184.63,
+    "detected_y": 256.94,
+    "actual_x_mm": 184.5,
+    "actual_y_mm": 254.8,
+    "depth_mm": 569.6,
+    "pixel_u": 475,
+    "pixel_v": 198,
+    "confidence": 0.75
+  },
+  {
+    "detected_x": 399.81,
+    "detected_y": 250.62,
+    "actual_x_mm": 401.8,
+    "actual_y_mm": 254.8,
+    "depth_mm": 356.3,
+    "pixel_u": 252,
+    "pixel_v": 206,
+    "confidence": 0.71
+  },
+  {
+    "detected_x": 193.46,
+    "detected_y": 257.6,
+    "actual_x_mm": 193.4,
+    "actual_y_mm": 254.8,
+    "depth_mm": 363.5,
+    "pixel_u": 466,
+    "pixel_v": 198,
+    "confidence": 0.67
+  },
+  {
+    "detected_x": -0.06,
+    "detected_y": 258.36,
+    "actual_x_mm": 0.0,
+    "actual_y_mm": 254.8,
+    "depth_mm": 373.5,
+    "pixel_u": 664,
+    "pixel_v": 194,
+    "confidence": 0.694
+  },
+  {
+    "detected_x": 393.82,
+    "detected_y": 250.05,
+    "actual_x_mm": 393.9,
+    "actual_y_mm": 254.8,
+    "depth_mm": 426.4,
+    "pixel_u": 258,
+    "pixel_v": 206,
+    "confidence": 0.746
+  },
+  {
+    "detected_x": 211.1,
+    "detected_y": 255.71,
+    "actual_x_mm": 211.0,
+    "actual_y_mm": 252.8,
+    "depth_mm": 400.6,
+    "pixel_u": 448,
+    "pixel_v": 199,
+    "confidence": 0.793
+  },
+  {
+    "detected_x": 17.93,
+    "detected_y": 259.32,
+    "actual_x_mm": 17.8,
+    "actual_y_mm": 252.8,
+    "depth_mm": 360.5,
+    "pixel_u": 645,
+    "pixel_v": 194,
+    "confidence": 0.634
+  },
+  {
+    "detected_x": 414.83,
+    "detected_y": 252.08,
+    "actual_x_mm": 411.0,
+    "actual_y_mm": 254.8,
+    "depth_mm": 343.9,
+    "pixel_u": 237,
+    "pixel_v": 206,
+    "confidence": 0.76
+  },
+  {
+    "detected_x": 202.32,
+    "detected_y": 258.28,
+    "actual_x_mm": 202.2,
+    "actual_y_mm": 254.8,
+    "depth_mm": 388.8,
+    "pixel_u": 457,
+    "pixel_v": 198,
+    "confidence": 0.71
+  },
+  {
+    "detected_x": 2.77,
+    "detected_y": 258.51,
+    "actual_x_mm": 6.6,
+    "actual_y_mm": 254.8,
+    "depth_mm": 340.1,
+    "pixel_u": 661,
+    "pixel_v": 194,
+    "confidence": 0.684
+  },
+  {
+    "detected_x": 212.08,
+    "detected_y": 255.79,
+    "actual_x_mm": 212.0,
+    "actual_y_mm": 254.8,
+    "depth_mm": 394.9,
+    "pixel_u": 447,
+    "pixel_v": 199,
+    "confidence": 0.786
+  },
+  {
+    "detected_x": 20.78,
+    "detected_y": 259.48,
+    "actual_x_mm": 15.8,
+    "actual_y_mm": 254.8,
+    "depth_mm": 366.3,
+    "pixel_u": 642,
+    "pixel_v": 194,
+    "confidence": 0.686
+  },
+  {
+    "detected_x": 407.81,
+    "detected_y": 251.39,
+    "actual_x_mm": 402.7,
+    "actual_y_mm": 254.8,
+    "depth_mm": 357.2,
+    "pixel_u": 244,
+    "pixel_v": 206,
+    "confidence": 0.702
+  },
+  {
+    "detected_x": 4.14,
+    "detected_y": 255.31,
+    "actual_x_mm": 2.0,
+    "actual_y_mm": 254.8,
+    "depth_mm": 360.5,
+    "pixel_u": 661,
+    "pixel_v": 195,
+    "confidence": 0.74
+  },
+  {
+    "detected_x": 398.81,
+    "detected_y": 250.52,
+    "actual_x_mm": 393.4,
+    "actual_y_mm": 254.8,
+    "depth_mm": 372.0,
+    "pixel_u": 253,
+    "pixel_v": 206,
+    "confidence": 0.739
+  },
+  {
+    "detected_x": 385.2,
+    "detected_y": 252.16,
+    "actual_x_mm": 382.6,
+    "actual_y_mm": 254.8,
+    "depth_mm": 367.4,
+    "pixel_u": 268,
+    "pixel_v": 205,
+    "confidence": 0.7
+  },
+  {
+    "detected_x": 182.78,
+    "detected_y": 253.59,
+    "actual_x_mm": 179.7,
+    "actual_y_mm": 254.8,
+    "depth_mm": 410.2,
+    "pixel_u": 477,
+    "pixel_v": 199,
+    "confidence": 0.76
+  },
+  {
+    "detected_x": 207.18,
+    "detected_y": 255.41,
+    "actual_x_mm": 207.0,
+    "actual_y_mm": 254.8,
+    "depth_mm": 388.2,
+    "pixel_u": 452,
+    "pixel_v": 199,
+    "confidence": 0.728
+  },
+  {
+    "detected_x": 13.19,
+    "detected_y": 259.07,
+    "actual_x_mm": 8.0,
+    "actual_y_mm": 254.8,
+    "depth_mm": 365.2,
+    "pixel_u": 650,
+    "pixel_v": 194,
+    "confidence": 0.655
+  },
+  {
+    "detected_x": 406.32,
+    "detected_y": 248.37,
+    "actual_x_mm": 405.6,
+    "actual_y_mm": 254.8,
+    "depth_mm": 334.2,
+    "pixel_u": 244,
+    "pixel_v": 207,
+    "confidence": 0.711
+  },
+  {
+    "detected_x": 197.39,
+    "detected_y": 257.9,
+    "actual_x_mm": 197.2,
+    "actual_y_mm": 254.8,
+    "depth_mm": 359.3,
+    "pixel_u": 462,
+    "pixel_v": 198,
+    "confidence": 0.714
+  },
+  {
+    "detected_x": 2.77,
+    "detected_y": 258.51,
+    "actual_x_mm": 3.3,
+    "actual_y_mm": 254.8,
+    "depth_mm": 365.0,
+    "pixel_u": 661,
+    "pixel_v": 194,
+    "confidence": 0.687
+  },
+  {
+    "detected_x": 399.81,
+    "detected_y": 250.62,
+    "actual_x_mm": 397.1,
+    "actual_y_mm": 254.8,
+    "depth_mm": 358.8,
+    "pixel_u": 252,
+    "pixel_v": 206,
+    "confidence": 0.676
+  },
+  {
+    "detected_x": 192.48,
+    "detected_y": 257.53,
+    "actual_x_mm": 192.3,
+    "actual_y_mm": 254.8,
+    "depth_mm": 360.3,
+    "pixel_u": 467,
+    "pixel_v": 198,
+    "confidence": 0.738
+  },
+  {
+    "detected_x": 0.39,
+    "detected_y": 255.12,
+    "actual_x_mm": 0.0,
+    "actual_y_mm": 254.8,
+    "depth_mm": 362.5,
+    "pixel_u": 665,
+    "pixel_v": 195,
+    "confidence": 0.743
+  },
+  {
+    "detected_x": 394.15,
+    "detected_y": 220.84,
+    "actual_x_mm": 398.1,
+    "actual_y_mm": 212.0,
+    "depth_mm": 391.1,
+    "pixel_u": 239,
+    "pixel_v": 218,
+    "confidence": 0.682
+  },
+  {
+    "detected_x": 193.86,
+    "detected_y": 222.69,
+    "actual_x_mm": 193.9,
+    "actual_y_mm": 212.0,
+    "depth_mm": 303.6,
+    "pixel_u": 466,
+    "pixel_v": 210,
+    "confidence": 0.484
+  },
+  {
+    "detected_x": 8.67,
+    "detected_y": 226.48,
+    "actual_x_mm": 0.8,
+    "actual_y_mm": 214.0,
+    "depth_mm": 355.5,
+    "pixel_u": 671,
+    "pixel_v": 205,
+    "confidence": 0.75
+  },
+  {
+    "detected_x": 382.75,
+    "detected_y": 221.89,
+    "actual_x_mm": 385.8,
+    "actual_y_mm": 214.0,
+    "depth_mm": 345.6,
+    "pixel_u": 253,
+    "pixel_v": 217,
+    "confidence": 0.658
+  },
+  {
+    "detected_x": 186.15,
+    "detected_y": 215.18,
+    "actual_x_mm": 186.2,
+    "actual_y_mm": 211.0,
+    "depth_mm": 308.5,
+    "pixel_u": 475,
+    "pixel_v": 213,
+    "confidence": 0.624
+  },
+  {
+    "detected_x": 369.56,
+    "detected_y": 218.39,
+    "actual_x_mm": 373.4,
+    "actual_y_mm": 211.0,
+    "depth_mm": 331.8,
+    "pixel_u": 266,
+    "pixel_v": 218,
+    "confidence": 0.619
+  },
+  {
+    "detected_x": 167.81,
+    "detected_y": 214.16,
+    "actual_x_mm": 167.9,
+    "actual_y_mm": 211.0,
+    "depth_mm": 338.8,
+    "pixel_u": 496,
+    "pixel_v": 213,
+    "confidence": 0.491
+  },
+  {
+    "detected_x": 333.54,
+    "detected_y": 215.07,
+    "actual_x_mm": 336.5,
+    "actual_y_mm": 211.0,
+    "depth_mm": 327.5,
+    "pixel_u": 306,
+    "pixel_v": 218,
+    "confidence": 0.782
+  },
+  {
+    "detected_x": 132.53,
+    "detected_y": 219.17,
+    "actual_x_mm": 132.5,
+    "actual_y_mm": 211.0,
+    "depth_mm": 497.7,
+    "pixel_u": 535,
+    "pixel_v": 210,
+    "confidence": 0.559
+  },
+  {
+    "detected_x": 309.45,
+    "detected_y": 215.13,
+    "actual_x_mm": 310.4,
+    "actual_y_mm": 211.0,
+    "depth_mm": 312.5,
+    "pixel_u": 334,
+    "pixel_v": 217,
+    "confidence": 0.75
+  },
+  {
+    "detected_x": 106.19,
+    "detected_y": 215.7,
+    "actual_x_mm": 106.0,
+    "actual_y_mm": 211.0,
+    "depth_mm": 323.0,
+    "pixel_u": 566,
+    "pixel_v": 211,
+    "confidence": 0.615
+  },
+  {
+    "detected_x": 286.11,
+    "detected_y": 215.41,
+    "actual_x_mm": 288.9,
+    "actual_y_mm": 211.0,
+    "depth_mm": 330.7,
+    "pixel_u": 361,
+    "pixel_v": 216,
+    "confidence": 0.764
+  },
+  {
+    "detected_x": 86.41,
+    "detected_y": 217.18,
+    "actual_x_mm": 86.1,
+    "actual_y_mm": 211.0,
+    "depth_mm": 354.8,
+    "pixel_u": 588,
+    "pixel_v": 210,
+    "confidence": 0.656
+  },
+  {
+    "detected_x": 66.49,
+    "detected_y": 218.75,
+    "actual_x_mm": 63.1,
+    "actual_y_mm": 211.0,
+    "depth_mm": 300.9,
+    "pixel_u": 610,
+    "pixel_v": 209,
+    "confidence": 0.623
+  },
+  {
+    "detected_x": 239.6,
+    "detected_y": 214.15,
+    "actual_x_mm": 240.2,
+    "actual_y_mm": 208.0,
+    "depth_mm": 334.0,
+    "pixel_u": 414,
+    "pixel_v": 215,
+    "confidence": 0.649
   }
 ]

@@ -23,6 +23,7 @@ import time
 import threading
 import os
 import yaml
+from collections import deque
 
 
 class RebarDetectionNode(Node):
@@ -38,12 +39,14 @@ class RebarDetectionNode(Node):
                                '/home/koceti/ros2_ws/src/rebar_vision/model/best_260313.pt')
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('depth_kernel_size', 5)
+        self.declare_parameter('depth_buffer_size', 5)  # temporal median 프레임 수
         self.declare_parameter('max_depth_m', 2.0)
         self.declare_parameter('min_depth_m', 0.05)
         self.declare_parameter('grid_rows', 2)
         self.declare_parameter('grid_cols', 3)
         self.declare_parameter('dedup_distance_mm', 40.0)
         self.declare_parameter('detection_strategy', 'cross')  # cross, merge, single
+        self.declare_parameter('calibration_model', 'nodepth')  # gbr, nodepth, linear
 
         # 카메라 외부 파라미터 (position: mm, rotation: degrees)
         self.declare_parameter('left_camera.position', [-200.0, 100.0, 108.0])
@@ -55,12 +58,14 @@ class RebarDetectionNode(Node):
         self.model_path = self.get_parameter('model_path').value
         self.confidence_threshold = self.get_parameter('confidence_threshold').value
         self.depth_kernel_size = self.get_parameter('depth_kernel_size').value
+        self.depth_buffer_size = self.get_parameter('depth_buffer_size').value
         self.max_depth_m = self.get_parameter('max_depth_m').value
         self.min_depth_m = self.get_parameter('min_depth_m').value
         self.grid_rows = self.get_parameter('grid_rows').value
         self.grid_cols = self.get_parameter('grid_cols').value
         self.dedup_distance_mm = self.get_parameter('dedup_distance_mm').value
         self.detection_strategy = self.get_parameter('detection_strategy').value
+        self.calibration_model_type = self.get_parameter('calibration_model').value
 
         self.camera_extrinsics = {
             'left': {
@@ -137,6 +142,10 @@ class RebarDetectionNode(Node):
         self.left_frames = None   # (rgb_msg, depth_msg)
         self.right_frames = None  # (rgb_msg, depth_msg)
 
+        # Temporal depth 버퍼 (numpy array 형태로 저장)
+        self.left_depth_buffer = deque(maxlen=self.depth_buffer_size)
+        self.right_depth_buffer = deque(maxlen=self.depth_buffer_size)
+
         # Camera Info 구독
         self.left_info_sub = self.create_subscription(
             CameraInfo,
@@ -176,10 +185,14 @@ class RebarDetectionNode(Node):
                 '    Left cam → Y- (먼쪽) 3pt, Right cam → Y+ (먼쪽) 3pt'
             )
         for cam, model in self.calibration_models.items():
-            self.get_logger().info(
-                f'  캘리브레이션[{cam}]: {model["num_points"]}쌍, '
-                f'X R²={model["x_r2"]:.4f}, Y R²={model["y_r2"]:.4f}'
-            )
+            mtype = model.get('type', 'linear')
+            info = f'  캘리브레이션[{cam}]: {mtype}, {model["num_points"]}쌍'
+            if mtype == 'gbr':
+                info += f', 평균오차={model.get("mean_error", 0):.1f}mm'
+            else:
+                info += (f', X R²={model.get("x_r2", 0):.4f}, '
+                         f'Y R²={model.get("y_r2", 0):.4f}')
+            self.get_logger().info(info)
         if not self.calibration_models:
             self.get_logger().warn('  캘리브레이션 모델 없음 → 기하학적 변환 사용')
         self.get_logger().info('=' * 60)
@@ -211,11 +224,41 @@ class RebarDetectionNode(Node):
             self.get_logger().error(f'모델 로드 실패: {e}')
 
     def _load_calibration_models(self):
-        """캘리브레이션 YAML에서 회귀 계수 로드"""
-        calib_files = {
-            'left': '/home/koceti/ros2_ws/data/calibration/calibration_result_left.yaml',
-            'right': '/home/koceti/ros2_ws/data/calibration/calibration_result_right.yaml',
+        """캘리브레이션 모델 로드 (calibration_model 파라미터에 따라 선택)
+
+        모델 타입:
+          - gbr: GBR joblib 모델 (pixel_u, pixel_v, depth_mm → X, Y)
+          - nodepth: depth 없는 다항식 회귀 (pixel_u, pixel_v → X, Y)
+          - linear: 기존 다중선형회귀 (pixel_u, pixel_v, depth_mm → X, Y)
+        """
+        model_type = self.calibration_model_type
+        self.get_logger().info(f'캘리브레이션 모델 타입: {model_type}')
+
+        # 모델 타입별 파일 경로
+        calib_dir = '/home/koceti/ros2_ws/data/calibration'
+        file_map = {
+            'gbr': {
+                'left': os.path.join(calib_dir, 'calibration_result_gbr_left.yaml'),
+                'right': os.path.join(calib_dir, 'calibration_result_gbr_right.yaml'),
+            },
+            'nodepth': {
+                'left': os.path.join(calib_dir, 'calibration_result_nodepth_left.yaml'),
+                'right': os.path.join(calib_dir, 'calibration_result_nodepth_right.yaml'),
+            },
+            'linear': {
+                'left': os.path.join(calib_dir, 'calibration_result_left.yaml'),
+                'right': os.path.join(calib_dir, 'calibration_result_right.yaml'),
+            },
         }
+
+        if model_type not in file_map:
+            self.get_logger().error(
+                f'알 수 없는 캘리브레이션 모델: {model_type} '
+                f'(gbr, nodepth, linear 중 선택)')
+            return
+
+        calib_files = file_map[model_type]
+
         for cam, path in calib_files.items():
             if not os.path.exists(path):
                 self.get_logger().info(f'캘리브레이션 파일 없음: {path}')
@@ -224,29 +267,107 @@ class RebarDetectionNode(Node):
                 with open(path, 'r') as f:
                     data = yaml.safe_load(f)
                 cal = data['calibration']
-                self.calibration_models[cam] = {
-                    'x_coeffs': np.array(cal['x_mapping']['coeffs']),
-                    'y_coeffs': np.array(cal['y_mapping']['coeffs']),
-                    'x_r2': cal['x_mapping']['r_squared'],
-                    'y_r2': cal['y_mapping']['r_squared'],
-                    'num_points': cal['num_points'],
-                }
+
+                if model_type == 'gbr':
+                    self._load_gbr_model(cam, cal)
+                elif model_type == 'nodepth':
+                    self._load_nodepth_model(cam, cal)
+                else:  # linear
+                    self._load_linear_model(cam, cal)
+
             except Exception as e:
                 self.get_logger().error(f'캘리브레이션 로드 실패 [{cam}]: {e}')
 
-    def _apply_calibration(self, pixel_u, pixel_v, depth_mm, camera_side):
-        """캘리브레이션 회귀 모델로 로봇 좌표 (X, Y) mm 계산
+    def _load_gbr_model(self, cam, cal):
+        """GBR joblib 모델 로드"""
+        import joblib
+        model_x_path = cal.get('model_x_file', '')
+        model_y_path = cal.get('model_y_file', '')
+        if not os.path.exists(model_x_path) or not os.path.exists(model_y_path):
+            self.get_logger().error(f'GBR joblib 파일 없음 [{cam}]: {model_x_path}')
+            return
+        self.calibration_models[cam] = {
+            'type': 'gbr',
+            'model_x': joblib.load(model_x_path),
+            'model_y': joblib.load(model_y_path),
+            'num_points': cal.get('num_points', 0),
+            'mean_error': cal.get('mean_error_mm', 0),
+        }
+        self.get_logger().info(
+            f'  [{cam}] GBR 로드: {cal.get("num_points", 0)}쌍, '
+            f'평균오차={cal.get("mean_error_mm", 0):.1f}mm')
 
-        X = a*u + b*v + c*d + e*u*d + f*v*d + g
-        Y = a*u + b*v + c*d + e*u*d + f*v*d + g
+    def _load_nodepth_model(self, cam, cal):
+        """depth 없는 다항식 회귀 계수 로드"""
+        self.calibration_models[cam] = {
+            'type': 'nodepth',
+            'x_coeffs': np.array(cal['x_mapping']['coeffs']),
+            'y_coeffs': np.array(cal['y_mapping']['coeffs']),
+            'x_r2': cal['x_mapping']['r_squared'],
+            'y_r2': cal['y_mapping']['r_squared'],
+            'num_points': cal.get('num_points', 0),
+        }
+        self.get_logger().info(
+            f'  [{cam}] nodepth 로드: {cal.get("num_points", 0)}쌍, '
+            f'X R²={cal["x_mapping"]["r_squared"]:.4f}, '
+            f'Y R²={cal["y_mapping"]["r_squared"]:.4f}')
+
+    def _load_linear_model(self, cam, cal):
+        """기존 다중선형회귀 계수 로드"""
+        self.calibration_models[cam] = {
+            'type': 'linear',
+            'x_coeffs': np.array(cal['x_mapping']['coeffs']),
+            'y_coeffs': np.array(cal['y_mapping']['coeffs']),
+            'x_r2': cal['x_mapping']['r_squared'],
+            'y_r2': cal['y_mapping']['r_squared'],
+            'num_points': cal.get('num_points', 0),
+        }
+        self.get_logger().info(
+            f'  [{cam}] linear 로드: {cal.get("num_points", 0)}쌍, '
+            f'X R²={cal["x_mapping"]["r_squared"]:.4f}, '
+            f'Y R²={cal["y_mapping"]["r_squared"]:.4f}')
+
+    def _apply_calibration(self, pixel_u, pixel_v, depth_mm, camera_side):
+        """캘리브레이션 모델로 로봇 좌표 (X, Y) mm 계산
+
+        모델 타입에 따라 자동 분기:
+          - gbr: GBR predict([[u, v, depth_mm]])
+          - nodepth: X = a*u + b*v + c*u*v + d*u² + e*v² + f
+          - linear: 6/8계수 다중선형회귀
         """
         model = self.calibration_models[camera_side]
-        features = np.array([
-            pixel_u, pixel_v, depth_mm,
-            pixel_u * depth_mm, pixel_v * depth_mm, 1.0
-        ])
-        x_mm = float(np.dot(model['x_coeffs'], features))
-        y_mm = float(np.dot(model['y_coeffs'], features))
+        model_type = model.get('type', 'linear')
+
+        if model_type == 'gbr':
+            features = np.array([[pixel_u, pixel_v, depth_mm]])
+            x_mm = float(model['model_x'].predict(features)[0])
+            y_mm = float(model['model_y'].predict(features)[0])
+
+        elif model_type == 'nodepth':
+            features = np.array([
+                pixel_u, pixel_v,
+                pixel_u * pixel_v,
+                pixel_u ** 2, pixel_v ** 2, 1.0
+            ])
+            x_mm = float(np.dot(model['x_coeffs'], features))
+            y_mm = float(np.dot(model['y_coeffs'], features))
+
+        else:  # linear
+            n_coeffs = len(model['x_coeffs'])
+            if n_coeffs == 8:
+                features = np.array([
+                    pixel_u, pixel_v, depth_mm,
+                    pixel_u * depth_mm, pixel_v * depth_mm,
+                    pixel_u ** 2, pixel_v ** 2, 1.0
+                ])
+            else:  # 6계수
+                features = np.array([
+                    pixel_u, pixel_v, depth_mm,
+                    pixel_u * depth_mm, pixel_v * depth_mm, 1.0
+                ])
+            x_mm = float(np.dot(model['x_coeffs'], features))
+            y_mm = float(np.dot(model['y_coeffs'], features))
+
         return x_mm, y_mm
 
     # ============================================
@@ -256,12 +377,16 @@ class RebarDetectionNode(Node):
         """좌측 카메라 프레임 캐싱"""
         with self.frame_lock:
             self.left_frames = (rgb_msg, depth_msg)
+            depth_np = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
+            self.left_depth_buffer.append(depth_np)
             self._update_cached_frames()
 
     def _right_sync_callback(self, rgb_msg, depth_msg):
         """우측 카메라 프레임 캐싱"""
         with self.frame_lock:
             self.right_frames = (rgb_msg, depth_msg)
+            depth_np = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
+            self.right_depth_buffer.append(depth_np)
             self._update_cached_frames()
 
     def _update_cached_frames(self):
@@ -315,6 +440,8 @@ class RebarDetectionNode(Node):
         # 캐시된 프레임 확인
         with self.frame_lock:
             frames = self.cached_frames
+            left_depth_buf = list(self.left_depth_buffer)
+            right_depth_buf = list(self.right_depth_buffer)
 
         if frames is None:
             response.success = False
@@ -360,7 +487,8 @@ class RebarDetectionNode(Node):
                         self.left_camera_info,
                         self.camera_extrinsics['left'],
                         camera_id=0,
-                        conf_threshold=conf_threshold
+                        conf_threshold=conf_threshold,
+                        depth_buffer=left_depth_buf
                     )
                     # Left 카메라: 먼 쪽 = Y가 작은 포인트 (Y-)
                     left_dets = self._filter_far_side(
@@ -374,7 +502,8 @@ class RebarDetectionNode(Node):
                         self.right_camera_info,
                         self.camera_extrinsics['right'],
                         camera_id=1,
-                        conf_threshold=conf_threshold
+                        conf_threshold=conf_threshold,
+                        depth_buffer=right_depth_buf
                     )
                     # Right 카메라: 먼 쪽 = Y가 큰 포인트 (Y+)
                     right_dets = self._filter_far_side(
@@ -393,7 +522,8 @@ class RebarDetectionNode(Node):
                             self.left_camera_info,
                             self.camera_extrinsics['left'],
                             camera_id=0,
-                            conf_threshold=conf_threshold
+                            conf_threshold=conf_threshold,
+                            depth_buffer=left_depth_buf
                         )
                         all_detections.extend(dets)
 
@@ -404,7 +534,8 @@ class RebarDetectionNode(Node):
                             self.right_camera_info,
                             self.camera_extrinsics['right'],
                             camera_id=1,
-                            conf_threshold=conf_threshold
+                            conf_threshold=conf_threshold,
+                            depth_buffer=right_depth_buf
                         )
                         all_detections.extend(dets)
 
@@ -448,7 +579,7 @@ class RebarDetectionNode(Node):
     # 단일 카메라 검출
     # ============================================
     def _detect_single_camera(self, rgb, depth, camera_info, extrinsics,
-                              camera_id, conf_threshold):
+                              camera_id, conf_threshold, depth_buffer=None):
         """단일 카메라에서 교차점 검출 + 3D 변환"""
         detections = []
 
@@ -470,8 +601,8 @@ class RebarDetectionNode(Node):
             cy = int((y1 + y2) / 2)
             confidence = float(box.conf[0])
 
-            # 깊이 샘플링 (median 필터)
-            depth_m = self._sample_depth(depth, cx, cy)
+            # 깊이 샘플링 (공간 median + temporal median)
+            depth_m = self._sample_depth(depth, cx, cy, depth_buffer)
             if depth_m is None:
                 continue
 
@@ -513,8 +644,8 @@ class RebarDetectionNode(Node):
     # ============================================
     # 깊이 샘플링
     # ============================================
-    def _sample_depth(self, depth_image, u, v):
-        """깊이 이미지에서 중앙값 기반 깊이 추출 (미터)"""
+    def _sample_depth_frame(self, depth_image, u, v):
+        """단일 프레임에서 공간 median depth 추출 (미터)"""
         h, w = depth_image.shape[:2]
         half = self.depth_kernel_size // 2
 
@@ -532,6 +663,24 @@ class RebarDetectionNode(Node):
             return None
 
         return float(np.median(valid))
+
+    def _sample_depth(self, depth_image, u, v, depth_buffer=None):
+        """깊이 추출: 공간 median + temporal median (미터)
+
+        depth_buffer가 있으면 최근 N프레임에서 각각 공간 median을 뽑고
+        그 값들의 median을 취해 순간 depth 스파이크를 제거한다.
+        """
+        if depth_buffer and len(depth_buffer) > 1:
+            samples = []
+            for frame in depth_buffer:
+                val = self._sample_depth_frame(frame, u, v)
+                if val is not None:
+                    samples.append(val)
+            if samples:
+                return float(np.median(samples))
+            return None
+
+        return self._sample_depth_frame(depth_image, u, v)
 
     # ============================================
     # 좌표 변환

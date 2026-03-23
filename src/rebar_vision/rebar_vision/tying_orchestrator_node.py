@@ -100,6 +100,11 @@ class TyingOrchestratorNode(Node):
         self.declare_parameter('max_stage_x_mm', 411.0)
         self.declare_parameter('max_stage_y_mm', 288.0)
         self.declare_parameter('max_yaw_deg', 399.0)
+        # Y축 자세별 가동 범위 (2026-03-18 실측)
+        self.declare_parameter('right_cam_y_min_mm', 0.0)
+        self.declare_parameter('right_cam_y_max_mm', 142.0)
+        self.declare_parameter('left_cam_y_min_mm', 124.0)
+        self.declare_parameter('left_cam_y_max_mm', 288.0)
         self.declare_parameter('inter_point_delay', 0.5)
         self.declare_parameter('detection_retry_count', 3)
         self.declare_parameter('detection_retry_delay', 1.0)
@@ -138,6 +143,10 @@ class TyingOrchestratorNode(Node):
         self.max_stage_x_mm = self.get_parameter('max_stage_x_mm').value
         self.max_stage_y_mm = self.get_parameter('max_stage_y_mm').value
         self.max_yaw_deg = self.get_parameter('max_yaw_deg').value
+        self.right_cam_y_min = self.get_parameter('right_cam_y_min_mm').value
+        self.right_cam_y_max = self.get_parameter('right_cam_y_max_mm').value
+        self.left_cam_y_min = self.get_parameter('left_cam_y_min_mm').value
+        self.left_cam_y_max = self.get_parameter('left_cam_y_max_mm').value
         self.inter_point_delay = self.get_parameter('inter_point_delay').value
         self.detection_retry_count = self.get_parameter('detection_retry_count').value
         self.detection_retry_delay = self.get_parameter('detection_retry_delay').value
@@ -769,11 +778,18 @@ class TyingOrchestratorNode(Node):
 
         # 작업영역 범위 밖 클러스터 사전 제거 (보간 전)
         margin = 30.0  # 클러스터 중심이 범위+마진 밖이면 노이즈로 판단
+        # 자세별 Y 가동 범위
+        if camera_side == 'right':
+            y_min_limit = self.right_cam_y_min - margin
+            y_max_limit = self.right_cam_y_max + margin
+        else:
+            y_min_limit = self.left_cam_y_min - margin
+            y_max_limit = self.left_cam_y_max + margin
         valid_clusters = []
         for c in clusters:
             if (c['x'] < -margin or c['x'] > self.max_stage_x_mm + margin
-                    or c['y'] < -margin
-                    or c['y'] > self.max_stage_y_mm + margin):
+                    or c['y'] < y_min_limit
+                    or c['y'] > y_max_limit):
                 self.get_logger().info(
                     f'  [{camera_side}] 범위 외 클러스터 제거: '
                     f'X={c["x"]:.1f}, Y={c["y"]:.1f}')
@@ -860,22 +876,28 @@ class TyingOrchestratorNode(Node):
         # Right: X내림차순(큰→작은), Left: X오름차순(작은→큰)
         left_coords_asc = list(reversed(left_coords))
         for side, coords in [('right', right_coords), ('left', left_coords_asc)]:
+            # 자세별 Y 가동 범위
+            if side == 'right':
+                y_min_safe = self.right_cam_y_min
+                y_max_safe = self.right_cam_y_max
+            else:
+                y_min_safe = self.left_cam_y_min
+                y_max_safe = self.left_cam_y_max
             for x, y in coords:
-                # 소폭 음수 클램핑
-                if -clamp_margin <= x < 0:
-                    self.get_logger().info(f'  X 클램핑: {x:.1f}mm → 0.0mm')
-                    x = 0.0
-                if -clamp_margin <= y < 0:
-                    self.get_logger().info(f'  Y 클램핑: {y:.1f}mm → 0.0mm')
-                    y = 0.0
-                # 범위 밖 제거
-                if x < -clamp_margin or y < -clamp_margin:
-                    self.get_logger().warn(
-                        f'  범위 외 제거: X={x:.1f}, Y={y:.1f} (음수)')
+                # 음수 좌표 스킵
+                if x < 0 or y < 0:
+                    self.get_logger().info(
+                        f'  음수 스킵: X={x:.1f}mm, Y={y:.1f}mm')
                     continue
                 if x > self.max_stage_x_mm or y > self.max_stage_y_mm:
                     self.get_logger().warn(
                         f'  범위 외 제거: X={x:.1f}, Y={y:.1f} (초과)')
+                    continue
+                # 자세별 Y 범위 필터링
+                if y < y_min_safe or y > y_max_safe:
+                    self.get_logger().info(
+                        f'  [{side}] Y 범위 외 스킵: Y={y:.1f}mm '
+                        f'(허용: {y_min_safe}~{y_max_safe}mm)')
                     continue
                 points.append((None, x, y, side))
 

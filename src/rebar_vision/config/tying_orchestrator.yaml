@@ -13,8 +13,14 @@ tying_orchestrator:
 
     # 스테이지 이동 범위 제한 (2026-03-04 실측)
     max_stage_x_mm: 411.0        # X축 최대 스트로크 (실측)
-    max_stage_y_mm: 288.0        # Y축 스트로크 (결속기 간섭 방지)
+    max_stage_y_mm: 288.0        # Y축 전체 스트로크 (물리적 한계)
     max_yaw_deg: 399.0           # Yaw 풀 스트로크
+
+    # Y축 자세별 가동 범위 (2026-03-18 실측, 결속기 간섭 한계)
+    right_cam_y_min_mm: 0.0      # Right cam 자세 Y 최소
+    right_cam_y_max_mm: 142.0    # Right cam 자세 Y 최대
+    left_cam_y_min_mm: 124.0     # Left cam 자세 Y 최소
+    left_cam_y_max_mm: 288.0     # Left cam 자세 Y 최대
 
     # Yaw 자세 (홈 기준 오프셋, 절대값 = home_ref_yaw + offset)
     yaw_right_cam_offset: -3.0   # Right cam 작업자세 (홈 기준 -3°)
@@ -28,7 +34,7 @@ tying_orchestrator:
 
     # Z축 결속 파라미터
     z_home_offset_mm: 10.0       # 호밍 후 Z 대기위치 (홈에서 하강 거리)
-    tying_z_down_mm: 10.0        # 결속 시 추가 Z 하강 (대기위치에서)
+    tying_z_down_mm: 15.0        # 결속 시 추가 Z 하강 (대기위치에서)
     deg_per_mm_z: 11.0           # Z축: 1mm = 11.0°
     z_speed_dps: 1000.0          # Z축 속도 (degree/s)
     z_settle_margin: 0.1         # Z축 이동 후 추가 대기 마진 (초)
