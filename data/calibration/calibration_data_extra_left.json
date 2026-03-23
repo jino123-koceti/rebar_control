@@ -98,5 +98,25 @@
     "pixel_u": 130,
     "pixel_v": 206,
     "confidence": 0.421
+  },
+  {
+    "detected_x": -11.93,
+    "detected_y": 441.94,
+    "actual_x_mm": 0.0,
+    "actual_y_mm": 270.0,
+    "depth_mm": 351.9,
+    "pixel_u": 682,
+    "pixel_v": 196,
+    "confidence": 0.591
+  },
+  {
+    "detected_x": -11.49,
+    "detected_y": 440.98,
+    "actual_x_mm": 0.0,
+    "actual_y_mm": 270.0,
+    "depth_mm": 350.9,
+    "pixel_u": 683,
+    "pixel_v": 196,
+    "confidence": 0.58
   }
 ]

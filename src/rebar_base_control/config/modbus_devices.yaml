@@ -3,7 +3,7 @@
 modbus_controller:
   ros__parameters:
     # Seengrip Gripper (Modbus RTU)
-    seengrip_port: '/dev/ttyUSB0'
+    seengrip_port: '/dev/seengrip_gripper'
     seengrip_baudrate: 115200
     seengrip_slave_id: 1
 
