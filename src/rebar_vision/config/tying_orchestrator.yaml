@@ -34,7 +34,7 @@ tying_orchestrator:
 
     # Z축 결속 파라미터
     z_home_offset_mm: 100.0      # 호밍 후 Z 대기위치 (홈에서 하강 거리)
-    tying_z_down_mm: 200.0       # 결속 시 추가 Z 하강 (대기위치에서)
+    tying_z_down_mm: 250.0       # 결속 시 추가 Z 하강 (대기위치에서)
     deg_per_mm_z: 2.69           # Z축: 1mm = 2.69°
     z_speed_dps: 1000.0          # Z축 속도 (degree/s)
     z_settle_margin: 0.1         # Z축 이동 후 추가 대기 마진 (초)

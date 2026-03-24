@@ -1,40 +1,70 @@
 calibration:
   camera: Right Camera (zedxmini2)
-  max_error_mm: 29.92
-  mean_error_mm: 7.93
+  max_error_mm: 34.88
+  mean_error_mm: 11.04
   method: multiple_linear_regression_with_cross_terms
-  num_points: 87
+  num_points: 150
   x_mapping:
     coeffs:
-    - -0.098475
-    - 3.787562
-    - 0.421015
-    - 0.003061
-    - -0.010863
-    - -472.487443
-    formula: X = a*u + b*v + c*d + e*u*d + f*v*d + g
+    - 0.732049
+    - 2.488171
+    - -0.253843
+    - 0.000707
+    - -0.000639
+    - -1.1e-05
+    - -0.006543
+    - -433.917084
+    formula: X = a*u + b*v + c*d + e*u*d + f*v*d + g*u^2 + h*v^2 + i
     inputs:
     - pixel_u
     - pixel_v
     - depth_mm
     - pixel_u*depth
     - pixel_v*depth
+    - pixel_u^2
+    - pixel_v^2
     - '1'
-    r_squared: 0.9963
+    r_squared: 0.9931
   y_mapping:
     coeffs:
-    - -0.096518
-    - 4.069838
-    - 0.388748
-    - 0.0002
-    - -0.002594
-    - -671.566201
-    formula: Y = a*u + b*v + c*d + e*u*d + f*v*d + g
+    - -0.048207
+    - -3.889357
+    - -1.276184
+    - 5.4e-05
+    - 0.006671
+    - 1.6e-05
+    - 0.012075
+    - 372.057808
+    formula: Y = a*u + b*v + c*d + e*u*d + f*v*d + g*u^2 + h*v^2 + i
     inputs:
     - pixel_u
     - pixel_v
     - depth_mm
     - pixel_u*depth
     - pixel_v*depth
+    - pixel_u^2
+    - pixel_v^2
     - '1'
-    r_squared: 0.9497
+    r_squared: 0.9494
+  z_mapping:
+    coeffs:
+    - -1.109099
+    - -131.53574
+    - -10.060271
+    - 0.001544
+    - 0.050226
+    - 0.000493
+    - 0.30236
+    - 14750.482359
+    formula: Z = a*u + b*v + c*d + e*u*d + f*v*d + g*u^2 + h*v^2 + i
+    inputs:
+    - pixel_u
+    - pixel_v
+    - depth_mm
+    - pixel_u*depth
+    - pixel_v*depth
+    - pixel_u^2
+    - pixel_v^2
+    - '1'
+    num_z_points: 31
+    r_squared: 0.1275

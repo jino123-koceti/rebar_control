@@ -996,7 +996,7 @@ class RebarController(Node):
                 # TYING_START 발행
                 tying_cmd = json.dumps({
                     'command': 'TYING_START',
-                    'speed': 50,
+                    'speed': 100,
                     'direction': tying_dir,
                 })
                 cmd_msg = String()

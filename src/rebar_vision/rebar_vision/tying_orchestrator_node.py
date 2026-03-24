@@ -466,15 +466,15 @@ class TyingOrchestratorNode(Node):
         if (self.control_mode == 'tying'
                 and self.prev_control_mode != 'tying'
                 and self.state == TyingState.IDLE):
-            # 기본 속도 50%, 반복 OFF
-            self.speed_percent = 50.0
-            self.effective_stage_speed = self.stage_max_speed * 0.5
-            self.effective_z_speed = self.z_speed * 0.5
+            # 기본 속도 100%, 반복 OFF
+            self.speed_percent = 100.0
+            self.effective_stage_speed = self.stage_max_speed * 1.0
+            self.effective_z_speed = self.z_speed * 1.0
             self.repeat_mode = False
             self.tying_pass = 'normal'
             self.get_logger().info('=' * 60)
             self.get_logger().info(
-                f'[AUTO] Tying 모드 진입 - 속도 50% '
+                f'[AUTO] Tying 모드 진입 - 속도 100% '
                 f'(XY:{self.effective_stage_speed:.0f}dps)')
             self.get_logger().info('=' * 60)
             self._start_detection()
