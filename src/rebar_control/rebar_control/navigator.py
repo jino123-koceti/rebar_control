@@ -224,6 +224,16 @@ class Navigator(Node):
         self.work_area = None  # {'start': {x,y,theta}, 'end': {x,y,theta}, 'corners': [...], 'width': float, 'height': float}
         self.current_pose = {'x': 0.0, 'y': 0.0, 'theta': 0.0}  # mm, mm, rad
 
+        # 횡이동 오프셋 (encoder_odom에 반영 안 되는 Y 이동량)
+        self.lateral_y_offset = 0.0  # mm
+        self.mm_per_rotation = 44.0  # 1회전 = 44mm (실측: 9회전=396mm)
+        self.lateral_complete_sub = self.create_subscription(
+            String,
+            '/lateral_motion_complete',
+            self._lateral_complete_callback,
+            10
+        )
+
         # 로봇 위치 구독 - 엔코더 odometry 기반 (영역 설정/경로 추종 스케일 통일)
         self.encoder_odom_sub = self.create_subscription(
             PoseStamped,
@@ -952,6 +962,25 @@ class Navigator(Node):
         msg.data = json.dumps(feedback_data)
         self.feedback_pub.publish(msg)
 
+    def _lateral_complete_callback(self, msg: String):
+        """횡이동 완료 시 Y 오프셋 누적"""
+        try:
+            parts = msg.data.split(':')
+            if parts[0] not in ('MANUAL', 'AUTO') or len(parts) < 3:
+                return
+            direction = parts[1]
+            turns = float(parts[2])
+            dy_mm = turns * self.mm_per_rotation
+            if direction == '+':
+                self.lateral_y_offset += dy_mm
+            else:
+                self.lateral_y_offset -= dy_mm
+            self.get_logger().info(
+                f"횡이동 오프셋: {direction}{dy_mm:.0f}mm, 누적={self.lateral_y_offset:.0f}mm"
+            )
+        except Exception:
+            pass
+
     def encoder_odom_callback(self, msg):
         """로봇 위치 업데이트 (엔코더 odometry - 영역설정/경로추종 스케일 통일)
 
@@ -959,7 +988,7 @@ class Navigator(Node):
         제어용으로 부호 반전하여 cmd_vel 방향과 일치시킴
         """
         self.current_pose['x'] = -msg.pose.position.x * 1000.0  # m → mm, 부호 반전
-        self.current_pose['y'] = -msg.pose.position.y * 1000.0  # m → mm, 부호 반전
+        self.current_pose['y'] = -msg.pose.position.y * 1000.0 + self.lateral_y_offset  # m → mm, 부호 반전 + 횡이동 오프셋
         siny = 2.0 * (msg.pose.orientation.w * msg.pose.orientation.z +
                        msg.pose.orientation.x * msg.pose.orientation.y)
         cosy = 1.0 - 2.0 * (msg.pose.orientation.y ** 2 + msg.pose.orientation.z ** 2)
@@ -1135,14 +1164,27 @@ class Navigator(Node):
             self.get_logger().info(f"  면적: {width * height / 1e6:.2f} m²")
         self.get_logger().info("=" * 60)
 
+        # UI용 work_area: corners를 로컬→odom 좌표로 변환
+        origin = self._area_origin
+        cos_t = math.cos(origin['theta'])
+        sin_t = math.sin(origin['theta'])
+        ui_corners = []
+        for c in corners:
+            odom_x = origin['x'] + c['x'] * cos_t - c['y'] * sin_t
+            odom_y = origin['y'] + c['x'] * sin_t + c['y'] * cos_t
+            ui_corners.append({'x': odom_x, 'y': odom_y})
+
+        ui_work_area = dict(self.work_area)
+        ui_work_area['corners'] = ui_corners
+
         # 작업영역 토픽 발행 (rebar_publisher가 UI에 전달)
         area_msg = String()
-        area_msg.data = json.dumps(self.work_area)
+        area_msg.data = json.dumps(ui_work_area)
         self.work_area_pub.publish(area_msg)
 
         # UI에 완료 피드백
         self._publish_area_feedback('area_setup_complete', {
-            'work_area': self.work_area,
+            'work_area': ui_work_area,
         })
 
     def handle_path_gen(self, data):
@@ -1227,14 +1269,10 @@ class Navigator(Node):
             self.get_logger().info("  START_MISSION 명령으로 주행을 시작하세요")
             self.get_logger().info("=" * 60)
 
-            # UI에 피드백 (물리적 좌표로 변환하여 전송)
-            # navigator 내부는 전후면 반전 좌표 → UI용으로 부호 복원
-            ui_waypoints = [
-                {**wp, 'x': -wp['x'], 'y': -wp['y']} for wp in waypoints
-            ]
+            # UI에 피드백 (로봇 자세/작업영역과 동일한 좌표계로 전송)
             self._publish_area_feedback('path_gen_complete', {
-                'waypoint_count': len(ui_waypoints),
-                'waypoints': ui_waypoints,
+                'waypoint_count': len(waypoints),
+                'waypoints': waypoints,
                 'work_area': self.work_area,
             })
 

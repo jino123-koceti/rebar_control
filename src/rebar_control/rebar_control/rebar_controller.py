@@ -123,7 +123,8 @@ class RebarController(Node):
         # Lateral motion 파라미터
         self.lateral_tolerance = 0.005  # 5mm
         self.lateral_speed_dps = 200.0  # degrees per second
-        self.mm_per_rotation = 50.0  # 50mm = 360도 = 1회전
+        self.mm_per_rotation = 44.0  # 44mm = 360도 = 1회전 (실측: 9회전=396mm)
+        self.lateral_y_offset = 0.0  # 횡이동 누적 Y 오프셋 (m)
 
         # 횡이동 분할 실행 상태
         self.lateral_total_rotations = 0  # 총 회전 횟수
@@ -422,12 +423,27 @@ class RebarController(Node):
         old_motion_type = self.current_motion_type
         self.current_motion_type = motion_type
 
-        # motion_type이 변경되면 횡이동 상태 리셋
+        # DIFFERENTIAL 웨이포인트마다 전진/후진 방향 재판정
+        if motion_type != Waypoint.MOTION_LATERAL and self.encoder_pose is not None:
+            curr_x = self.encoder_pose.pose.position.x - self.mission_origin_x
+            dx = x - curr_x
+            self.path_is_backward = (dx < 0)
+            self.get_logger().info(
+                f"📷 경로 방향: {'후진' if self.path_is_backward else '전진'} (dx={dx*1000:.0f}mm)"
+            )
+
+        # motion_type이 변경되면 횡이동 상태 + heading PID 리셋
         if old_motion_type != motion_type:
             self.lateral_total_rotations = 0
             self.lateral_current_rotation = 0
             self.lateral_command_sent = False
             self.lateral_start_time = None
+            # heading PID 상태 초기화 (DIFFERENTIAL→LATERAL 전환 시 적분값 잔류 방지)
+            self.integral_heading = 0.0
+            self.prev_heading_error = 0.0
+            self.integral_distance = 0.0
+            # 즉시 정지 (stale cmd_vel 방지)
+            self.publish_cmd_vel(0.0, 0.0)
 
         # target_pose 설정
         pose_msg = PoseStamped()
@@ -619,7 +635,7 @@ class RebarController(Node):
         inverted = PoseStamped()
         inverted.header = msg.header
         inverted.pose.position.x = -msg.pose.position.x
-        inverted.pose.position.y = -msg.pose.position.y
+        inverted.pose.position.y = -msg.pose.position.y + self.lateral_y_offset  # 횡이동 오프셋 반영
         inverted.pose.position.z = msg.pose.position.z
         # yaw도 반전 (π 회전)
         yaw = self._quaternion_to_yaw(msg.pose.orientation)
@@ -707,13 +723,16 @@ class RebarController(Node):
             self.target_waypoint.motion_type != msg.motion_type
         )
 
-        # motion_type이 변경되면 횡이동 상태 강제 리셋
-        # (LATERAL → DIFFERENTIAL 전환 시 이전 횡이동 상태가 남아있으면 안됨)
+        # motion_type이 변경되면 횡이동 상태 + heading PID 강제 리셋
         if self.target_waypoint is not None and self.target_waypoint.motion_type != msg.motion_type:
             self.lateral_total_rotations = 0
             self.lateral_current_rotation = 0
             self.lateral_command_sent = False
             self.lateral_start_time = None
+            self.integral_heading = 0.0
+            self.prev_heading_error = 0.0
+            self.integral_distance = 0.0
+            self.publish_cmd_vel(0.0, 0.0)
 
         self.target_waypoint = msg
         self.current_motion_type = msg.motion_type
@@ -897,6 +916,11 @@ class RebarController(Node):
         """
         if self.encoder_pose is None or self.target_pose is None:
             # 엔코더 odometry 또는 목표가 없으면 정지
+            self.publish_cmd_vel(0.0, 0.0)
+            return
+
+        # 결속 진행 중에는 주행 정지
+        if self.tying_in_progress:
             self.publish_cmd_vel(0.0, 0.0)
             return
 
@@ -1210,28 +1234,37 @@ class RebarController(Node):
             pass  # JSON 파싱 실패 시 무시
 
     def lateral_complete_callback(self, msg: String):
-        """횡이동 완료 신호 처리 (joint_controller로부터)"""
-        if msg.data != "COMPLETE":
+        """횡이동 회전 완료 신호 처리 (joint_controller로부터, 매 회전마다 호출)"""
+        if not msg.data.startswith("AUTO:"):
             return
 
         # 현재 횡이동 중이 아니면 무시
         if self.lateral_total_rotations == 0:
             return
 
-        # 현재 회전 완료
-        self.lateral_current_rotation += 1
+        # 완료된 회전수 누적 + Y 오프셋 업데이트
+        try:
+            parts = msg.data.split(':')
+            direction = parts[1]
+            turns = int(float(parts[2]))
+        except (IndexError, ValueError):
+            direction = '+'
+            turns = 1
+        self.lateral_current_rotation += turns
+
+        # encoder_pose Y 보정용 오프셋 누적 (m 단위)
+        dy_m = turns * self.mm_per_rotation / 1000.0
+        if direction == '+':
+            self.lateral_y_offset += dy_m
+        else:
+            self.lateral_y_offset -= dy_m
 
         self.get_logger().info(
-            f"  ✅ [{self.lateral_current_rotation}/{self.lateral_total_rotations}] 회전 완료 (엔코더 기반)"
+            f"🔄 횡이동 [{self.lateral_current_rotation}/{self.lateral_total_rotations}] 회전 완료"
         )
 
         if self.lateral_current_rotation >= self.lateral_total_rotations:
-            # 모든 회전 완료 → 위치 보정 + 웨이포인트 도달
             self._complete_lateral_motion()
-        else:
-            # 다음 회전 준비
-            self.lateral_command_sent = False
-            self.lateral_start_time = None
 
     def _complete_lateral_motion(self):
         """
@@ -1271,6 +1304,7 @@ class RebarController(Node):
         # 웨이포인트 도달 처리
         self.publish_cmd_vel(0.0, 0.0)
         self.waypoint_reached_sent = True
+        self.waypoint_reached_time = time.monotonic()
 
         # 상태 초기화
         self.lateral_total_rotations = 0
@@ -1280,12 +1314,27 @@ class RebarController(Node):
         if hasattr(self, 'lateral_start_y'):
             delattr(self, 'lateral_start_y')
 
-        # 인덱스 기반 모드면 다음 웨이포인트로 자동 이동
-        if self.path_received and len(self.waypoint_array_x) > 0:
-            self._advance_to_next_waypoint()
-        else:
-            # 하위호환: 기존 방식 (navigator가 다음 웨이포인트 발행)
-            self.publish_waypoint_reached()
+        # 결속 시작 (DIFFERENTIAL 도달과 동일)
+        tying_dir = 'forward' if self.total_wp_count % 2 == 0 else 'reverse'
+        self.total_wp_count += 1
+
+        self.get_logger().info(
+            f"🎯 횡이동 웨이포인트 도달 → 결속 시작 [direction={tying_dir}]"
+        )
+
+        tying_cmd = json.dumps({
+            'command': 'TYING_START',
+            'speed': 100,
+            'direction': tying_dir,
+        })
+        cmd_msg = String()
+        cmd_msg.data = tying_cmd
+        self.mission_command_pub.publish(cmd_msg)
+        self.tying_in_progress = True
+        self.tying_complete_received = False
+
+        # 결속 완료 후 _advance_to_next_waypoint()는 tying_complete_callback에서 처리
+        # (DIFFERENTIAL 도달과 동일 흐름)
 
     def _quaternion_to_yaw(self, q):
         """Quaternion → Yaw (radian) 변환"""
@@ -1298,26 +1347,26 @@ class RebarController(Node):
         """
         횡이동 제어 (Y축 이동, 회전 없음)
 
-        50mm 단위로 분할하여 1회전(360°)씩 실행.
-        예: 100mm → 360° + 360° (2회 전송)
+        N회전을 한 번에 전송 (가감속 1회).
+        예: 396mm → 9회전 x 360° = 3240° 일괄 전송
         엔코더 기반 완료 감지 + 위치 보정
         """
         curr_y = self.encoder_pose.pose.position.y
         target_y = self.target_pose.pose.position.y
         dy = target_y - curr_y
 
-        # 최초 호출 시: 총 회전 횟수 계산
+        # 최초 호출 시: 총 회전 횟수 계산 + 일괄 전송
         if self.lateral_total_rotations == 0:
             # 시작 위치 저장 (위치 보정용)
             self.lateral_start_y = curr_y
 
-            # dy를 50mm 단위로 분할 (반올림)
+            # dy를 44mm 단위로 분할 (반올림)
             dy_mm = dy * 1000.0
             self.lateral_total_rotations = int(round(abs(dy_mm) / self.mm_per_rotation))
             self.lateral_current_rotation = 0
 
             if self.lateral_total_rotations == 0:
-                # 이동 거리가 너무 작음 (< 25mm) → 즉시 완료
+                # 이동 거리가 너무 작음 (< 22mm) → 즉시 완료
                 self.get_logger().info(
                     f"✅ 횡이동 완료: dy={dy_mm:.1f}mm < {self.mm_per_rotation/2:.0f}mm (skip)"
                 )
@@ -1334,14 +1383,8 @@ class RebarController(Node):
             # 회전 방향 결정
             self.lateral_rotation_sign = 1.0 if dy > 0 else -1.0
 
-            self.get_logger().info(
-                f"🔄 횡이동 시작: dy={dy_mm:.1f}mm → {self.lateral_total_rotations}회전 "
-                f"({self.lateral_total_rotations}x360° @ {self.lateral_speed_dps} dps, 엔코더 기반)"
-            )
-
-        # 현재 회전 명령 전송 (한 번만)
-        if not self.lateral_command_sent:
-            rotation_deg = 360.0 * self.lateral_rotation_sign
+            # N회전 일괄 전송 (가감속 1회)
+            rotation_deg = 360.0 * self.lateral_total_rotations * self.lateral_rotation_sign
 
             msg = JointControl()
             msg.joint_id = 0x143
@@ -1353,18 +1396,13 @@ class RebarController(Node):
             self.lateral_command_sent = True
 
             self.get_logger().info(
-                f"🔄 횡이동 [{self.lateral_current_rotation + 1}/{self.lateral_total_rotations}]: "
-                f"{rotation_deg:+.0f}° 전송 (완료 대기 중...)"
+                f"🔄 횡이동 시작: dy={dy_mm:.1f}mm → {self.lateral_total_rotations}회전 "
+                f"({rotation_deg:+.0f}° 일괄 @ {self.lateral_speed_dps} dps)"
             )
 
+        # 횡이동 중에는 주행 모터 완전 정지 (제자리 선회 방지, heading 보정도 안 함)
+        self.publish_cmd_vel(0.0, 0.0)
         # 완료 감지는 lateral_complete_callback에서 처리됨 (엔코더 기반)
-
-        # Heading 유지를 위한 cmd_vel 발행 (각속도만, 엔코더 odom 기반)
-        if self.reference_heading is not None and self.encoder_pose is not None:
-            curr_yaw = self._quaternion_to_yaw(self.encoder_pose.pose.orientation)
-            heading_error = self._normalize_angle(self.reference_heading - curr_yaw)
-            angular_z = heading_error * 1.0  # kp_angular
-            self.publish_cmd_vel(0.0, angular_z)
 
     def _normalize_angle(self, angle):
         """각도 정규화 (-π ~ π)"""

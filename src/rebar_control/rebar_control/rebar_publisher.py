@@ -92,6 +92,16 @@ class RebarPublisher(Node):
             10
         )
 
+        # 횡이동 완료 구독 → position.y 오프셋 누적
+        self.lateral_complete_sub = self.create_subscription(
+            String,
+            '/lateral_motion_complete',
+            self.lateral_complete_callback,
+            10
+        )
+        self.lateral_y_offset = 0.0  # 횡이동 누적 오프셋 (mm)
+        self.mm_per_rotation = 44.0  # 1회전 = 44mm (실측: 9회전=396mm)
+
         # 상태 저장
         self.control_mode = "idle"
         self.mission_status = "idle"
@@ -140,7 +150,7 @@ class RebarPublisher(Node):
         # 전후면 반전 보정: encoder_odom은 물리적 방향 그대로이므로
         # 부호 반전하여 전진=양수 (navigator와 동일)
         self.position['x'] = -msg.pose.position.x * 1000.0  # m → mm, 부호 반전
-        self.position['y'] = -msg.pose.position.y * 1000.0  # m → mm, 부호 반전
+        self.position['y'] = -msg.pose.position.y * 1000.0 + self.lateral_y_offset  # m → mm, 부호 반전 + 횡이동 오프셋
 
         raw_yaw = self._quaternion_to_yaw(msg.pose.orientation)
         inv_yaw = raw_yaw + math.pi
@@ -148,6 +158,31 @@ class RebarPublisher(Node):
 
         # Heading (degree)
         self.heading = math.degrees(self.position['theta'])
+
+    def lateral_complete_callback(self, msg: String) -> None:
+        """횡이동 완료 시 position.y 오프셋 누적
+
+        메시지 형식:
+        - "MANUAL:+:9.0" → S17, 9회전
+        - "MANUAL:-:9.0" → S18, 9회전
+        - "COMPLETE" → Auto 모드 (rebar_controller에서 처리, 여기서는 무시)
+        """
+        try:
+            parts = msg.data.split(':')
+            if parts[0] not in ('MANUAL', 'AUTO') or len(parts) < 3:
+                return
+            direction = parts[1]
+            turns = float(parts[2])
+            dy_mm = turns * self.mm_per_rotation
+            if direction == '+':
+                self.lateral_y_offset += dy_mm  # S17 = +Y (좌측)
+            else:
+                self.lateral_y_offset -= dy_mm  # S18 = -Y (우측)
+            self.get_logger().info(
+                f"횡이동 오프셋 업데이트: {direction}{dy_mm:.0f}mm, 누적={self.lateral_y_offset:.0f}mm"
+            )
+        except Exception as e:
+            self.get_logger().warn(f"횡이동 메시지 파싱 실패: {msg.data}, {e}")
 
     def mission_feedback_callback(self, msg: String) -> None:
         """navigator의 미션 피드백 반영"""
