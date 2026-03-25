@@ -107,6 +107,7 @@ class CalibrationCollector(Node):
         # 다중 선형회귀 계수
         self.x_coeffs = None
         self.y_coeffs = None
+        self.z_coeffs = None
 
         # 기존 데이터가 충분하면 매핑 계수 자동 로드
         if len(self.cal_data) >= 6:
@@ -207,14 +208,14 @@ class CalibrationCollector(Node):
             self._save_viz(detections)
 
         print('-' * 60)
-        print('각 포인트의 실측값을 입력하세요 (mm 단위, "X Y")')
+        print('각 포인트의 실측값을 입력하세요 (mm 단위, "X Y" 또는 "X Y Z")')
         print("  's'=스킵  'q'=종료  'show'=데이터보기  'calc'=매핑계산  'test'=테스트")
         print()
 
         for i, det in enumerate(detections):
             label = f'P{i+1}'
             while True:
-                raw = input(f'  {label} 검출({det.x:.1f}, {det.y:.1f}) → 실측(mm): ').strip()
+                raw = input(f'  {label} 검출({det.x:.1f}, {det.y:.1f}) depth={det.depth_mm:.0f} → 실측(mm, X Y [Z]): ').strip()
 
                 if raw == 'q':
                     return False
@@ -238,11 +239,12 @@ class CalibrationCollector(Node):
 
                 try:
                     parts = raw.replace(',', ' ').split()
-                    if len(parts) != 2:
-                        print('    형식: X Y (예: 25.7 10.2)')
+                    if len(parts) not in (2, 3):
+                        print('    형식: X Y 또는 X Y Z (예: 25.7 10.2 또는 25.7 10.2 5.0)')
                         continue
                     actual_x_mm = float(parts[0])
                     actual_y_mm = float(parts[1])
+                    actual_z_mm = float(parts[2]) if len(parts) == 3 else None
 
                     pair = {
                         'detected_x': round(det.x, 2),
@@ -254,10 +256,13 @@ class CalibrationCollector(Node):
                         'pixel_v': det.pixel_v,
                         'confidence': round(det.confidence, 3),
                     }
+                    if actual_z_mm is not None:
+                        pair['actual_z_mm'] = round(actual_z_mm, 1)
                     self.cal_data.append(pair)
                     self._save_data()
+                    z_str = f', Z={actual_z_mm:.1f}' if actual_z_mm is not None else ''
                     print(f'    저장: 검출({det.x:.1f}, {det.y:.1f}) → '
-                          f'실측({actual_x_mm:.1f}, {actual_y_mm:.1f})mm  '
+                          f'실측({actual_x_mm:.1f}, {actual_y_mm:.1f}{z_str})mm  '
                           f'[총 {len(self.cal_data)}쌍]')
 
                     # 6쌍 이상이면 자동 매핑 계산
@@ -277,7 +282,7 @@ class CalibrationCollector(Node):
 
         mapped = []
         for det in detections:
-            mx, my = self._apply_mapping(det.pixel_u, det.pixel_v, det.depth_mm)
+            mx, my, _mz = self._apply_mapping(det.pixel_u, det.pixel_v, det.depth_mm)
             mapped.append((mx, my))
 
         used = set()
@@ -314,15 +319,18 @@ class CalibrationCollector(Node):
         if not self.cal_data:
             print('  (없음)')
             return
-        print(f'  {"#":>3}  {"pixel_u":>8}  {"pixel_v":>8}  {"depth":>7}  {"실측X":>7}  {"실측Y":>7}  {"검출X":>8}  {"검출Y":>8}')
+        has_z = any('actual_z_mm' in d for d in self.cal_data)
+        z_header = f'  {"실측Z":>7}' if has_z else ''
+        print(f'  {"#":>3}  {"pixel_u":>8}  {"pixel_v":>8}  {"depth":>7}  {"실측X":>7}  {"실측Y":>7}{z_header}  {"검출X":>8}  {"검출Y":>8}')
         for i, d in enumerate(self.cal_data):
+            z_val = f'  {d["actual_z_mm"]:7.1f}' if 'actual_z_mm' in d else ('  ' + ' ' * 7 if has_z else '')
             print(f'  {i+1:3d}  {d["pixel_u"]:8d}  {d["pixel_v"]:8d}  {d["depth_mm"]:7.0f}  '
-                  f'{d["actual_x_mm"]:7.1f}  {d["actual_y_mm"]:7.1f}  '
+                  f'{d["actual_x_mm"]:7.1f}  {d["actual_y_mm"]:7.1f}{z_val}  '
                   f'{d["detected_x"]:8.1f}  {d["detected_y"]:8.1f}')
         print()
 
     def _build_features(self, pixel_u, pixel_v, depth):
-        """설계 행렬 생성: [pixel_u, pixel_v, depth, pixel_u*depth, pixel_v*depth, 1]"""
+        """설계 행렬 생성: [pixel_u, pixel_v, depth, pixel_u*depth, pixel_v*depth, pixel_u², pixel_v², 1]"""
         pixel_u = np.asarray(pixel_u, dtype=np.float64)
         pixel_v = np.asarray(pixel_v, dtype=np.float64)
         depth = np.asarray(depth, dtype=np.float64)
@@ -330,6 +338,7 @@ class CalibrationCollector(Node):
             pixel_u, pixel_v, depth = pixel_u.reshape(1), pixel_v.reshape(1), depth.reshape(1)
         return np.column_stack([pixel_u, pixel_v, depth,
                                 pixel_u * depth, pixel_v * depth,
+                                pixel_u ** 2, pixel_v ** 2,
                                 np.ones(len(pixel_u))])
 
     def _compute_mapping_silent(self):
@@ -345,6 +354,15 @@ class CalibrationCollector(Node):
         A = self._build_features(pixel_u, pixel_v, depth)
         self.x_coeffs, _, _, _ = np.linalg.lstsq(A, actual_x, rcond=None)
         self.y_coeffs, _, _, _ = np.linalg.lstsq(A, actual_y, rcond=None)
+        # Z축 회귀 (actual_z_mm 데이터가 있는 경우)
+        z_data = [d for d in self.cal_data if 'actual_z_mm' in d]
+        if len(z_data) >= 6:
+            z_pu = np.array([d['pixel_u'] for d in z_data], dtype=np.float64)
+            z_pv = np.array([d['pixel_v'] for d in z_data], dtype=np.float64)
+            z_dep = np.array([d['depth_mm'] for d in z_data], dtype=np.float64)
+            actual_z = np.array([d['actual_z_mm'] for d in z_data], dtype=np.float64)
+            Az = self._build_features(z_pu, z_pv, z_dep)
+            self.z_coeffs, _, _, _ = np.linalg.lstsq(Az, actual_z, rcond=None)
 
     def _compute_mapping(self):
         """다중 선형회귀 + 교차항: (pixel_u, pixel_v, depth) → X, Y"""
@@ -380,20 +398,43 @@ class CalibrationCollector(Node):
         print(f'\n  [매핑] 다중 선형회귀 + 교차항 ({n}쌍)')
         print(f'  X: R²={x_r2:.4f}  평균오차={np.mean(x_errors):.1f}mm  최대={np.max(x_errors):.1f}mm')
         print(f'  Y: R²={y_r2:.4f}  평균오차={np.mean(y_errors):.1f}mm  최대={np.max(y_errors):.1f}mm')
-        print(f'  총합: 평균오차={np.mean(total_errors):.1f}mm, 최대={np.max(total_errors):.1f}mm')
 
-        self._save_mapping(np.mean(total_errors), np.max(total_errors), x_r2, y_r2)
+        # Z축 회귀 (actual_z_mm 데이터가 있는 경우)
+        z_r2 = None
+        z_data = [d for d in self.cal_data if 'actual_z_mm' in d]
+        if len(z_data) >= 6:
+            z_pu = np.array([d['pixel_u'] for d in z_data], dtype=np.float64)
+            z_pv = np.array([d['pixel_v'] for d in z_data], dtype=np.float64)
+            z_dep = np.array([d['depth_mm'] for d in z_data], dtype=np.float64)
+            actual_z = np.array([d['actual_z_mm'] for d in z_data], dtype=np.float64)
+            Az = self._build_features(z_pu, z_pv, z_dep)
+            self.z_coeffs, _, _, _ = np.linalg.lstsq(Az, actual_z, rcond=None)
+            z_pred = Az @ self.z_coeffs
+            z_errors = np.abs(z_pred - actual_z)
+            z_ss_res = np.sum((actual_z - z_pred)**2)
+            z_ss_tot = np.sum((actual_z - np.mean(actual_z))**2)
+            z_r2 = 1 - z_ss_res / z_ss_tot if z_ss_tot > 0 else 0
+            print(f'  Z: R²={z_r2:.4f}  평균오차={np.mean(z_errors):.1f}mm  최대={np.max(z_errors):.1f}mm  ({len(z_data)}쌍)')
+            total_errors = np.sqrt(x_errors**2 + y_errors**2)  # Z는 별도 데이터셋이라 XY만 총합
+        else:
+            if z_data:
+                print(f'  Z: 데이터 부족 ({len(z_data)}/6쌍)')
+
+        print(f'  XY총합: 평균오차={np.mean(total_errors):.1f}mm, 최대={np.max(total_errors):.1f}mm')
+
+        self._save_mapping(np.mean(total_errors), np.max(total_errors), x_r2, y_r2, z_r2)
         print(f'  저장: {self.result_file}')
         print()
 
     def _apply_mapping(self, pixel_u, pixel_v, depth_mm):
         """(pixel_u, pixel_v, depth) → 보정 좌표 (mm)"""
         if self.x_coeffs is None or self.y_coeffs is None:
-            return (None, None)
+            return (None, None, None)
         A = self._build_features(pixel_u, pixel_v, depth_mm)
         x_mm = float(self.x_coeffs @ A[0])
         y_mm = float(self.y_coeffs @ A[0])
-        return (x_mm, y_mm)
+        z_mm = float(self.z_coeffs @ A[0]) if self.z_coeffs is not None else None
+        return (x_mm, y_mm, z_mm)
 
     def _test_mapping(self, detections):
         """현재 검출 결과에 매핑 적용"""
@@ -403,11 +444,12 @@ class CalibrationCollector(Node):
         print(f'\n  === 매핑 테스트 ===')
         for i, det in enumerate(detections):
             mapped = self._apply_mapping(det.pixel_u, det.pixel_v, det.depth_mm)
+            z_str = f', Z={mapped[2]:.1f}mm' if mapped[2] is not None else ''
             print(f'  P{i+1}: pixel_u={det.pixel_u}, pixel_v={det.pixel_v}, depth={det.depth_mm:.0f}mm → '
-                  f'보정 X={mapped[0]:.1f}mm, Y={mapped[1]:.1f}mm')
+                  f'보정 X={mapped[0]:.1f}mm, Y={mapped[1]:.1f}mm{z_str}')
         print()
 
-    def _save_mapping(self, mean_err, max_err, x_r2, y_r2):
+    def _save_mapping(self, mean_err, max_err, x_r2, y_r2, z_r2=None):
         """매핑 계수를 YAML로 저장"""
         data = {
             'calibration': {
@@ -417,19 +459,27 @@ class CalibrationCollector(Node):
                 'max_error_mm': round(float(max_err), 2),
                 'camera': self.camera_name,
                 'x_mapping': {
-                    'inputs': ['pixel_u', 'pixel_v', 'depth_mm', 'pixel_u*depth', 'pixel_v*depth', '1'],
+                    'inputs': ['pixel_u', 'pixel_v', 'depth_mm', 'pixel_u*depth', 'pixel_v*depth', 'pixel_u^2', 'pixel_v^2', '1'],
                     'coeffs': [round(float(c), 6) for c in self.x_coeffs],
-                    'formula': 'X = a*u + b*v + c*d + e*u*d + f*v*d + g',
+                    'formula': 'X = a*u + b*v + c*d + e*u*d + f*v*d + g*u^2 + h*v^2 + i',
                     'r_squared': round(float(x_r2), 4),
                 },
                 'y_mapping': {
-                    'inputs': ['pixel_u', 'pixel_v', 'depth_mm', 'pixel_u*depth', 'pixel_v*depth', '1'],
+                    'inputs': ['pixel_u', 'pixel_v', 'depth_mm', 'pixel_u*depth', 'pixel_v*depth', 'pixel_u^2', 'pixel_v^2', '1'],
                     'coeffs': [round(float(c), 6) for c in self.y_coeffs],
-                    'formula': 'Y = a*u + b*v + c*d + e*u*d + f*v*d + g',
+                    'formula': 'Y = a*u + b*v + c*d + e*u*d + f*v*d + g*u^2 + h*v^2 + i',
                     'r_squared': round(float(y_r2), 4),
                 },
             }
         }
+        if self.z_coeffs is not None and z_r2 is not None:
+            data['calibration']['z_mapping'] = {
+                'inputs': ['pixel_u', 'pixel_v', 'depth_mm', 'pixel_u*depth', 'pixel_v*depth', 'pixel_u^2', 'pixel_v^2', '1'],
+                'coeffs': [round(float(c), 6) for c in self.z_coeffs],
+                'formula': 'Z = a*u + b*v + c*d + e*u*d + f*v*d + g*u^2 + h*v^2 + i',
+                'r_squared': round(float(z_r2), 4),
+                'num_z_points': len([d for d in self.cal_data if 'actual_z_mm' in d]),
+            }
         with open(self.result_file, 'w') as f:
             yaml.dump(data, f, default_flow_style=False)
         # right 카메라는 기존 파일에도 동기화
@@ -475,20 +525,22 @@ class CalibrationCollector(Node):
             # 매핑 적용 결과 추가
             if self.x_coeffs is not None:
                 mapped = self._apply_mapping(det.pixel_u, det.pixel_v, det.depth_mm)
-                lines.append((f'mapped:({mapped[0]:.1f}, {mapped[1]:.1f})', colors['mapped']))
+                z_str = f', Z={mapped[2]:.1f}' if mapped[2] is not None else ''
+                lines.append((f'mapped:({mapped[0]:.1f}, {mapped[1]:.1f}{z_str})', colors['mapped']))
 
-            tx = u + bbox_half + 5
-            ty = v - 15
+            # 텍스트를 바운딩 박스 아래쪽에 나열
+            tx = u - bbox_half
+            ty = v + bbox_half + 18
 
             for line_idx, (text, color) in enumerate(lines):
-                y_offset = ty + line_idx * 22
-                (tw, th), _ = cv2.getTextSize(text, font, 0.55, 2)
+                y_offset = ty + line_idx * 18
+                (tw, th), _ = cv2.getTextSize(text, font, 0.45, 1)
                 cv2.rectangle(img,
-                              (tx - 2, y_offset - th - 4),
-                              (tx + tw + 2, y_offset + 4),
+                              (tx - 2, y_offset - th - 2),
+                              (tx + tw + 2, y_offset + 3),
                               colors['text_bg'], -1)
                 cv2.putText(img, text, (tx, y_offset),
-                            font, 0.55, color, 2)
+                            font, 0.45, color, 1)
 
         # 상단 요약
         summary = f'{self.camera_name} | {len(detections)} detections | cal_data: {len(self.cal_data)} pairs'

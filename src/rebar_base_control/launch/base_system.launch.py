@@ -148,7 +148,7 @@ def generate_launch_description():
             name='pololu_node',
             output='screen',
             parameters=[{
-                'serial_port': '/dev/ttyACM0',
+                'serial_port': '/dev/pololu_trigger',
                 'baudrate': 9600,
                 'motor_ids': [0],
                 'motor_topics': ['motor_0/vel']

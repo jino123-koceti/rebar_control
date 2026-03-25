@@ -137,9 +137,14 @@ class RebarPublisher(Node):
     def pose_callback(self, msg: PoseStamped) -> None:
         """로봇 위치 업데이트"""
         # PoseStamped → dict (mm 단위)
-        self.position['x'] = msg.pose.position.x * 1000.0  # m → mm
-        self.position['y'] = msg.pose.position.y * 1000.0  # m → mm
-        self.position['theta'] = self._quaternion_to_yaw(msg.pose.orientation)  # radian
+        # 전후면 반전 보정: encoder_odom은 물리적 방향 그대로이므로
+        # 부호 반전하여 전진=양수 (navigator와 동일)
+        self.position['x'] = -msg.pose.position.x * 1000.0  # m → mm, 부호 반전
+        self.position['y'] = -msg.pose.position.y * 1000.0  # m → mm, 부호 반전
+
+        raw_yaw = self._quaternion_to_yaw(msg.pose.orientation)
+        inv_yaw = raw_yaw + math.pi
+        self.position['theta'] = math.atan2(math.sin(inv_yaw), math.cos(inv_yaw))
 
         # Heading (degree)
         self.heading = math.degrees(self.position['theta'])

@@ -31,6 +31,8 @@ class HomingState(Enum):
     FINE_HOME = 4       # 느린 속도로 다시 리미트 접근 (미시적 호밍)
     MOVE_TO_READY = 5   # 준비 위치로 이동
     COMPLETE = 6
+    Z_ONLY_UP = 7       # Z축 단독 호밍: z_min까지 상승
+    Z_ONLY_READY = 8    # Z축 단독 호밍: ready 위치로 하강
 
 
 class JointController(Node):
@@ -59,9 +61,9 @@ class JointController(Node):
         # 허용 오차: 각도(deg) 기준
         self.declare_parameter('position_tolerance', 1.0)
         # 12시 방향 각도 (0x94 기준, return_12.py 캘리브레이션 값)
-        self.declare_parameter('home_angle_94', 33.50)
+        self.declare_parameter('home_angle_94', 16.38)
         # 홈 위치 0x90 엔코더 값 (33.50° 위치의 0x90 값, 2025-12-26 하드웨어 재조립 후 캘리브레이션)
-        self.declare_parameter('home_encoder_90', 24399)
+        self.declare_parameter('home_encoder_90', 11928)
 
         # Parameters - 3축 스테이지 (0x144, 0x145, 0x146)
         self.declare_parameter('stage_x_step_deg', 4.497)      # 1mm = 4.497° (P2P 실측 보정)
@@ -191,6 +193,11 @@ class JointController(Node):
             String, '/homing_cmd', self._recv_homing_cmd, 10)
         self.homing_status_pub = self.create_publisher(
             String, '/homing_status', 10)
+
+        # 비상정지: /emergency_stop (Bool) → 전체 모터 즉시 정지
+        self.emergency_stop_sub = self.create_subscription(
+            Bool, '/emergency_stop', self._emergency_stop_callback, 10)
+        self.emergency_stopped = False
 
         # 비상정지: /mission/command의 EMERGENCY_STOP/CANCEL → 호밍 중지
         self.mission_cmd_sub = self.create_subscription(
@@ -383,6 +390,10 @@ class JointController(Node):
         0x143 횡이동: 홈 엔코더 기준 상대 위치 제어로 변환
         기타 모터: 그대로 전달
         """
+        if self.emergency_stopped:
+            self.get_logger().warn("Joint control command ignored (ESTOP active)",
+                                   throttle_duration_sec=2.0)
+            return
         if self.control_mode != 'auto':
             self.get_logger().debug(
                 f"Joint control command ignored (mode={self.control_mode}, expected 'auto')"
@@ -405,9 +416,21 @@ class JointController(Node):
             axis = axis_map.get(msg.joint_id)
             if axis:
                 if msg.control_mode == JointControl.MODE_ABSOLUTE:
-                    # 절대 위치: 현재 homing reference 대비 이동 방향 판단
-                    ref = self.homing_references.get(msg.joint_id)
-                    direction = msg.position - ref if ref is not None else msg.position
+                    # 절대 위치: 현재 모터 각도 대비 이동 방향 판단
+                    # (홈 기준이 아닌 현재 위치 기준으로 해야 리밋 해제 후 복귀 명령이 통과됨)
+                    current_angle_map = {
+                        0x144: self.stage_x_angle,
+                        0x145: self.stage_y_angle,
+                        0x146: self.stage_z_angle,
+                        0x147: self.yaw_angle,
+                    }
+                    current = current_angle_map.get(msg.joint_id)
+                    if current is not None:
+                        direction = msg.position - current
+                    else:
+                        # 현재 각도 미수신 시 홈 기준 fallback
+                        ref = self.homing_references.get(msg.joint_id)
+                        direction = msg.position - ref if ref is not None else msg.position
                 else:
                     direction = msg.position
 
@@ -518,6 +541,10 @@ class JointController(Node):
 
     def process_joint_control(self):
         """주기적으로 리모콘 입력 처리 및 Auto 모드 횡이동 완료 감지"""
+        # 비상정지 중에는 엔코더 요청만 허용 (제어 명령 차단)
+        if self.emergency_stopped:
+            return
+
         # 주기적으로 0x90/0x92/0x94 요청 (0.2초마다) - Manual/Auto 모두
         # 0x90: 싱글턴 엔코더 (횡이동 완료 감지용)
         # 0x92: 멀티턴 각도 (횡이동 제어용)
@@ -593,22 +620,16 @@ class JointController(Node):
             self._execute_single_turn_rotation(direction='-')  # 반시계 방향
 
     def _execute_single_turn_rotation(self, direction):
-        """Manual 모드 1회전 (0x92 멀티턴 엔코더 기반, 최단 경로 12시 정렬)
+        """Manual 모드 횡이동 (0x92 멀티턴 엔코더 기반, 12시 정렬 + N회전 일괄)
 
-        S17: 시계 방향 +360° 회전
-        S18: 반시계 방향 -360° 회전
+        S17: 시계 방향 +lateral_step_deg 회전
+        S18: 반시계 방향 -lateral_step_deg 회전
 
         로직:
-        1. 현재 0x92 멀티턴 각도 읽기 (예: 1000°)
-        2. 가장 가까운 12시(33.50 + n*360) 찾기 (최단 경로, 360° 이내)
-        3. 가장 가까운 12시로 이동 (절대 위치)
-        4. 거기서 ±360° 회전 (절대 위치)
-
-        예시:
-        - 현재 1000° → 가장 가까운 12시 = 874.94° (차이: -125.06°) → 874.94°로 이동
-        - S17: 874.94 + 360 = 1234.94°로 이동
-
-        프로그램 재시작 후에도 항상 360° 이내 회전으로 12시 정렬!
+        1. 현재 0x92 멀티턴 각도 읽기
+        2. 가장 가까운 12시(16.38 + n*360) 찾기 (최단 경로)
+        3. 12시 정렬 + lateral_step_deg 회전을 한 번의 명령으로 실행
+           → 가감속 1회로 피크 전류 최소화
         """
         # 명령 간격 제한 확인
         if self.last_command_time:
@@ -631,10 +652,9 @@ class JointController(Node):
 
         current_angle = self.current_angle_deg  # 멀티턴 (예: 1000°)
 
-        # 가장 가까운 12시(33.50 + n*360) 찾기
-        # 현재 각도를 360으로 나눈 나머지와 33.50 비교
-        remainder = current_angle % 360.0  # 예: 1000 % 360 = 280°
-        delta_in_circle = self.home_angle_94_target - remainder  # 33.50 - 280 = -246.50°
+        # 가장 가까운 12시 찾기
+        remainder = current_angle % 360.0
+        delta_in_circle = self.home_angle_94_target - remainder
 
         # 최단 경로 (-180 ~ +180)
         if delta_in_circle > 180.0:
@@ -642,37 +662,22 @@ class JointController(Node):
         elif delta_in_circle < -180.0:
             delta_in_circle += 360.0
 
-        nearest_home = current_angle + delta_in_circle  # 1000 + (-125.06) = 874.94°
+        nearest_home = current_angle + delta_in_circle
 
-        # 1단계: 12시로 정렬 (tolerance 이내가 아니면)
-        if abs(delta_in_circle) > self.position_tolerance:
-            self.get_logger().info(
-                f"📍 12시 정렬: {current_angle:.1f}° → {nearest_home:.1f}° "
-                f"(delta={delta_in_circle:.1f}°, 360° 이내)"
-            )
-            self._send_joint_command_abs(
-                0x143,
-                nearest_home,
-                self.lateral_speed,
-                '12시 정렬 (멀티턴)'
-            )
-            self.last_command_time = self.get_clock().now()
-            return
-
-        # 2단계: 12시에서 ±360° 회전 (절대 위치)
-        rotation_deg = 360.0 if direction == '+' else -360.0
+        # 12시 정렬 + N회전을 한 번에 (가감속 1회)
+        rotation_deg = self.lateral_step if direction == '+' else -self.lateral_step
         target_angle = nearest_home + rotation_deg
 
         self.get_logger().info(
-            f"🔄 12시{direction}360° 회전: "
-            f"0x92={current_angle:.1f}° → {target_angle:.1f}°, 0x90={self.current_encoder}"
+            f"🔄 횡이동: {current_angle:.1f}° → 12시({nearest_home:.1f}°) → "
+            f"{direction}{self.lateral_step:.0f}° → {target_angle:.1f}°, 0x90={self.current_encoder}"
         )
 
         self._send_joint_command_abs(
             0x143,
             target_angle,
             self.lateral_speed,
-            f'12시{direction}360° 회전 (멀티턴)'
+            f'12시 정렬 + {direction}{self.lateral_step:.0f}° 횡이동'
         )
 
         self.last_command_time = self.get_clock().now()
@@ -1173,6 +1178,30 @@ class JointController(Node):
                 self._request_output_angle(0x143)
                 self.get_logger().warn("📡 0x92 각도 요청 중... (다음 사이클에서 재시도)")
 
+    def _emergency_stop_callback(self, msg: Bool):
+        """리모콘 비상정지 → 전체 스테이지 모터 즉시 정지"""
+        if msg.data:
+            if not self.emergency_stopped:
+                self.emergency_stopped = True
+                self.get_logger().error(
+                    "🛑 [ESTOP] 리모콘 비상정지 → 스테이지 모터 전체 정지!")
+                # 모든 스테이지 모터 정지 (X, Y, Z, Yaw)
+                for motor_id in [0x144, 0x145, 0x146, 0x147]:
+                    self._send_speed_command(motor_id, 0.0)
+                # 횡이동 모터도 정지
+                self._send_speed_command(0x143, 0.0)
+                # 호밍 중이면 중지
+                if self.homing_state != HomingState.IDLE:
+                    self.homing_state = HomingState.IDLE
+                    self._publish_homing_status("EMERGENCY_STOPPED")
+                # Auto 횡이동 중이면 중지
+                self.auto_lateral_in_progress = False
+                self.auto_lateral_target_encoder = None
+        else:
+            if self.emergency_stopped:
+                self.emergency_stopped = False
+                self.get_logger().info("✅ [ESTOP] 비상정지 해제")
+
     def _mission_command_callback(self, msg: String):
         """UI 비상정지 명령 수신 → 호밍 중이면 즉시 정지"""
         try:
@@ -1221,6 +1250,16 @@ class JointController(Node):
                 self.homing_state = HomingState.IDLE
                 self._publish_homing_status("STOPPED")
 
+        elif cmd == 'Z_HOME':
+            if self.homing_state != HomingState.IDLE:
+                self.get_logger().warn("Z_HOME: homing already in progress")
+                return
+            self.get_logger().info("=" * 60)
+            self.get_logger().info("  Z ONLY HOMING START")
+            self.get_logger().info("=" * 60)
+            self.homing_start_time = time.monotonic()
+            self._homing_enter_state(HomingState.Z_ONLY_UP)
+
         elif cmd == 'SET_READY':
             if not self.is_homed:
                 self.get_logger().warn("Cannot SET_READY: not homed yet")
@@ -1260,6 +1299,14 @@ class JointController(Node):
         # === Z_UP: Z축 상승 (z_min 리미트까지) ===
         if self.homing_state == HomingState.Z_UP:
             if not self.homing_cmd_sent:
+                # 센서 안정화 대기 (0.5초): 전원 재투입 직후 z_min 센서 읽기 지연 방지
+                if now - self.homing_state_start_time < 0.5:
+                    if self.limit_sensors.get('z_min', False):
+                        self.get_logger().info("Homing: Z already at z_min (early detect), skipping")
+                        if self.stage_z_angle is not None:
+                            self.homing_references[0x146] = self.stage_z_angle
+                        self._homing_enter_state(HomingState.COARSE_HOME)
+                    return  # 안정화 대기 중
                 if self.limit_sensors.get('z_min', False):
                     self.get_logger().info("Homing: Z already at z_min, skipping")
                     if self.stage_z_angle is not None:
@@ -1461,6 +1508,59 @@ class JointController(Node):
                     self.flog(f"MOVE_TO_READY: 타임아웃(15s) remaining={remaining}")
                     self._homing_enter_state(HomingState.COMPLETE)
 
+        # === Z_ONLY_UP: Z축 단독 호밍 - z_min까지 상승 ===
+        elif self.homing_state == HomingState.Z_ONLY_UP:
+            if not self.homing_cmd_sent:
+                # 센서 안정화 대기 (0.5초)
+                if now - self.homing_state_start_time < 0.5:
+                    if self.limit_sensors.get('z_min', False):
+                        self.get_logger().info("Z_HOME: Z already at z_min, skipping UP")
+                        if self.stage_z_angle is not None:
+                            self.homing_references[0x146] = self.stage_z_angle
+                        self._homing_enter_state(HomingState.Z_ONLY_READY)
+                    return
+                if self.limit_sensors.get('z_min', False):
+                    self.get_logger().info("Z_HOME: Z already at z_min")
+                    if self.stage_z_angle is not None:
+                        self.homing_references[0x146] = self.stage_z_angle
+                    self._homing_enter_state(HomingState.Z_ONLY_READY)
+                    return
+                self._send_joint_command_rel(
+                    0x146, -9999.0, self.homing_speed, 'Z_HOME: Z UP'
+                )
+                self.homing_cmd_sent = True
+                self.get_logger().info("Z_HOME: Z moving UP to z_min")
+            # Transition: z_min → _homing_on_limit_triggered → Z_ONLY_READY
+
+        # === Z_ONLY_READY: Z축 단독 호밍 - ready 위치로 하강 ===
+        elif self.homing_state == HomingState.Z_ONLY_READY:
+            if not self.homing_cmd_sent:
+                if 0x146 in self.homing_references:
+                    z_offset_deg = self.ready_z_mm * self.stage_z_step
+                    z_target = self.homing_references[0x146] + z_offset_deg
+                    self._send_joint_command_abs(0x146, z_target, self.stage_z_speed, 'Z_HOME: Z READY')
+                    self.get_logger().info(
+                        f"Z_HOME: Z → ready ({self.ready_z_mm}mm, {z_target:.1f}°)"
+                    )
+                    self.homing_cmd_sent = True
+                else:
+                    self.get_logger().warn("Z_HOME: no Z reference, cannot move to ready")
+                    self.homing_state = HomingState.IDLE
+                    self._publish_homing_status("Z_HOME_FAILED")
+            else:
+                # ready 위치 도달 확인 (목표각도 ±허용오차)
+                if self.stage_z_angle is not None and 0x146 in self.homing_references:
+                    z_target = self.homing_references[0x146] + self.ready_z_mm * self.stage_z_step
+                    if abs(self.stage_z_angle - z_target) < self.position_tolerance:
+                        self.get_logger().info("Z_HOME: complete ✅")
+                        self._publish_homing_status("Z_HOME_COMPLETE")
+                        self.homing_state = HomingState.IDLE
+                # 타임아웃
+                elif now - self.homing_state_start_time > self.homing_timeout:
+                    self.get_logger().warn("Z_HOME: timeout waiting for Z ready")
+                    self._publish_homing_status("Z_HOME_COMPLETE")
+                    self.homing_state = HomingState.IDLE
+
         elif self.homing_state == HomingState.COMPLETE:
             self.is_homed = True
             # Reference angles를 JSON으로 포함하여 발행
@@ -1494,6 +1594,17 @@ class JointController(Node):
                 )
             self.get_logger().info(f"Homing: Z reached z_min (ref={self.stage_z_angle})")
             self._homing_enter_state(HomingState.COARSE_HOME)
+
+        elif self.homing_state == HomingState.Z_ONLY_UP and sensor_name == 'z_min':
+            self._send_speed_command(0x146, 0.0)
+            if self.stage_z_angle is not None:
+                self.homing_references[0x146] = self.stage_z_angle
+                # joint_positions 동기화 (상대이동 -9999로 오염된 값 복구)
+                self._send_joint_command_abs(
+                    0x146, self.stage_z_angle, 0.0, 'Z_HOME: Z sync'
+                )
+            self.get_logger().info(f"Z_HOME: Z reached z_min (ref={self.stage_z_angle})")
+            self._homing_enter_state(HomingState.Z_ONLY_READY)
 
         elif self.homing_state in (HomingState.COARSE_HOME, HomingState.FINE_HOME):
             phase = "COARSE" if self.homing_state == HomingState.COARSE_HOME else "FINE"

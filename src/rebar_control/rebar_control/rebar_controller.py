@@ -44,11 +44,12 @@ class RebarController(Node):
         self.declare_parameter('max_linear_vel', 0.25)  # m/s (0.5 → 0.25 감속)
         self.declare_parameter('max_angular_vel', 1.0)  # rad/s
 
-        self.declare_parameter('distance_tolerance', 0.05)  # m (50mm) - VSLAM 드리프트 환경 고려
+        self.declare_parameter('distance_tolerance', 0.001)  # m (1mm) - 0x92 position 기반 정밀 제어
         self.declare_parameter('heading_tolerance', 0.1)  # rad (~6도)
         self.declare_parameter('max_tying_points', 100)  # repeat 모드 종료 기준 (총 결속 포인트)
 
         # PID 파라미터
+        self.declare_parameter('min_linear_vel', 0.01)  # m/s (모터 stiction 극복 최소 속도)
         self.declare_parameter('kp_linear', 1.0)  # 0.5 → 1.0 (응답성 향상)
         self.declare_parameter('ki_linear', 0.05)  # 0.0 → 0.05 (정상상태 오차 보정)
         self.declare_parameter('kd_linear', 0.1)
@@ -63,6 +64,7 @@ class RebarController(Node):
         self.control_rate = self.get_parameter('control_rate').value
         self.max_linear = self.get_parameter('max_linear_vel').value
         self.max_angular = self.get_parameter('max_angular_vel').value
+        self.min_linear = self.get_parameter('min_linear_vel').value
 
         self.distance_tolerance = self.get_parameter('distance_tolerance').value
         self.heading_tolerance = self.get_parameter('heading_tolerance').value
@@ -945,6 +947,11 @@ class RebarController(Node):
             path_dx = next_x - target_x
             path_dy = next_y - target_y
             path_ref_valid = True
+        else:
+            # 단일 WP: 출발점(0,0) → 목표 방향으로 경로 방향 설정
+            path_dx = target_x
+            path_dy = target_y
+            path_ref_valid = True
         if path_ref_valid:
             # 경로 방향 벡터
             path_len = math.sqrt(path_dx**2 + path_dy**2)
@@ -1057,6 +1064,10 @@ class RebarController(Node):
             self.kd_linear * derivative_distance
         )
         self.prev_distance_error = distance
+
+        # min_speed 보장: tolerance 밖이면 최소 속도 이상 유지 (stiction 극복)
+        if abs(linear_vel) < self.min_linear and distance > self.distance_tolerance:
+            linear_vel = self.min_linear
 
         # 후진이면 선속도 반전
         if self.path_is_backward:

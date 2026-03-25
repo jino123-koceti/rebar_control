@@ -20,6 +20,7 @@ from rebar_base_interfaces.srv import DetectCrossings
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
+from collections import deque
 import json
 import os
 import time
@@ -33,6 +34,7 @@ CAMERA_CONFIG = {
     'right': {
         'camera_selection': 2,
         'image_topic': '/zedxmini2/zed_node/left/image_rect_color',
+        'depth_topic': '/zedxmini2/zed_node/depth/depth_registered',
         'camera_name': 'Right Camera (zedxmini2)',
         'data_file': os.path.join(DATA_DIR, 'calibration_data_right.json'),
         'result_file': os.path.join(DATA_DIR, 'calibration_result_nodepth_right.yaml'),
@@ -41,12 +43,18 @@ CAMERA_CONFIG = {
     'left': {
         'camera_selection': 1,
         'image_topic': '/zedxmini1/zed_node/left/image_rect_color',
+        'depth_topic': '/zedxmini1/zed_node/depth/depth_registered',
         'camera_name': 'Left Camera (zedxmini1)',
         'data_file': os.path.join(DATA_DIR, 'calibration_data_left.json'),
         'result_file': os.path.join(DATA_DIR, 'calibration_result_nodepth_left.yaml'),
         'viz_file': os.path.join(DATA_DIR, 'calibration_detect_left.png'),
     },
 }
+
+DEPTH_BUFFER_SIZE = 15       # 누적 프레임 수
+DEPTH_KERNEL_SIZE = 5        # spatial median 커널 (5x5)
+DEPTH_MIN_M = 0.05           # 유효 depth 최소 (m)
+DEPTH_MAX_M = 2.0            # 유효 depth 최대 (m)
 
 
 class UserPoint:
@@ -78,12 +86,18 @@ class CalibrationUserAdd(Node):
 
         self.image_sub = self.create_subscription(
             Image, cfg['image_topic'], self.image_callback, 1)
+        self.depth_sub = self.create_subscription(
+            Image, cfg['depth_topic'], self._depth_callback, 10)
         self.detect_client = self.create_client(
             DetectCrossings, '/rebar/detect_crossings')
 
         self.cal_data = self._load_data()
         self.x_coeffs = None
         self.y_coeffs = None
+
+        # depth 누적 버퍼
+        self.depth_buffer = deque(maxlen=DEPTH_BUFFER_SIZE)
+        self.depth_lock = threading.Lock()
 
         # 마우스 클릭 상태
         self.click_points = []
@@ -99,6 +113,45 @@ class CalibrationUserAdd(Node):
         if not self.got_image:
             self.camera_image = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
             self.got_image = True
+
+    def _depth_callback(self, msg):
+        depth_np = self.bridge.imgmsg_to_cv2(msg, 'passthrough')
+        with self.depth_lock:
+            self.depth_buffer.append(depth_np)
+
+    def sample_depth(self, u, v):
+        """누적 depth buffer에서 spatial+temporal median 추출 (mm)
+
+        각 프레임에서 (u,v) 주변 커널의 spatial median을 뽑고,
+        프레임 간 temporal median을 취한다.
+        """
+        with self.depth_lock:
+            frames = list(self.depth_buffer)
+        if not frames:
+            return None
+
+        half = DEPTH_KERNEL_SIZE // 2
+        samples = []
+        for frame in frames:
+            h, w = frame.shape[:2]
+            y_min, y_max = max(0, v - half), min(h, v + half + 1)
+            x_min, x_max = max(0, u - half), min(w, u + half + 1)
+            region = frame[y_min:y_max, x_min:x_max]
+            valid = region[np.isfinite(region) &
+                           (region > DEPTH_MIN_M) &
+                           (region < DEPTH_MAX_M)]
+            if len(valid) > 0:
+                samples.append(float(np.median(valid)))
+        if not samples:
+            return None
+        return float(np.median(samples)) * 1000.0  # m → mm
+
+    def depth_status(self):
+        """현재 depth buffer 상태 출력"""
+        with self.depth_lock:
+            n_frames = len(self.depth_buffer)
+        print('  [depth] 버퍼: %d/%d 프레임' % (n_frames, DEPTH_BUFFER_SIZE))
+        return n_frames
 
     def _load_data(self):
         if os.path.exists(self.data_file):
@@ -119,6 +172,23 @@ class CalibrationUserAdd(Node):
             pixel_u, pixel_v,
             pixel_u * pixel_v,
             pixel_u ** 2, pixel_v ** 2,
+            np.ones(len(pixel_u)),
+        ])
+
+    def _build_features_with_depth(self, pixel_u, pixel_v, depth_mm):
+        pixel_u = np.asarray(pixel_u, dtype=np.float64)
+        pixel_v = np.asarray(pixel_v, dtype=np.float64)
+        depth_mm = np.asarray(depth_mm, dtype=np.float64)
+        if pixel_u.ndim == 0:
+            pixel_u = pixel_u.reshape(1)
+            pixel_v = pixel_v.reshape(1)
+            depth_mm = depth_mm.reshape(1)
+        return np.column_stack([
+            pixel_u, pixel_v, depth_mm,
+            pixel_u * pixel_v,
+            pixel_u * depth_mm,
+            pixel_v * depth_mm,
+            pixel_u ** 2, pixel_v ** 2, depth_mm ** 2,
             np.ones(len(pixel_u)),
         ])
 
@@ -145,6 +215,7 @@ class CalibrationUserAdd(Node):
         actual_x = np.array([d['actual_x_mm'] for d in self.cal_data], dtype=np.float64)
         actual_y = np.array([d['actual_y_mm'] for d in self.cal_data], dtype=np.float64)
 
+        # --- pixel-only 회귀 ---
         A = self._build_features(pixel_u, pixel_v)
 
         self.x_coeffs, _, _, _ = np.linalg.lstsq(A, actual_x, rcond=None)
@@ -163,17 +234,75 @@ class CalibrationUserAdd(Node):
 
         total_errors = np.sqrt(x_errors ** 2 + y_errors ** 2)
 
-        print('\n  [매핑] pixel-only 회귀 (%d쌍, depth 미사용)' % n)
-        print('  features: [pixel_u, pixel_v, u*v, u², v², 1]')
+        print('\n  [매핑] pixel-only 회귀 (%d쌍)' % n)
+        print('  features: [u, v, u*v, u², v², 1]')
         print('  X: R²=%.4f  평균오차=%.1fmm  최대=%.1fmm' % (
             x_r2, np.mean(x_errors), np.max(x_errors)))
         print('  Y: R²=%.4f  평균오차=%.1fmm  최대=%.1fmm' % (
             y_r2, np.mean(y_errors), np.max(y_errors)))
-        print('  XY총합: 평균오차=%.1fmm, 최대=%.1fmm' % (
+        print('  XY총합: 평균=%.1fmm, 최대=%.1fmm' % (
             np.mean(total_errors), np.max(total_errors)))
 
         self._save_mapping(np.mean(total_errors), np.max(total_errors), x_r2, y_r2)
         print('  저장: %s' % self.result_file)
+
+        # --- depth 포함 회귀 비교 ---
+        depth_mm = np.array(
+            [d.get('depth_mm', 0.0) for d in self.cal_data], dtype=np.float64)
+        depth_valid = depth_mm > 10.0  # 10mm 이상만 유효
+        n_depth = int(np.sum(depth_valid))
+
+        if n_depth >= 10:
+            Ad = self._build_features_with_depth(
+                pixel_u[depth_valid], pixel_v[depth_valid],
+                depth_mm[depth_valid])
+            ax_d = actual_x[depth_valid]
+            ay_d = actual_y[depth_valid]
+
+            xc_d, _, _, _ = np.linalg.lstsq(Ad, ax_d, rcond=None)
+            xp_d = Ad @ xc_d
+            xe_d = np.abs(xp_d - ax_d)
+            x_r2_d = 1 - np.sum((ax_d - xp_d)**2) / np.sum((ax_d - np.mean(ax_d))**2)
+
+            yc_d, _, _, _ = np.linalg.lstsq(Ad, ay_d, rcond=None)
+            yp_d = Ad @ yc_d
+            ye_d = np.abs(yp_d - ay_d)
+            y_r2_d = 1 - np.sum((ay_d - yp_d)**2) / np.sum((ay_d - np.mean(ay_d))**2)
+
+            te_d = np.sqrt(xe_d**2 + ye_d**2)
+
+            # pixel-only (같은 서브셋)
+            A_sub = self._build_features(
+                pixel_u[depth_valid], pixel_v[depth_valid])
+            xc_s, _, _, _ = np.linalg.lstsq(A_sub, ax_d, rcond=None)
+            xp_s = A_sub @ xc_s
+            yc_s, _, _, _ = np.linalg.lstsq(A_sub, ay_d, rcond=None)
+            yp_s = A_sub @ yc_s
+            te_s = np.sqrt((xp_s - ax_d)**2 + (yp_s - ay_d)**2)
+            x_r2_s = 1 - np.sum((ax_d - xp_s)**2) / np.sum((ax_d - np.mean(ax_d))**2)
+            y_r2_s = 1 - np.sum((ay_d - yp_s)**2) / np.sum((ay_d - np.mean(ay_d))**2)
+
+            print('\n  [비교] depth 유효 서브셋 (%d/%d쌍)' % (n_depth, n))
+            print('  depth 범위: %.0f ~ %.0fmm (mean=%.0f)' % (
+                depth_mm[depth_valid].min(),
+                depth_mm[depth_valid].max(),
+                depth_mm[depth_valid].mean()))
+            print('  %-20s %8s %8s %8s %8s' % (
+                '', 'X_R²', 'Y_R²', 'XY평균', 'XY최대'))
+            print('  %-20s %8.4f %8.4f %8.1f %8.1f' % (
+                'pixel-only (subset)',
+                x_r2_s, y_r2_s,
+                np.mean(te_s), np.max(te_s)))
+            print('  %-20s %8.4f %8.4f %8.1f %8.1f' % (
+                'pixel+depth',
+                x_r2_d, y_r2_d,
+                np.mean(te_d), np.max(te_d)))
+            improve = np.mean(te_s) - np.mean(te_d)
+            print('  → depth 추가 효과: 평균오차 %.1fmm %s' % (
+                abs(improve), '개선' if improve > 0 else '악화'))
+        else:
+            print('\n  [비교] depth 유효 데이터 부족 (%d쌍, 최소 10쌍 필요)' % n_depth)
+            print('  → 검출 시 depth가 저장되면 자동 비교됩니다')
         print()
 
     def _apply_mapping(self, pixel_u, pixel_v):
@@ -377,6 +506,7 @@ class CalibrationUserAdd(Node):
     def collect_round(self):
         """한 라운드: 검출 → (선택) 사용자 추가 → 실측값 입력"""
         print('\n' + '=' * 60)
+        self.depth_status()
         print('검출 수행 중...')
         detections, response = self.detect()
 
@@ -408,8 +538,14 @@ class CalibrationUserAdd(Node):
         for i, det in enumerate(detections):
             line = ('  P%d: pixel=(%d, %d)  conf=%.2f' % (
                 i + 1, det.pixel_u, det.pixel_v, det.confidence))
-            if hasattr(det, 'depth_mm') and det.depth_mm > 0:
+            # 누적 depth 표시
+            acc_d = self.sample_depth(int(det.pixel_u), int(det.pixel_v))
+            if acc_d:
+                line += '  depth=%.0fmm(acc)' % acc_d
+            elif hasattr(det, 'depth_mm') and det.depth_mm > 0:
                 line += '  depth=%.0fmm' % det.depth_mm
+            else:
+                line += '  depth=N/A'
             if mapped_list and i < len(mapped_list):
                 mx, my, cnt = mapped_list[i]
                 line += '  -> mapped:(%.1f, %.1f)' % (mx, my)
@@ -502,10 +638,17 @@ class CalibrationUserAdd(Node):
                     actual_x_mm = float(parts[0])
                     actual_y_mm = float(parts[1])
 
+                    # 누적 depth 샘플링
+                    acc_depth = self.sample_depth(
+                        int(det.pixel_u), int(det.pixel_v))
+                    det_depth = det.depth_mm if hasattr(det, 'depth_mm') else 0.0
+                    # 누적 depth 우선, 없으면 검출 시 depth
+                    final_depth = acc_depth if acc_depth else det_depth
+
                     pair = {
                         'actual_x_mm': round(actual_x_mm, 1),
                         'actual_y_mm': round(actual_y_mm, 1),
-                        'depth_mm': round(det.depth_mm, 1) if hasattr(det, 'depth_mm') else 0.0,
+                        'depth_mm': round(final_depth, 1) if final_depth else 0.0,
                         'pixel_u': det.pixel_u,
                         'pixel_v': det.pixel_v,
                         'confidence': round(det.confidence, 3),
@@ -515,10 +658,18 @@ class CalibrationUserAdd(Node):
                         pair['detected_x'] = round(det.x, 2)
                         pair['detected_y'] = round(det.y, 2)
 
+                    depth_info = ''
+                    if acc_depth:
+                        depth_info = '  depth=%.0fmm(누적%d프레임)' % (
+                            acc_depth, len(self.depth_buffer))
+                    elif det_depth and det_depth > 0:
+                        depth_info = '  depth=%.0fmm(단일)' % det_depth
+
                     self.cal_data.append(pair)
                     self._save_data()
-                    print('    저장: (%.1f, %.1f)mm  [총 %d쌍]' % (
-                        actual_x_mm, actual_y_mm, len(self.cal_data)))
+                    print('    저장: (%.1f, %.1f)mm%s  [총 %d쌍]' % (
+                        actual_x_mm, actual_y_mm, depth_info,
+                        len(self.cal_data)))
 
                     if len(self.cal_data) >= 6:
                         self._compute_mapping_silent()
@@ -651,7 +802,8 @@ def main():
     print(' 결과 파일:   %s' % node.result_file)
     print(' 기존 데이터: %d쌍' % len(node.cal_data))
     print()
-    print(' Enter=검출  a=포인트추가  calc=매핑  outlier=분석  q=종료')
+    print(' Enter=검출  a=포인트추가  calc=매핑  outlier=분석')
+    print(' depth=depth상태  q=종료')
     print('=' * 60)
 
     try:
@@ -665,6 +817,8 @@ def main():
                 node._compute_mapping()
             elif cmd == 'outlier':
                 node._outlier_analysis()
+            elif cmd == 'depth':
+                node.depth_status()
             elif cmd.startswith('del '):
                 try:
                     node._delete_entry(int(cmd.split()[1]))

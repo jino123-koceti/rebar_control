@@ -103,6 +103,13 @@ class CANSender(Node):
         self.pending_speed_cmds = {}  # {motor_id: speed_dps}
         self.create_timer(1.0 / 200.0, self._flush_speed_commands)  # 200Hz
 
+        # 주행 모터 0x92 multiturn position 주기적 요청 (position 기반 오도메트리용)
+        self.declare_parameter('drive_encoder_rate', 20.0)  # Hz
+        drive_encoder_rate = self.get_parameter('drive_encoder_rate').value
+        if drive_encoder_rate > 0:
+            self.create_timer(1.0 / drive_encoder_rate, self._request_drive_encoder)
+            self.get_logger().info(f"  - Drive encoder 요청: {drive_encoder_rate:.0f} Hz (0x92)")
+
         self.get_logger().info("CAN Sender 노드 초기화 완료")
         self.get_logger().info("  - 속도 제어: 0x141, 0x142 (DriveControl)")
         self.get_logger().info("  - 위치 제어: 0x143~0x147 (JointControl)")
@@ -440,6 +447,21 @@ class CANSender(Node):
 
         except Exception as e:
             self.get_logger().error(f"CAN 위치 명령 전송 실패 (ID: 0x{motor_id:03X}): {e}")
+
+    def _request_drive_encoder(self):
+        """주행 모터(0x141, 0x142) multiturn position(0x92) 주기적 요청"""
+        if not self.bus:
+            return
+        try:
+            for motor_id in (self.left_motor_id, self.right_motor_id):
+                can_msg = can.Message(
+                    arbitration_id=motor_id,
+                    data=[0x92, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                    is_extended_id=False
+                )
+                self.bus.send(can_msg)
+        except Exception as e:
+            self.get_logger().error(f"Drive encoder 요청 실패: {e}")
 
     def destroy_node(self):
         """노드 종료 시 정리"""

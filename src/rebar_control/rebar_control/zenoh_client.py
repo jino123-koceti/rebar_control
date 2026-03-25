@@ -203,11 +203,17 @@ class ZenohClient(Node):
             from datetime import datetime
 
             # PoseStamped → dict 변환
+            # 전후면 반전 보정: encoder_odom은 물리적 방향 그대로이므로
+            # 부호 반전하여 전진=양수, yaw도 π 회전 (navigator와 동일)
+            raw_yaw = self._quaternion_to_yaw(msg.pose.orientation)
+            inv_yaw = raw_yaw + math.pi
+            inv_yaw = math.atan2(math.sin(inv_yaw), math.cos(inv_yaw))
+
             pose_data = {
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],  # "2025-12-17 14:22:47.123"
-                'x': msg.pose.position.x * 1000.0,  # m → mm
-                'y': msg.pose.position.y * 1000.0,  # m → mm
-                'theta': self._quaternion_to_yaw(msg.pose.orientation),  # radian
+                'x': -msg.pose.position.x * 1000.0,  # m → mm, 부호 반전
+                'y': -msg.pose.position.y * 1000.0,  # m → mm, 부호 반전
+                'theta': inv_yaw,  # radian, π 회전
                 'speed': self.current_speed  # m/s (모터 피드백에서 계산)
             }
 
