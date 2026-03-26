@@ -236,14 +236,18 @@ class CalibrationUserAdd(Node):
 
         print('\n  [매핑] pixel-only 회귀 (%d쌍)' % n)
         print('  features: [u, v, u*v, u², v², 1]')
-        print('  X: R²=%.4f  평균오차=%.1fmm  최대=%.1fmm' % (
-            x_r2, np.mean(x_errors), np.max(x_errors)))
-        print('  Y: R²=%.4f  평균오차=%.1fmm  최대=%.1fmm' % (
-            y_r2, np.mean(y_errors), np.max(y_errors)))
-        print('  XY총합: 평균=%.1fmm, 최대=%.1fmm' % (
-            np.mean(total_errors), np.max(total_errors)))
+        print('  %-6s %8s %10s %10s' % ('', 'R²', '평균오차', '최대오차'))
+        print('  %-6s %8.4f %8.1fmm %8.1fmm' % (
+            'X:', x_r2, np.mean(x_errors), np.max(x_errors)))
+        print('  %-6s %8.4f %8.1fmm %8.1fmm' % (
+            'Y:', y_r2, np.mean(y_errors), np.max(y_errors)))
+        print('  %-6s %8s %8.1fmm %8.1fmm' % (
+            'XY:', '', np.mean(total_errors), np.max(total_errors)))
 
-        self._save_mapping(np.mean(total_errors), np.max(total_errors), x_r2, y_r2)
+        self._save_mapping(x_r2, y_r2,
+                           np.mean(x_errors), np.max(x_errors),
+                           np.mean(y_errors), np.max(y_errors),
+                           np.mean(total_errors), np.max(total_errors))
         print('  저장: %s' % self.result_file)
 
         # --- depth 포함 회귀 비교 ---
@@ -282,23 +286,30 @@ class CalibrationUserAdd(Node):
             x_r2_s = 1 - np.sum((ax_d - xp_s)**2) / np.sum((ax_d - np.mean(ax_d))**2)
             y_r2_s = 1 - np.sum((ay_d - yp_s)**2) / np.sum((ay_d - np.mean(ay_d))**2)
 
+            xe_s = np.abs(xp_s - ax_d)
+            ye_s = np.abs(yp_s - ay_d)
+            xe_d = np.abs(xp_d - ax_d)
+            ye_d = np.abs(yp_d - ay_d)
+
             print('\n  [비교] depth 유효 서브셋 (%d/%d쌍)' % (n_depth, n))
             print('  depth 범위: %.0f ~ %.0fmm (mean=%.0f)' % (
                 depth_mm[depth_valid].min(),
                 depth_mm[depth_valid].max(),
                 depth_mm[depth_valid].mean()))
-            print('  %-20s %8s %8s %8s %8s' % (
-                '', 'X_R²', 'Y_R²', 'XY평균', 'XY최대'))
-            print('  %-20s %8.4f %8.4f %8.1f %8.1f' % (
+            print('  %-20s %8s %8s %8s %8s %8s %8s' % (
+                '', 'X_R²', 'Y_R²', 'X평균', 'X최대', 'Y평균', 'Y최대'))
+            print('  %-20s %8.4f %8.4f %7.1f %7.1f %7.1f %7.1f' % (
                 'pixel-only (subset)',
                 x_r2_s, y_r2_s,
-                np.mean(te_s), np.max(te_s)))
-            print('  %-20s %8.4f %8.4f %8.1f %8.1f' % (
+                np.mean(xe_s), np.max(xe_s),
+                np.mean(ye_s), np.max(ye_s)))
+            print('  %-20s %8.4f %8.4f %7.1f %7.1f %7.1f %7.1f' % (
                 'pixel+depth',
                 x_r2_d, y_r2_d,
-                np.mean(te_d), np.max(te_d)))
+                np.mean(xe_d), np.max(xe_d),
+                np.mean(ye_d), np.max(ye_d)))
             improve = np.mean(te_s) - np.mean(te_d)
-            print('  → depth 추가 효과: 평균오차 %.1fmm %s' % (
+            print('  → depth 추가 효과: XY평균오차 %.1fmm %s' % (
                 abs(improve), '개선' if improve > 0 else '악화'))
         else:
             print('\n  [비교] depth 유효 데이터 부족 (%d쌍, 최소 10쌍 필요)' % n_depth)
@@ -313,13 +324,20 @@ class CalibrationUserAdd(Node):
         y_mm = float(self.y_coeffs @ A[0])
         return (x_mm, y_mm)
 
-    def _save_mapping(self, mean_err, max_err, x_r2, y_r2):
+    def _save_mapping(self, x_r2, y_r2,
+                      x_mean_err, x_max_err,
+                      y_mean_err, y_max_err,
+                      xy_mean_err, xy_max_err):
         data = {
             'calibration': {
                 'method': 'pixel_only_regression',
                 'num_points': len(self.cal_data),
-                'mean_error_mm': round(float(mean_err), 2),
-                'max_error_mm': round(float(max_err), 2),
+                'mean_error_mm': round(float(xy_mean_err), 2),
+                'max_error_mm': round(float(xy_max_err), 2),
+                'x_mean_error_mm': round(float(x_mean_err), 2),
+                'x_max_error_mm': round(float(x_max_err), 2),
+                'y_mean_error_mm': round(float(y_mean_err), 2),
+                'y_max_error_mm': round(float(y_max_err), 2),
                 'camera': self.camera_name,
                 'x_mapping': {
                     'inputs': ['pixel_u', 'pixel_v', 'pixel_u*pixel_v',
@@ -468,7 +486,7 @@ class CalibrationUserAdd(Node):
 
         request = DetectCrossings.Request()
         request.camera_selection = self.camera_selection
-        request.confidence_threshold = 0.3
+        request.confidence_threshold = 0.5
         request.expected_count = 6
 
         future = self.detect_client.call_async(request)
@@ -712,21 +730,28 @@ class CalibrationUserAdd(Node):
         yp = A @ yc
         xy_err = np.sqrt((xp - actual_x) ** 2 + (yp - actual_y) ** 2)
 
+        x_err = np.abs(xp - actual_x)
+        y_err = np.abs(yp - actual_y)
+
         worst = np.argsort(xy_err)[::-1][:10]
         print('\n  === 아웃라이어 상위 10개 ===')
-        print('  %4s %7s %7s %8s %8s %8s %8s %7s' % (
-            '#', 'pix_u', 'pix_v', '실측X', '실측Y', '예측X', '예측Y', 'err'))
+        print('  %4s %7s %7s %8s %8s %8s %8s %7s %7s %7s' % (
+            '#', 'pix_u', 'pix_v', '실측X', '실측Y', '예측X', '예측Y', 'errX', 'errY', 'errXY'))
         for i in worst:
             d = self.cal_data[i]
-            print('  %4d %7d %7d %8.1f %8.1f %8.1f %8.1f %7.1f' % (
+            print('  %4d %7d %7d %8.1f %8.1f %8.1f %8.1f %+6.1f %+6.1f %6.1f' % (
                 i + 1, d['pixel_u'], d['pixel_v'],
                 d['actual_x_mm'], d['actual_y_mm'],
-                xp[i], yp[i], xy_err[i]))
+                xp[i], yp[i],
+                xp[i] - actual_x[i], yp[i] - actual_y[i], xy_err[i]))
 
-        print('\n  === 오차 분포 ===')
+        print('\n  === 오차 분포 (X / Y / XY) ===')
         for th in [5, 10, 15, 20, 30]:
-            cnt = int(np.sum(xy_err <= th))
-            print('  <=%2dmm: %3d/%d (%.0f%%)' % (th, cnt, n, 100 * cnt / n))
+            cx = int(np.sum(x_err <= th))
+            cy = int(np.sum(y_err <= th))
+            cxy = int(np.sum(xy_err <= th))
+            print('  <=%2dmm: X=%3d/%d (%.0f%%)  Y=%3d/%d (%.0f%%)  XY=%3d/%d (%.0f%%)' % (
+                th, cx, n, 100*cx/n, cy, n, 100*cy/n, cxy, n, 100*cxy/n))
 
         print('\n  삭제하려면 "del 번호" (예: del 115)')
         print()

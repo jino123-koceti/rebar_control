@@ -50,6 +50,7 @@ class ActionType(Enum):
     MOVE_YAW = auto()            # Yaw 절대각도 이동 (deg, 0x92 멀티턴)
     MOVE_Z_DOWN = auto()         # Z축 하강 (상대 이동, mm)
     MOVE_Z_UP = auto()           # Z축 상승 (상대 이동, mm)
+    MOVE_Z_UP_WITH_XY = auto()   # Z상승 + 조기 XY이동 (연속 동작)
     TRIGGER = auto()             # 트리거 동작 (발사 → 정지 → 원복 → 정지)
     LOG = auto()                 # 로그 출력
 
@@ -73,6 +74,7 @@ class TyingState(Enum):
     EXECUTING_ACTION = auto()
     WAITING_SETTLE = auto()
     WAITING_Z = auto()           # Z축 이동 대기 (계산된 시간)
+    WAITING_Z_XY = auto()        # Z상승 중 + XY 병렬 이동 대기
     WAITING_TRIGGER = auto()     # 트리거 동작 대기 (다단계)
     PAUSED = auto()
     COMPLETE = auto()
@@ -122,6 +124,7 @@ class TyingOrchestratorNode(Node):
         self.declare_parameter('deg_per_mm_z', 11.0)           # Z축: 1mm = 11.0° (실측 보정 필요)
         self.declare_parameter('z_speed_dps', 200.0)           # Z축 속도 (degree/s)
         self.declare_parameter('z_settle_margin', 1.0)         # Z축 이동 후 추가 대기 (초)
+        self.declare_parameter('z_early_xy_mm', 20.0)          # Z상승 중 이 높이 오르면 XY 선행 시작 (mm)
         # 트리거 파라미터
         self.declare_parameter('trigger_speed', 1.0)           # 트리거 모터 속도 (-1.0 ~ 1.0)
         self.declare_parameter('trigger_duration', 1.0)        # 트리거 동작 시간 (초)
@@ -162,6 +165,7 @@ class TyingOrchestratorNode(Node):
         self.deg_per_mm_z = self.get_parameter('deg_per_mm_z').value
         self.z_speed = self.get_parameter('z_speed_dps').value
         self.z_settle_margin = self.get_parameter('z_settle_margin').value
+        self.z_early_xy_mm = self.get_parameter('z_early_xy_mm').value
         self.trigger_speed_val = self.get_parameter('trigger_speed').value
         self.trigger_duration = self.get_parameter('trigger_duration').value
         self.multi_detect_tries = self.get_parameter('multi_detect_tries').value
@@ -390,6 +394,7 @@ class TyingOrchestratorNode(Node):
             if self.state in (TyingState.EXECUTING_ACTION,
                               TyingState.WAITING_SETTLE,
                               TyingState.WAITING_Z,
+                              TyingState.WAITING_Z_XY,
                               TyingState.WAITING_TRIGGER):
                 self.get_logger().info('[UI] PAUSE 수신 - 일시 정지')
                 self.paused_from_state = self.state
@@ -558,6 +563,26 @@ class TyingOrchestratorNode(Node):
             if elapsed >= self.z_wait_time:
                 self.get_logger().info(
                     f'    Z축 이동 완료 ({elapsed:.1f}s)')
+                self._advance_to_next_action()
+
+        elif self.state == TyingState.WAITING_Z_XY:
+            # Z상승 중 조기 XY 시작
+            if not self.z_xy_started and elapsed >= self.z_early_xy_time:
+                action = self.action_queue[self.current_action_index]
+                self._send_xy_absolute(action.x_mm, action.y_mm)
+                self.z_xy_started = True
+                self.get_logger().info(
+                    f'    Z↑ {self.z_early_xy_mm}mm 도달 ({elapsed:.1f}s) → XY 선행 이동 시작')
+            # Z 완료 + XY 완료 모두 확인
+            z_done = (elapsed >= self.z_wait_time)
+            xy_done = self._check_goal_reached() if self.z_xy_started else False
+            if z_done and xy_done:
+                self.get_logger().info(
+                    f'    Z↑+XY 완료 ({elapsed:.1f}s)')
+                self._advance_to_next_action()
+            elif z_done and not xy_done and elapsed > self.max_stage_timeout:
+                self.get_logger().warn(
+                    f'    Z↑+XY: XY 타임아웃 ({elapsed:.1f}s)')
                 self._advance_to_next_action()
 
         elif self.state == TyingState.WAITING_TRIGGER:
@@ -1116,6 +1141,7 @@ class TyingOrchestratorNode(Node):
 
         self.get_logger().info(
             f'자세 상태: {self.current_pose_state} | '
+            f'방향: {self.tying_direction} | 패스: {self.tying_pass} | '
             f'Right: {len(right_pts)}개, Left: {len(left_pts)}개')
 
         if self.tying_direction == 'reverse':
@@ -1178,6 +1204,45 @@ class TyingOrchestratorNode(Node):
                 self.current_pose_state = 'left'
             elif right_pts:
                 self.current_pose_state = 'right'
+
+        # 후처리: Z_UP + MOVE_XY 연속 패턴 → MOVE_Z_UP_WITH_XY로 합치기
+        self._optimize_z_xy_overlap()
+
+    def _optimize_z_xy_overlap(self):
+        """Z_UP 직후 MOVE_XY가 오는 패턴을 MOVE_Z_UP_WITH_XY로 합침.
+
+        이렇게 하면 Z 상승 중 일정 높이(z_early_xy_mm) 도달 시
+        XY 이동을 미리 시작하여 사이클 타임을 줄입니다.
+        """
+        optimized = []
+        i = 0
+        merged_count = 0
+        while i < len(self.action_queue):
+            action = self.action_queue[i]
+            # Z_UP 다음이 MOVE_XY이면 합치기
+            if (action.action_type == ActionType.MOVE_Z_UP
+                    and i + 1 < len(self.action_queue)
+                    and self.action_queue[i + 1].action_type == ActionType.MOVE_XY):
+                next_action = self.action_queue[i + 1]
+                optimized.append(Action(
+                    action_type=ActionType.MOVE_Z_UP_WITH_XY,
+                    z_mm=action.z_mm,
+                    x_mm=next_action.x_mm,
+                    y_mm=next_action.y_mm,
+                    point_label=action.point_label,
+                    message=f'{action.point_label}: Z↑{action.z_mm}mm + '
+                            f'{next_action.point_label} XY({next_action.x_mm:.1f},{next_action.y_mm:.1f})',
+                ))
+                i += 2  # 두 액션을 하나로
+                merged_count += 1
+            else:
+                optimized.append(action)
+                i += 1
+
+        if merged_count > 0:
+            self.action_queue = optimized
+            self.get_logger().info(
+                f'  [최적화] Z↑+XY 병합: {merged_count}개 (액션 {len(self.action_queue)}개)')
 
     def _append_tying_actions(self, label, x, y):
         """한 포인트에 대한 결속 액션 시퀀스 추가.
@@ -1356,6 +1421,26 @@ class TyingOrchestratorNode(Node):
             self.z_wait_time = z_deg / self.effective_z_speed + self.z_settle_margin
             self._transition_to(TyingState.WAITING_Z)
 
+        elif action.action_type == ActionType.MOVE_Z_UP_WITH_XY:
+            # Phase 1: Z상승 시작
+            z_deg = action.z_mm * self.deg_per_mm_z
+            self._send_z_relative(-z_deg)  # 음수 = 상승
+            self.get_logger().info(
+                f'  Z↑+XY: {action.message} (Z:-{z_deg:.1f}°)')
+            self.tying_message = action.message
+            self._publish_tying_feedback()
+            # Z 전체 시간과 조기 XY 시작 시간 계산
+            self.z_wait_time = z_deg / self.effective_z_speed + self.z_settle_margin
+            early_z_deg = self.z_early_xy_mm * self.deg_per_mm_z
+            self.z_early_xy_time = early_z_deg / self.effective_z_speed
+            self.z_xy_started = False
+            # goal 설정 (XY 도달 확인용)
+            self.goal_targets = {
+                0x44: self.home_ref_x_deg - action.x_mm * self.deg_per_mm_x,
+                0x45: self.home_ref_y_deg + action.y_mm * self.deg_per_mm_y,
+            }
+            self._transition_to(TyingState.WAITING_Z_XY)
+
         elif action.action_type == ActionType.TRIGGER:
             self.get_logger().info(f'  트리거: {action.message}')
             self.tying_message = action.message
@@ -1372,7 +1457,7 @@ class TyingOrchestratorNode(Node):
         # Z축 상승 완료 시 = 1포인트 결속 완료 → 진행률 업데이트
         if self.current_action_index < len(self.action_queue):
             action = self.action_queue[self.current_action_index]
-            if (action.action_type == ActionType.MOVE_Z_UP
+            if (action.action_type in (ActionType.MOVE_Z_UP, ActionType.MOVE_Z_UP_WITH_XY)
                     and action.point_label):
                 self.completed_points += 1
                 self.tying_message = (
@@ -1627,6 +1712,7 @@ class TyingOrchestratorNode(Node):
             TyingState.EXECUTING_ACTION: 'tying',
             TyingState.WAITING_SETTLE: 'tying',
             TyingState.WAITING_Z: 'tying',
+            TyingState.WAITING_Z_XY: 'tying',
             TyingState.WAITING_TRIGGER: 'tying',
             TyingState.PAUSED: 'tying',
             TyingState.COMPLETE: 'success',
