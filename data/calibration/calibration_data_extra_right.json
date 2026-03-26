@@ -150,36 +150,6 @@
     "confidence": 0.64
   },
   {
-    "detected_x": 36.74,
-    "detected_y": 37.24,
-    "actual_x_mm": 25.7,
-    "actual_y_mm": 10.2,
-    "depth_mm": 371.8,
-    "pixel_u": 383,
-    "pixel_v": 184,
-    "confidence": 0.664
-  },
-  {
-    "detected_x": 411.29,
-    "detected_y": 46.83,
-    "actual_x_mm": 403.0,
-    "actual_y_mm": 15.2,
-    "depth_mm": 383.0,
-    "pixel_u": 738,
-    "pixel_v": 189,
-    "confidence": 0.631
-  },
-  {
-    "detected_x": 17.02,
-    "detected_y": 40.58,
-    "actual_x_mm": 11.0,
-    "actual_y_mm": 15.2,
-    "depth_mm": 380.3,
-    "pixel_u": 368,
-    "pixel_v": 185,
-    "confidence": 0.597
-  },
-  {
     "detected_x": 11.45,
     "detected_y": 72.56,
     "actual_x_mm": 0.0,
@@ -228,5 +198,82 @@
     "pixel_u": 733,
     "pixel_v": 197,
     "confidence": 0.416
+  },
+  {
+    "actual_x_mm": 206.1,
+    "actual_y_mm": 72.7,
+    "depth_mm": 0.0,
+    "pixel_u": 556,
+    "pixel_v": 195,
+    "confidence": 0.0,
+    "source": "user",
+    "detected_x": 0.0,
+    "detected_y": 0.0
+  },
+  {
+    "actual_x_mm": 203.8,
+    "actual_y_mm": 140.4,
+    "depth_mm": 0.0,
+    "pixel_u": 573,
+    "pixel_v": 224,
+    "confidence": 0.0,
+    "source": "user",
+    "detected_x": 0.0,
+    "detected_y": 0.0
+  },
+  {
+    "actual_x_mm": 398.0,
+    "actual_y_mm": 120.0,
+    "depth_mm": 0.0,
+    "pixel_u": 829,
+    "pixel_v": 217,
+    "confidence": 0.0,
+    "source": "user",
+    "detected_x": 0.0,
+    "detected_y": 0.0
+  },
+  {
+    "actual_x_mm": 395.0,
+    "actual_y_mm": 111.2,
+    "depth_mm": 0.0,
+    "pixel_u": 812,
+    "pixel_v": 210,
+    "confidence": 0.0,
+    "source": "user",
+    "detected_x": 0.0,
+    "detected_y": 0.0
+  },
+  {
+    "actual_x_mm": 411.0,
+    "actual_y_mm": 96.5,
+    "depth_mm": 0.0,
+    "pixel_u": 821,
+    "pixel_v": 205,
+    "confidence": 0.0,
+    "source": "user",
+    "detected_x": 0.0,
+    "detected_y": 0.0
+  },
+  {
+    "actual_x_mm": 193.7,
+    "actual_y_mm": 128.3,
+    "depth_mm": 0.0,
+    "pixel_u": 564,
+    "pixel_v": 216,
+    "confidence": 0.0,
+    "source": "user",
+    "detected_x": 0.0,
+    "detected_y": 0.0
+  },
+  {
+    "actual_x_mm": 0.2,
+    "actual_y_mm": 130.3,
+    "depth_mm": 0.0,
+    "pixel_u": 307,
+    "pixel_v": 218,
+    "confidence": 0.0,
+    "source": "user",
+    "detected_x": 0.0,
+    "detected_y": 0.0
   }
 ]

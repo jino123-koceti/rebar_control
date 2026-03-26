@@ -1,17 +1,17 @@
 calibration:
   camera: Right Camera (zedxmini2)
-  max_error_mm: 27.44
-  mean_error_mm: 8.6
+  max_error_mm: 26.75
+  mean_error_mm: 8.42
   method: pixel_only_regression
-  num_points: 234
+  num_points: 227
   x_mapping:
     coeffs:
-    - 2.318762
-    - 4.807965
-    - -0.006878
-    - -3.3e-05
-    - -0.00377
-    - -1118.210595
+    - 2.152079
+    - 3.324774
+    - -0.006204
+    - 6.0e-06
+    - -0.000778
+    - -935.759492
     formula: X = a*u + b*v + c*u*v + d*u^2 + e*v^2 + f
     inputs:
     - pixel_u
@@ -20,15 +20,15 @@ calibration:
     - pixel_u^2
     - pixel_v^2
     - '1'
-    r_squared: 0.997
+    r_squared: 0.9973
   y_mapping:
     coeffs:
-    - -0.015697
-    - 9.288656
-    - -0.000144
-    - 3.3e-05
-    - -0.016469
-    - -1097.739876
+    - -0.037151
+    - 9.062335
+    - -9.8e-05
+    - 4.5e-05
+    - -0.015928
+    - -1071.057606
     formula: Y = a*u + b*v + c*u*v + d*u^2 + e*v^2 + f
     inputs:
     - pixel_u
@@ -37,4 +37,4 @@ calibration:
     - pixel_u^2
     - pixel_v^2
     - '1'
-    r_squared: 0.9403
+    r_squared: 0.931
