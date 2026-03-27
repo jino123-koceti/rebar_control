@@ -34,10 +34,14 @@ tying_orchestrator:
 
     # Z축 결속 파라미터
     z_home_offset_mm: 100.0      # 호밍 후 Z 대기위치 (홈에서 하강 거리)
-    tying_z_down_mm: 50.0        # 결속 시 추가 Z 하강 (대기위치에서) - 동작 테스트용 (원래 250.0)
+    tying_z_down_mm: 250.0       # 결속 시 추가 Z 하강 (대기위치에서)
+    # tying_z_down_mm: 50.0     # 동작 테스트용 (결속 없이 Z 소폭 하강만)
     deg_per_mm_z: 2.69           # Z축: 1mm = 2.69°
     z_speed_dps: 1000.0          # Z축 속도 (degree/s)
     z_settle_margin: 0.1         # Z축 이동 후 추가 대기 마진 (초)
+    # tying_z_down_mm 변경 시 z_early_xy_mm도 함께 조정할 것
+    # z_early_xy_mm = tying_z_down_mm - (대기높이까지 남은 거리)
+    z_early_xy_mm: 120.0         # Z상승 중 이만큼 오르면 XY 선행 이동 시작 (mm) (250-130=120)
 
     # 트리거 파라미터
     trigger_speed: 1.0           # 트리거 모터 속도 (-1.0 ~ 1.0)

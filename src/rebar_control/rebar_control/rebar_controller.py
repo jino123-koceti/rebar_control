@@ -919,9 +919,21 @@ class RebarController(Node):
             self.publish_cmd_vel(0.0, 0.0)
             return
 
-        # 결속 진행 중에는 주행 정지
+        # 결속 진행 중에는 주행 정지, TYING_COMPLETE 수신 시 다음 WP로 진행
         if self.tying_in_progress:
             self.publish_cmd_vel(0.0, 0.0)
+            if self.tying_complete_received:
+                self.tying_in_progress = False
+                self.tying_complete_received = False
+                elapsed = time.monotonic() - self.waypoint_reached_time
+                self.get_logger().info(
+                    f"✅ 결속 완료 ({elapsed:.1f}초) → 다음 웨이포인트로 진행"
+                )
+                self.flog(f"WP[{self.current_waypoint_index}] 결속 완료 ({elapsed:.1f}초) → 다음 WP")
+                if self.path_received and len(self.waypoint_array_x) > 0:
+                    self._advance_to_next_waypoint()
+                else:
+                    self.publish_waypoint_reached()
             return
 
         # Motion type에 따라 제어 방식 선택

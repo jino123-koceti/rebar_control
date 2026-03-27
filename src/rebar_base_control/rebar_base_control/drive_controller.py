@@ -47,7 +47,9 @@ class DriveController(Node):
         self.publish_frequency = self.get_parameter('publish_frequency').value
 
         # 상태 변수
-        self.control_mode = 'idle'  # 'idle', 'manual', 'auto', 'emergency_stop'
+        self.control_mode = 'idle'  # 'idle', 'manual', 'auto', 'emergency_stop', 'obstacle_pause'
+        self.obstacle_paused = False
+        self.pre_pause_mode = None  # PAUSE 전 모드 저장
         self.cmd_vel_msg = Twist()
         self.remote_control_msg = RemoteControl()
         self.last_drive_msg = DriveControl()
@@ -90,6 +92,14 @@ class DriveController(Node):
             Bool,
             '/emergency_stop',
             self.emergency_stop_callback,
+            10
+        )
+
+        # 장애물 PAUSE 구독
+        self.obstacle_pause_sub = self.create_subscription(
+            Bool,
+            '/obstacle_pause',
+            self.obstacle_pause_callback,
             10
         )
 
@@ -138,6 +148,7 @@ class DriveController(Node):
     def emergency_stop_callback(self, msg: Bool) -> None:
         """E-STOP 시 즉시 정지"""
         if msg.data:
+            self.obstacle_paused = False  # ESTOP이 우선
             self.control_mode = 'emergency_stop'
             stop_msg = DriveControl()
             stop_msg.left_speed = 0.0
@@ -145,6 +156,31 @@ class DriveController(Node):
             stop_msg.lateral_speed = 0.0
             self.drive_control_pub.publish(stop_msg)
             self.last_drive_msg = stop_msg
+
+    def obstacle_pause_callback(self, msg: Bool) -> None:
+        """장애물 감지 → 주행 일시정지/재개"""
+        if self.control_mode == 'emergency_stop':
+            return  # ESTOP 중에는 무시
+
+        if msg.data and not self.obstacle_paused:
+            # PAUSE: 현재 모드 저장 후 정지
+            self.obstacle_paused = True
+            self.pre_pause_mode = self.control_mode
+            self.control_mode = 'obstacle_pause'
+            self.get_logger().warn('장애물 감지 → 주행 PAUSE')
+            stop_msg = DriveControl()
+            stop_msg.left_speed = 0.0
+            stop_msg.right_speed = 0.0
+            stop_msg.lateral_speed = 0.0
+            self.drive_control_pub.publish(stop_msg)
+            self.last_drive_msg = stop_msg
+
+        elif not msg.data and self.obstacle_paused:
+            # RESUME: 이전 모드 복귀
+            self.obstacle_paused = False
+            self.control_mode = self.pre_pause_mode or 'idle'
+            self.pre_pause_mode = None
+            self.get_logger().info('장애물 해제 → 주행 RESUME')
 
     def remote_control_callback(self, msg: RemoteControl) -> None:
         """리모콘 신호 저장 (Manual 모드에서 사용)"""
@@ -198,7 +234,7 @@ class DriveController(Node):
                 )
 
         else:
-            # idle, emergency_stop 등: 정지
+            # idle, emergency_stop, obstacle_pause 등: 정지
             drive_msg.left_speed = 0.0
             drive_msg.right_speed = 0.0
             drive_msg.lateral_speed = 0.0

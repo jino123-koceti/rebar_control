@@ -35,6 +35,7 @@ setup(
             'dual_camera_recorder = rebar_vision.dual_camera_recorder_node:main',
             'rebar_detection = rebar_vision.rebar_detection_node:main',
             'tying_orchestrator = rebar_vision.tying_orchestrator_node:main',
+            'obstacle_detector = rebar_vision.obstacle_detector_node:main',
         ],
     },
 )

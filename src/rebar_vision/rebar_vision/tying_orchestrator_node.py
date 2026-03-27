@@ -35,7 +35,7 @@ from rebar_base_interfaces.srv import DetectCrossings
 import logging
 import os
 from datetime import datetime
-from std_msgs.msg import String, Float32
+from std_msgs.msg import String, Float32, Bool
 import json
 import time
 import numpy as np
@@ -124,7 +124,7 @@ class TyingOrchestratorNode(Node):
         self.declare_parameter('deg_per_mm_z', 11.0)           # Z축: 1mm = 11.0° (실측 보정 필요)
         self.declare_parameter('z_speed_dps', 200.0)           # Z축 속도 (degree/s)
         self.declare_parameter('z_settle_margin', 1.0)         # Z축 이동 후 추가 대기 (초)
-        self.declare_parameter('z_early_xy_mm', 20.0)          # Z상승 중 이 높이 오르면 XY 선행 시작 (mm)
+        self.declare_parameter('z_early_xy_mm', 120.0)         # Z상승 중 이 높이 오르면 XY 선행 시작 (mm)
         # 트리거 파라미터
         self.declare_parameter('trigger_speed', 1.0)           # 트리거 모터 속도 (-1.0 ~ 1.0)
         self.declare_parameter('trigger_duration', 1.0)        # 트리거 동작 시간 (초)
@@ -265,6 +265,12 @@ class TyingOrchestratorNode(Node):
             self._homing_status_cb, 10
         )
 
+        # 장애물 PAUSE 구독
+        self.obstacle_pause_sub = self.create_subscription(
+            Bool, '/obstacle_pause',
+            self._obstacle_pause_cb, 10
+        )
+
         self.joint_pub = self.create_publisher(
             JointControl, '/joint_control', 10
         )
@@ -338,6 +344,30 @@ class TyingOrchestratorNode(Node):
     # ============================================
     # 콜백
     # ============================================
+    def _obstacle_pause_cb(self, msg: Bool):
+        """장애물 감지 → 결속 일시정지/재개"""
+        if msg.data:
+            # PAUSE
+            if self.state in (TyingState.EXECUTING_ACTION,
+                              TyingState.WAITING_SETTLE,
+                              TyingState.WAITING_Z,
+                              TyingState.WAITING_Z_XY,
+                              TyingState.WAITING_TRIGGER):
+                self.get_logger().warn('장애물 감지 → 결속 PAUSE')
+                self.paused_from_state = self.state
+                self._transition_to(TyingState.PAUSED)
+                self.tying_message = '장애물 감지 - 일시 정지'
+                self._publish_tying_feedback()
+        else:
+            # RESUME
+            if self.state == TyingState.PAUSED and self.paused_from_state is not None:
+                self.get_logger().info('장애물 해제 → 결속 RESUME')
+                resume_state = self.paused_from_state or TyingState.EXECUTING_ACTION
+                self.paused_from_state = None
+                self.tying_message = '재개'
+                self._transition_to(resume_state)
+                self._publish_tying_feedback()
+
     def _mission_command_cb(self, msg: String):
         """외부 UI 명령 처리 (/mission/command ← Zenoh rebar/command)
 
