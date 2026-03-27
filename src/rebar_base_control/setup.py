@@ -35,6 +35,7 @@ setup(
             'ezi_io_controller = rebar_base_control.ezi_io_controller:main',
             'sequence_controller = rebar_base_control.sequence_controller:main',
             'encoder_odom = rebar_base_control.encoder_odom:main',
+            'homing_controller = rebar_base_control.homing_controller:main',
         ],
     },
 )

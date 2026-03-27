@@ -20,19 +20,6 @@ from std_msgs.msg import String, Bool
 import time
 import os
 from datetime import datetime
-from enum import Enum
-
-
-class HomingState(Enum):
-    IDLE = 0
-    Z_UP = 1            # Z축 상승 (z_min)
-    COARSE_HOME = 2     # X+Y+Yaw 동시 리미트 이동 (거시적 호밍)
-    BACK_OFF = 3        # 리미트에서 후퇴
-    FINE_HOME = 4       # 느린 속도로 다시 리미트 접근 (미시적 호밍)
-    MOVE_TO_READY = 5   # 준비 위치로 이동
-    COMPLETE = 6
-    Z_ONLY_UP = 7       # Z축 단독 호밍: z_min까지 상승
-    Z_ONLY_READY = 8    # Z축 단독 호밍: ready 위치로 하강
 
 
 class JointController(Node):
@@ -78,18 +65,6 @@ class JointController(Node):
         # 리밋 센서 사용 여부
         self.declare_parameter('use_limit_sensors', True)
 
-        # Homing parameters
-        self.declare_parameter('homing_speed', 100.0)
-        self.declare_parameter('homing_fine_speed', 30.0)
-        self.declare_parameter('homing_backoff_time', 0.5)
-        self.declare_parameter('homing_timeout', 30.0)
-        self.declare_parameter('yaw_home_encoder_90', 16328)
-        self.declare_parameter('yaw_max_encoder_90', 44710)
-        self.declare_parameter('yaw_full_stroke_deg', 400.0)
-        self.declare_parameter('ready_x_mm', 0.0)
-        self.declare_parameter('ready_y_mm', 0.0)
-        self.declare_parameter('ready_z_mm', 0.0)
-        self.declare_parameter('ready_yaw_deg', 0.0)
 
         self.lateral_step = self.get_parameter('lateral_step_deg').value
         self.lateral_speed = self.get_parameter('lateral_max_speed').value
@@ -112,18 +87,6 @@ class JointController(Node):
         self.joystick_scale = self.get_parameter('joystick_scale').value
         self.use_limit_sensors = self.get_parameter('use_limit_sensors').value
 
-        # Homing parameter values
-        self.homing_speed = self.get_parameter('homing_speed').value
-        self.homing_fine_speed = self.get_parameter('homing_fine_speed').value
-        self.homing_backoff_time = self.get_parameter('homing_backoff_time').value
-        self.homing_timeout = self.get_parameter('homing_timeout').value
-        self.yaw_home_enc_90 = int(self.get_parameter('yaw_home_encoder_90').value)
-        self.yaw_max_enc_90 = int(self.get_parameter('yaw_max_encoder_90').value)
-        self.yaw_full_stroke = self.get_parameter('yaw_full_stroke_deg').value
-        self.ready_x_mm = self.get_parameter('ready_x_mm').value
-        self.ready_y_mm = self.get_parameter('ready_y_mm').value
-        self.ready_z_mm = self.get_parameter('ready_z_mm').value
-        self.ready_yaw_deg = self.get_parameter('ready_yaw_deg').value
 
         # 리밋 센서 상태 (True = 리밋 도달, False = 정상)
         self.limit_sensors = {
@@ -188,20 +151,16 @@ class JointController(Node):
         self.lateral_complete_pub = self.create_publisher(
             String, '/lateral_motion_complete', 10)
 
-        # Homing topics
-        self.homing_cmd_sub = self.create_subscription(
-            String, '/homing_cmd', self._recv_homing_cmd, 10)
-        self.homing_status_pub = self.create_publisher(
-            String, '/homing_status', 10)
 
         # 비상정지: /emergency_stop (Bool) → 전체 모터 즉시 정지
         self.emergency_stop_sub = self.create_subscription(
             Bool, '/emergency_stop', self._emergency_stop_callback, 10)
         self.emergency_stopped = False
 
-        # 비상정지: /mission/command의 EMERGENCY_STOP/CANCEL → 호밍 중지
-        self.mission_cmd_sub = self.create_subscription(
-            String, '/mission/command', self._mission_command_callback, 10)
+        # 호밍 레퍼런스 수신 (homing_controller가 발행)
+        self.homing_references = {}
+        self.create_subscription(
+            String, '/homing_status', self._recv_homing_status, 10)
 
         # Auto 모드 횡이동 추적 상태
         self.auto_lateral_target_encoder = None  # 목표 엔코더 값
@@ -230,16 +189,6 @@ class JointController(Node):
         self.yaw_angle = None           # 0x147 현재 각도
         self.yaw_angle_time = 0.0
 
-        # Homing state
-        self.homing_state = HomingState.IDLE
-        self.homing_cmd_sent = False
-        self.homing_start_time = 0.0
-        self.homing_state_start_time = 0.0
-        self.homing_references = {}  # {motor_id: reference_angle_0x92}
-        self.homing_axes_done = set()  # COARSE/FINE 완료 축 추적: {'x', 'y', 'yaw'}
-        self.is_homed = False
-        self.yaw_encoder_90 = None  # Yaw 0x90 value (16-bit)
-        self.yaw_encoder_90_time = 0.0
 
         # 조이스틱 연속 제어 상태
         self.stage_x_moving = False     # X축 이동 중 플래그
@@ -338,9 +287,6 @@ class JointController(Node):
             else:
                 self.get_logger().info(f"✅ 리밋 해제: {name}")
 
-        # Homing: rising edge (False→True) 감지
-        if self.homing_state != HomingState.IDLE and not prev_state and msg.data:
-            self._homing_on_limit_triggered(name)
 
     def _check_limit_safe(self, axis: str, direction: float) -> bool:
         """리밋 센서 체크하여 이동 가능 여부 반환
@@ -563,15 +509,7 @@ class JointController(Node):
             self._request_output_angle(0x145)  # Y축 0x92 요청
             self._request_output_angle(0x146)  # Z축 0x92 요청
             self._request_output_angle(0x147)  # Yaw 0x92 요청
-            # Homing 중: Yaw 0x90 추가 요청
-            if self.homing_state != HomingState.IDLE:
-                self._request_single_turn_encoder(0x147)
             self.last_angle_request_time = current_time
-
-        # Homing 중: 호밍 상태머신만 실행 (일반 제어 비활성화)
-        if self.homing_state != HomingState.IDLE:
-            self._homing_loop()
-            return
 
         # Auto 모드: 횡이동 완료 감지만 수행 (리모콘 입력 무시)
         if self.control_mode == 'auto':
@@ -928,15 +866,6 @@ class JointController(Node):
             else:
                 self.get_logger().warn("⛔ Z축 상한 리밋 도달 - 상승 명령 무시")
 
-    def _send_homing_speeds(self, commands):
-        """호밍용: 다수 모터에 속도 명령 동시 전송 (CAN 직접)
-
-        Args:
-            commands: [(motor_id, speed_dps), ...] 리스트
-        """
-        for motor_id, speed_dps in commands:
-            self._send_speed_command(motor_id, speed_dps)
-
     def _send_speed_command(self, joint_id, speed_dps):
         """JointControl 메시지 발행 (속도 제어) - 조이스틱 연속 제어용
 
@@ -1207,10 +1136,6 @@ class JointController(Node):
                     self._send_speed_command(motor_id, 0.0)
                 # 횡이동 모터도 정지
                 self._send_speed_command(0x143, 0.0)
-                # 호밍 중이면 중지
-                if self.homing_state != HomingState.IDLE:
-                    self.homing_state = HomingState.IDLE
-                    self._publish_homing_status("EMERGENCY_STOPPED")
                 # Auto 횡이동 중이면 중지
                 self.auto_lateral_in_progress = False
                 self.auto_lateral_target_encoder = None
@@ -1219,536 +1144,23 @@ class JointController(Node):
                 self.emergency_stopped = False
                 self.get_logger().info("✅ [ESTOP] 비상정지 해제")
 
-    def _mission_command_callback(self, msg: String):
-        """UI 비상정지 명령 수신 → 호밍 중이면 즉시 정지"""
-        try:
-            import json
-            data = json.loads(msg.data)
-            cmd = data.get('command', '')
-        except (json.JSONDecodeError, AttributeError):
-            cmd = msg.data.strip().upper()
-
-        if cmd in ('EMERGENCY_STOP', 'CANCEL', 'E-STOP', 'STOP'):
-            if self.homing_state != HomingState.IDLE:
-                self.get_logger().error(
-                    f"🛑 비상정지({cmd}) → 호밍 즉시 중지!")
-                for motor_id in [0x144, 0x145, 0x146, 0x147]:
-                    self._send_speed_command(motor_id, 0.0)
-                self.homing_state = HomingState.IDLE
-                self._publish_homing_status("EMERGENCY_STOPPED")
-
-    # ==================== Homing Methods ====================
-
-    def _recv_homing_cmd(self, msg: String):
-        """호밍 명령 수신: START, STOP, SET_READY"""
-        cmd = msg.data.strip().upper()
-
-        if cmd == 'START':
-            if self.homing_state != HomingState.IDLE:
-                self.get_logger().warn("Homing already in progress")
-                return
-            # TODO: Yaw 안전 체크 - 하드웨어 리밋센서 추가 후 구현 예정
-            # (0x90 기반 체크는 기어 백래쉬/슬립으로 신뢰 불가)
-            self.get_logger().info("=" * 60)
-            self.get_logger().info("  HOMING SEQUENCE START")
-            self.get_logger().info("=" * 60)
-            self.flog("========== HOMING SEQUENCE START ==========")
-            self.homing_start_time = time.monotonic()
-            self.homing_references = {}
-            self.homing_axes_done = set()
-            self.is_homed = False
-            self._homing_enter_state(HomingState.Z_UP)
-
-        elif cmd == 'STOP':
-            if self.homing_state != HomingState.IDLE:
-                self.get_logger().warn("Homing STOPPED by user")
-                for motor_id in [0x144, 0x145, 0x146, 0x147]:
-                    self._send_speed_command(motor_id, 0.0)
-                self.homing_state = HomingState.IDLE
-                self._publish_homing_status("STOPPED")
-
-        elif cmd == 'Z_HOME':
-            if self.homing_state != HomingState.IDLE:
-                self.get_logger().warn("Z_HOME: homing already in progress")
-                return
-            self.get_logger().info("=" * 60)
-            self.get_logger().info("  Z ONLY HOMING START")
-            self.get_logger().info("=" * 60)
-            self.homing_start_time = time.monotonic()
-            self._homing_enter_state(HomingState.Z_ONLY_UP)
-
-        elif cmd == 'SET_READY':
-            if not self.is_homed:
-                self.get_logger().warn("Cannot SET_READY: not homed yet")
-                return
-            self._set_ready_position()
-
-    def _homing_enter_state(self, new_state: HomingState):
-        """호밍 상태 전환"""
-        self.get_logger().info(f"Homing: {self.homing_state.name} -> {new_state.name}")
-        self.homing_state = new_state
-        self.homing_cmd_sent = False
-        self.homing_state_start_time = time.monotonic()
-        self._publish_homing_status(f"HOMING_{new_state.name}")
-
-    def _publish_homing_status(self, status: str):
-        """호밍 상태 발행"""
-        status_msg = String()
-        status_msg.data = status
-        self.homing_status_pub.publish(status_msg)
-
-
-    def _homing_loop(self):
-        """호밍 상태머신 - process_joint_control에서 호출 (20Hz)
-        Z↑ → COARSE(X+Y+Yaw 동시) → BACK_OFF → FINE(X+Y+Yaw 동시) → READY
-        """
-        now = time.monotonic()
-
-        # 타임아웃 체크
-        if now - self.homing_state_start_time > self.homing_timeout:
-            self.get_logger().error(
-                f"Homing TIMEOUT in state {self.homing_state.name} "
-                f"({now - self.homing_state_start_time:.1f}s)"
-            )
-            self._homing_fail("TIMEOUT")
-            return
-
-        # === Z_UP: Z축 상승 (z_min 리미트까지) ===
-        if self.homing_state == HomingState.Z_UP:
-            if not self.homing_cmd_sent:
-                # 센서 안정화 대기 (0.5초): 전원 재투입 직후 z_min 센서 읽기 지연 방지
-                if now - self.homing_state_start_time < 0.5:
-                    if self.limit_sensors.get('z_min', False):
-                        self.get_logger().info("Homing: Z already at z_min (early detect), skipping")
-                        if self.stage_z_angle is not None:
-                            self.homing_references[0x146] = self.stage_z_angle
-                        self._homing_enter_state(HomingState.COARSE_HOME)
-                    return  # 안정화 대기 중
-                if self.limit_sensors.get('z_min', False):
-                    self.get_logger().info("Homing: Z already at z_min, skipping")
-                    if self.stage_z_angle is not None:
-                        self.homing_references[0x146] = self.stage_z_angle
-                    self._homing_enter_state(HomingState.COARSE_HOME)
-                    return
-                self._send_joint_command_rel(
-                    0x146, -9999.0, self.homing_speed, 'Homing: Z UP'
-                )
-                self.homing_cmd_sent = True
-                self.get_logger().info("Homing: Z moving UP to z_min")
-            # Transition: z_min limit sensor → _homing_on_limit_triggered
-
-        # === COARSE_HOME: X+Y+Yaw 동시에 리미트로 이동 (거시적 호밍) ===
-        elif self.homing_state == HomingState.COARSE_HOME:
-            if not self.homing_cmd_sent:
-                self.homing_axes_done = set()
-                # 이미 리미트에 있는 축은 건너뛰기
-                if self.limit_sensors.get('x_min', False):
-                    self.homing_axes_done.add('x')
-                    self.get_logger().info("Homing COARSE: X already at x_min")
-                if self.limit_sensors.get('y_min', False):
-                    self.homing_axes_done.add('y')
-                    self.get_logger().info("Homing COARSE: Y already at y_min")
-                if self.limit_sensors.get('yaw_home', False):
-                    self.homing_axes_done.add('yaw')
-                    self.get_logger().info("Homing COARSE: Yaw already at home")
-                if len(self.homing_axes_done) == 3:
-                    self.get_logger().info("Homing COARSE: All axes at limits, skipping")
-                    self._homing_enter_state(HomingState.BACK_OFF)
-                    return
-                self.homing_cmd_sent = True
-                yaw_spd = self.homing_speed * 0.5
-                self.get_logger().info(
-                    f"Homing COARSE: X+Y @ {self.homing_speed} dps, Yaw @ {yaw_spd} dps"
-                )
-            # 아직 리미트 도달하지 않은 축만 속도 명령 동시 전송
-            cmds = []
-            if 'x' not in self.homing_axes_done:
-                cmds.append((0x144, self.homing_speed))
-            if 'y' not in self.homing_axes_done:
-                cmds.append((0x145, -self.homing_speed))
-            if 'yaw' not in self.homing_axes_done:
-                cmds.append((0x147, -self.homing_speed * 0.5))
-            if cmds:
-                self._send_homing_speeds(cmds)
-            # Transition: 모든 축 리미트 → _homing_on_limit_triggered
-
-        # === BACK_OFF: 리미트에서 후퇴 (센서 해제될 때까지) ===
-        elif self.homing_state == HomingState.BACK_OFF:
-            if not self.homing_cmd_sent:
-                self.homing_cmd_sent = True
-                self.homing_axes_done = set()  # 센서 해제된 축 추적
-                self.get_logger().info("Homing BACK_OFF: Retreating until sensors release")
-            # 아직 센서 ON인 축만 후퇴, 해제된 축은 정지
-            cmds = []
-            if self.limit_sensors.get('x_min', False):
-                cmds.append((0x144, -self.homing_speed))
-            elif 'x' not in self.homing_axes_done:
-                cmds.append((0x144, 0.0))
-                self.homing_axes_done.add('x')
-                self.get_logger().info("Homing BACK_OFF: X sensor released")
-            if self.limit_sensors.get('y_min', False):
-                cmds.append((0x145, self.homing_speed))
-            elif 'y' not in self.homing_axes_done:
-                cmds.append((0x145, 0.0))
-                self.homing_axes_done.add('y')
-                self.get_logger().info("Homing BACK_OFF: Y sensor released")
-            if self.limit_sensors.get('yaw_home', False):
-                cmds.append((0x147, self.homing_speed * 0.5))
-            elif 'yaw' not in self.homing_axes_done:
-                cmds.append((0x147, 0.0))
-                self.homing_axes_done.add('yaw')
-                self.get_logger().info("Homing BACK_OFF: Yaw sensor released")
-            if cmds:
-                self._send_homing_speeds(cmds)
-            # 3축 모두 센서 해제 → FINE_HOME
-            if len(self.homing_axes_done) >= 3:
-                self._send_homing_speeds([(0x144, 0.0), (0x145, 0.0), (0x147, 0.0)])
-                self.get_logger().info("Homing BACK_OFF: All sensors released")
-                self._homing_enter_state(HomingState.FINE_HOME)
-
-        # === FINE_HOME: 느린 속도로 다시 리미트 접근 (미시적 호밍) ===
-        elif self.homing_state == HomingState.FINE_HOME:
-            if not self.homing_cmd_sent:
-                self.homing_axes_done = set()
-                # BACK_OFF 후에도 여전히 리미트에 있는 축 건너뛰기
-                if self.limit_sensors.get('x_min', False):
-                    self.homing_axes_done.add('x')
-                    if self.stage_x_angle is not None:
-                        self.homing_references[0x144] = self.stage_x_angle
-                    self.get_logger().info("Homing FINE: X still at x_min, skipping")
-                if self.limit_sensors.get('y_min', False):
-                    self.homing_axes_done.add('y')
-                    if self.stage_y_angle is not None:
-                        self.homing_references[0x145] = self.stage_y_angle
-                    self.get_logger().info("Homing FINE: Y still at y_min, skipping")
-                if self.limit_sensors.get('yaw_home', False):
-                    self.homing_axes_done.add('yaw')
-                    if self.yaw_angle is not None:
-                        self.homing_references[0x147] = self.yaw_angle
-                    self.get_logger().info("Homing FINE: Yaw still at home, skipping")
-                if len(self.homing_axes_done) >= 3:
-                    self.get_logger().info("Homing FINE: All at limits, skipping to READY")
-                    self._homing_enter_state(HomingState.MOVE_TO_READY)
-                    return
-                self.homing_cmd_sent = True
-                moving = 3 - len(self.homing_axes_done)
-                yaw_fine = self.homing_fine_speed * 0.5
-                self.get_logger().info(
-                    f"Homing FINE: {moving} axes, X+Y @ {self.homing_fine_speed} dps, Yaw @ {yaw_fine} dps"
-                )
-            # 아직 리미트 도달하지 않은 축만 속도 명령 동시 전송
-            cmds = []
-            if 'x' not in self.homing_axes_done:
-                cmds.append((0x144, self.homing_fine_speed))
-            if 'y' not in self.homing_axes_done:
-                cmds.append((0x145, -self.homing_fine_speed))
-            if 'yaw' not in self.homing_axes_done:
-                cmds.append((0x147, -self.homing_fine_speed * 0.5))
-            if cmds:
-                self._send_homing_speeds(cmds)
-            # Transition: 모든 축 리미트 → _homing_on_limit_triggered
-
-        # === MOVE_TO_READY ===
-        elif self.homing_state == HomingState.MOVE_TO_READY:
-            if not self.homing_cmd_sent:
-                self.flog("MOVE_TO_READY: 준비자세 이동 시작")
-                self._move_axes_to_ready()
-                self.homing_cmd_sent = True
-                self.homing_state_start_time = time.monotonic()  # 타임아웃 리셋
-            else:
-                # 최소 1초 대기 후 도달 판정 (0x92 피드백 기반)
-                if now - self.homing_state_start_time < 1.0:
-                    return
-                tolerance = 5.0  # deg
-                angle_map = {
-                    0x144: self.stage_x_angle,
-                    0x145: self.stage_y_angle,
-                    0x146: self.stage_z_angle,
-                    0x147: self.yaw_angle,
+    def _recv_homing_status(self, msg: String):
+        """homing_controller에서 발행한 호밍 완료 메시지 수신 → 레퍼런스 저장"""
+        if msg.data.startswith('COMPLETE:'):
+            try:
+                import json
+                ref_json = msg.data.split(':', 1)[1]
+                ref_data = json.loads(ref_json)
+                self.homing_references = {
+                    0x144: ref_data.get('x', 0.0),
+                    0x145: ref_data.get('y', 0.0),
+                    0x146: ref_data.get('z', 0.0),
+                    0x147: ref_data.get('yaw', 0.0),
                 }
-                phase = getattr(self, 'ready_phase', 2)
-
-                # X축 phase 1→2→3 별도 판정
-                if phase in (1, 2) and hasattr(self, 'ready_x_final'):
-                    x_current = angle_map.get(0x144)
-                    x_target = self.ready_targets.get(0x144)
-                    if x_current is not None and x_target is not None:
-                        if abs(x_current - x_target) <= tolerance:
-                            if phase == 1:
-                                # phase 1 도달 → phase 2 (2/3 지점)
-                                self.ready_phase = 2
-                                self._send_joint_command_abs(
-                                    0x144, self.ready_x_step2,
-                                    self.stage_x_speed, 'Ready: X (2/3)')
-                                self.ready_targets[0x144] = self.ready_x_step2
-                                self.homing_state_start_time = time.monotonic()
-                                self.get_logger().info(
-                                    f"Homing: X phase 2 → {self.ready_x_step2:.1f}°")
-                                self.flog(f"MOVE_TO_READY: X phase 1 도달 → phase 2 ({self.ready_x_step2:.1f}°)")
-                                return
-                            else:
-                                # phase 2 도달 → phase 3 (최종)
-                                self.ready_phase = 3
-                                self._send_joint_command_abs(
-                                    0x144, self.ready_x_final,
-                                    self.stage_x_speed, 'Ready: X (3/3)')
-                                self.ready_targets[0x144] = self.ready_x_final
-                                self.homing_state_start_time = time.monotonic()
-                                self.get_logger().info(
-                                    f"Homing: X phase 3 → {self.ready_x_final:.1f}°")
-                                self.flog(f"MOVE_TO_READY: X phase 2 도달 → phase 3 ({self.ready_x_final:.1f}°)")
-                                return
-
-                # 전체 축 도달 판정 (X는 phase 2 타겟 기준)
-                all_reached = True
-                for motor_id, target in getattr(self, 'ready_targets', {}).items():
-                    current = angle_map.get(motor_id)
-                    if current is None:
-                        all_reached = False
-                        continue
-                    if abs(current - target) > tolerance:
-                        all_reached = False
-                        break
-                if all_reached:
-                    self.get_logger().info("Homing: All axes reached ready position")
-                    self.flog("MOVE_TO_READY: 전축 도달 완료")
-                    self._homing_enter_state(HomingState.COMPLETE)
-                elif now - self.homing_state_start_time > 15.0:
-                    # 타임아웃 - 도달 못해도 완료 처리
-                    remaining = {
-                        hex(mid): f'{angle_map.get(mid, 0):.1f}/{tgt:.1f}'
-                        for mid, tgt in getattr(self, 'ready_targets', {}).items()
-                        if angle_map.get(mid) is not None and abs(angle_map[mid] - tgt) > tolerance
-                    }
-                    self.get_logger().warn(
-                        f"Homing: Ready position timeout (15s), remaining: {remaining}")
-                    self.flog(f"MOVE_TO_READY: 타임아웃(15s) remaining={remaining}")
-                    self._homing_enter_state(HomingState.COMPLETE)
-
-        # === Z_ONLY_UP: Z축 단독 호밍 - z_min까지 상승 ===
-        elif self.homing_state == HomingState.Z_ONLY_UP:
-            if not self.homing_cmd_sent:
-                # 센서 안정화 대기 (0.5초)
-                if now - self.homing_state_start_time < 0.5:
-                    if self.limit_sensors.get('z_min', False):
-                        self.get_logger().info("Z_HOME: Z already at z_min, skipping UP")
-                        if self.stage_z_angle is not None:
-                            self.homing_references[0x146] = self.stage_z_angle
-                        self._homing_enter_state(HomingState.Z_ONLY_READY)
-                    return
-                if self.limit_sensors.get('z_min', False):
-                    self.get_logger().info("Z_HOME: Z already at z_min")
-                    if self.stage_z_angle is not None:
-                        self.homing_references[0x146] = self.stage_z_angle
-                    self._homing_enter_state(HomingState.Z_ONLY_READY)
-                    return
-                self._send_joint_command_rel(
-                    0x146, -9999.0, self.homing_speed, 'Z_HOME: Z UP'
-                )
-                self.homing_cmd_sent = True
-                self.get_logger().info("Z_HOME: Z moving UP to z_min")
-            # Transition: z_min → _homing_on_limit_triggered → Z_ONLY_READY
-
-        # === Z_ONLY_READY: Z축 단독 호밍 - ready 위치로 하강 ===
-        elif self.homing_state == HomingState.Z_ONLY_READY:
-            if not self.homing_cmd_sent:
-                if 0x146 in self.homing_references:
-                    z_offset_deg = self.ready_z_mm * self.stage_z_step
-                    z_target = self.homing_references[0x146] + z_offset_deg
-                    self._send_joint_command_abs(0x146, z_target, self.stage_z_speed, 'Z_HOME: Z READY')
-                    self.get_logger().info(
-                        f"Z_HOME: Z → ready ({self.ready_z_mm}mm, {z_target:.1f}°)"
-                    )
-                    self.homing_cmd_sent = True
-                else:
-                    self.get_logger().warn("Z_HOME: no Z reference, cannot move to ready")
-                    self.homing_state = HomingState.IDLE
-                    self._publish_homing_status("Z_HOME_FAILED")
-            else:
-                # ready 위치 도달 확인 (목표각도 ±허용오차)
-                if self.stage_z_angle is not None and 0x146 in self.homing_references:
-                    z_target = self.homing_references[0x146] + self.ready_z_mm * self.stage_z_step
-                    if abs(self.stage_z_angle - z_target) < self.position_tolerance:
-                        self.get_logger().info("Z_HOME: complete ✅")
-                        self._publish_homing_status("Z_HOME_COMPLETE")
-                        self.homing_state = HomingState.IDLE
-                # 타임아웃
-                elif now - self.homing_state_start_time > self.homing_timeout:
-                    self.get_logger().warn("Z_HOME: timeout waiting for Z ready")
-                    self._publish_homing_status("Z_HOME_COMPLETE")
-                    self.homing_state = HomingState.IDLE
-
-        elif self.homing_state == HomingState.COMPLETE:
-            self.is_homed = True
-            # Reference angles를 JSON으로 포함하여 발행
-            import json
-            ref_data = {
-                'x': self.homing_references.get(0x144, 0.0),
-                'y': self.homing_references.get(0x145, 0.0),
-                'z': self.homing_references.get(0x146, 0.0),
-                'yaw': self.homing_references.get(0x147, 0.0),
-            }
-            self._publish_homing_status(f"COMPLETE:{json.dumps(ref_data)}")
-            elapsed = now - self.homing_start_time
-            self.get_logger().info("=" * 60)
-            self.get_logger().info(f"  HOMING COMPLETE ({elapsed:.1f}s)")
-            self.get_logger().info(f"  References: {self.homing_references}")
-            self.get_logger().info("=" * 60)
-            self.flog(f"========== HOMING COMPLETE ({elapsed:.1f}s) ==========")
-            self.flog(f"  References: {self.homing_references}")
-            self.homing_state = HomingState.IDLE
-
-    def _homing_on_limit_triggered(self, sensor_name: str):
-        """호밍 중 리밋 센서 트리거 처리 (rising edge)"""
-
-        if self.homing_state == HomingState.Z_UP and sensor_name == 'z_min':
-            self._send_speed_command(0x146, 0.0)
-            if self.stage_z_angle is not None:
-                self.homing_references[0x146] = self.stage_z_angle
-                # joint_positions 동기화 (상대이동 -9999로 오염된 값 복구)
-                self._send_joint_command_abs(
-                    0x146, self.stage_z_angle, 0.0, 'Homing: Z sync'
-                )
-            self.get_logger().info(f"Homing: Z reached z_min (ref={self.stage_z_angle})")
-            self._homing_enter_state(HomingState.COARSE_HOME)
-
-        elif self.homing_state == HomingState.Z_ONLY_UP and sensor_name == 'z_min':
-            self._send_speed_command(0x146, 0.0)
-            if self.stage_z_angle is not None:
-                self.homing_references[0x146] = self.stage_z_angle
-                # joint_positions 동기화 (상대이동 -9999로 오염된 값 복구)
-                self._send_joint_command_abs(
-                    0x146, self.stage_z_angle, 0.0, 'Z_HOME: Z sync'
-                )
-            self.get_logger().info(f"Z_HOME: Z reached z_min (ref={self.stage_z_angle})")
-            self._homing_enter_state(HomingState.Z_ONLY_READY)
-
-        elif self.homing_state in (HomingState.COARSE_HOME, HomingState.FINE_HOME):
-            phase = "COARSE" if self.homing_state == HomingState.COARSE_HOME else "FINE"
-            next_state = HomingState.BACK_OFF if self.homing_state == HomingState.COARSE_HOME else HomingState.MOVE_TO_READY
-
-            if sensor_name == 'x_min' and 'x' not in self.homing_axes_done:
-                self._send_homing_speeds([(0x144, 0.0)])
-                self.homing_axes_done.add('x')
-                if self.homing_state == HomingState.FINE_HOME and self.stage_x_angle is not None:
-                    self.homing_references[0x144] = self.stage_x_angle
-                self.get_logger().info(f"Homing {phase}: X reached x_min (ref={self.stage_x_angle})")
-
-            elif sensor_name == 'y_min' and 'y' not in self.homing_axes_done:
-                self._send_homing_speeds([(0x145, 0.0)])
-                self.homing_axes_done.add('y')
-                if self.homing_state == HomingState.FINE_HOME and self.stage_y_angle is not None:
-                    self.homing_references[0x145] = self.stage_y_angle
-                self.get_logger().info(f"Homing {phase}: Y reached y_min (ref={self.stage_y_angle})")
-
-            elif sensor_name == 'yaw_home' and 'yaw' not in self.homing_axes_done:
-                self._send_homing_speeds([(0x147, 0.0)])
-                self.homing_axes_done.add('yaw')
-                if self.homing_state == HomingState.FINE_HOME and self.yaw_angle is not None:
-                    self.homing_references[0x147] = self.yaw_angle
-                self.get_logger().info(f"Homing {phase}: Yaw reached home (ref={self.yaw_angle})")
-
-            # 3축 모두 완료 시 다음 상태로 전환
-            if len(self.homing_axes_done) >= 3:
-                self.get_logger().info(f"Homing {phase}: All axes done -> {next_state.name}")
-                self._homing_enter_state(next_state)
-
-    def _homing_fail(self, reason: str):
-        """호밍 실패 처리"""
-        self._send_homing_speeds([
-            (0x144, 0.0), (0x145, 0.0), (0x146, 0.0), (0x147, 0.0)
-        ])
-        self.homing_state = HomingState.IDLE
-        self._publish_homing_status(f"FAILED:{reason}")
-        self.get_logger().error(f"Homing FAILED: {reason}")
-
-    def _move_axes_to_ready(self):
-        """호밍 완료 후 준비 위치로 이동 + can_sender joint_positions 동기화
-
-        X축은 이동량이 클 수 있어 3단계 분할 이동 (100mm × 3):
-        1차: homing_ref에서 1/3 지점까지
-        2차: 1/3에서 2/3 지점까지
-        3차: 2/3에서 최종 목표까지
-        """
-        self.get_logger().info("Homing: Moving to ready positions...")
-        self.flog("MOVE_TO_READY: 준비자세 명령 전송")
-        self.ready_targets = {}
-        self.ready_phase = 1  # X축 분할 이동 단계 (1→2→3)
-
-        # X: 3단계 분할 이동
-        if 0x144 in self.homing_references:
-            x_offset_deg = self.ready_x_mm * self.stage_x_step
-            x_target = self.homing_references[0x144] + x_offset_deg
-            x_ref = self.homing_references[0x144]
-            x_step1 = x_ref + (x_target - x_ref) / 3.0
-            x_step2 = x_ref + (x_target - x_ref) * 2.0 / 3.0
-            self.ready_x_final = x_target
-            self.ready_x_step2 = x_step2
-            # 1차: 1/3 지점까지
-            self._send_joint_command_abs(0x144, x_step1, self.stage_x_speed, 'Ready: X (1/3)')
-            self.ready_targets[0x144] = x_step1
-            self.flog(f"  X: ref={x_ref:.1f} → step1={x_step1:.1f} → step2={x_step2:.1f} → final={x_target:.1f}")
-
-        # Y: reference + offset (mm -> deg)
-        if 0x145 in self.homing_references:
-            y_offset_deg = self.ready_y_mm * self.stage_y_step
-            y_target = self.homing_references[0x145] + y_offset_deg
-            self._send_joint_command_abs(0x145, y_target, self.stage_y_speed, 'Ready: Y')
-            self.ready_targets[0x145] = y_target
-
-        # Z: reference + offset (mm -> deg)
-        if 0x146 in self.homing_references:
-            z_offset_deg = self.ready_z_mm * self.stage_z_step
-            z_target = self.homing_references[0x146] + z_offset_deg
-            self._send_joint_command_abs(0x146, z_target, self.stage_z_speed, 'Ready: Z')
-            self.ready_targets[0x146] = z_target
-
-        # Yaw: reference + offset (deg directly)
-        if 0x147 in self.homing_references:
-            yaw_target = self.homing_references[0x147] + self.ready_yaw_deg
-            self._send_joint_command_abs(0x147, yaw_target, self.yaw_speed, 'Ready: Yaw')
-            self.ready_targets[0x147] = yaw_target
-
-    def _set_ready_position(self):
-        """현재 위치를 준비 위치로 기록 (YAML 업데이트 값 출력)"""
-        self.get_logger().info("=" * 60)
-        self.get_logger().info("  SET READY POSITION")
-        self.get_logger().info("=" * 60)
-
-        if 0x144 in self.homing_references and self.stage_x_angle is not None:
-            offset_deg = self.stage_x_angle - self.homing_references[0x144]
-            offset_mm = offset_deg / self.stage_x_step if self.stage_x_step != 0 else 0
-            self.get_logger().info(
-                f"  X: ref={self.homing_references[0x144]:.1f} -> "
-                f"cur={self.stage_x_angle:.1f} = {offset_mm:.1f}mm"
-            )
-
-        if 0x145 in self.homing_references and self.stage_y_angle is not None:
-            offset_deg = self.stage_y_angle - self.homing_references[0x145]
-            offset_mm = offset_deg / self.stage_y_step if self.stage_y_step != 0 else 0
-            self.get_logger().info(
-                f"  Y: ref={self.homing_references[0x145]:.1f} -> "
-                f"cur={self.stage_y_angle:.1f} = {offset_mm:.1f}mm"
-            )
-
-        if 0x146 in self.homing_references and self.stage_z_angle is not None:
-            offset_deg = self.stage_z_angle - self.homing_references[0x146]
-            offset_mm = offset_deg / self.stage_z_step if self.stage_z_step != 0 else 0
-            self.get_logger().info(
-                f"  Z: ref={self.homing_references[0x146]:.1f} -> "
-                f"cur={self.stage_z_angle:.1f} = {offset_mm:.1f}mm"
-            )
-
-        if 0x147 in self.homing_references and self.yaw_angle is not None:
-            offset_deg = self.yaw_angle - self.homing_references[0x147]
-            self.get_logger().info(
-                f"  Yaw: ref={self.homing_references[0x147]:.1f} -> "
-                f"cur={self.yaw_angle:.1f} = {offset_deg:.1f}deg"
-            )
-
-        self.get_logger().info("=" * 60)
-        self.get_logger().info("  Copy above values to can_devices.yaml ready_* parameters")
-        self.get_logger().info("=" * 60)
+                self.get_logger().info(
+                    f"Homing references received: {self.homing_references}")
+            except (json.JSONDecodeError, IndexError) as e:
+                self.get_logger().warn(f"Failed to parse homing status: {e}")
 
     def destroy_node(self):
         """노드 종료 시 정리"""

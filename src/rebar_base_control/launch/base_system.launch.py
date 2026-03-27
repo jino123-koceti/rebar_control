@@ -141,6 +141,16 @@ def generate_launch_description():
             emulate_tty=True
         ),
 
+        # Homing Controller Node (호밍 시퀀스 전담)
+        Node(
+            package='rebar_base_control',
+            executable='homing_controller.py',
+            name='homing_controller',
+            output='screen',
+            parameters=[can_config],
+            emulate_tty=True
+        ),
+
         # Pololu Node (트리거 모터)
         Node(
             package='pololu_ros2',
