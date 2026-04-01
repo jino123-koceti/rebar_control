@@ -475,9 +475,7 @@ class RebarDetectionNode(Node):
 
             if strategy == 'cross':
                 # ===== Cross Detection 전략 =====
-                # Left 카메라(Y=+100mm) → 먼 쪽(Y-) 포인트 검출
-                # Right 카메라(Y=-100mm) → 먼 쪽(Y+) 포인트 검출
-                # 각 카메라가 3개씩, 총 6개 → 중복 제거 불필요
+                # far_side 필터링 제거: orchestrator가 Y범위 필터링 수행
                 left_dets = []
                 right_dets = []
 
@@ -490,11 +488,6 @@ class RebarDetectionNode(Node):
                         conf_threshold=conf_threshold,
                         depth_buffer=left_depth_buf
                     )
-                    # Left 카메라: 먼 쪽 = Y가 작은 포인트 (Y-)
-                    left_dets = self._filter_far_side(
-                        left_dets, camera_side='left',
-                        max_points=self.grid_cols
-                    )
 
                 if self.right_camera_info and right_rgb is not None:
                     right_dets = self._detect_single_camera(
@@ -505,12 +498,9 @@ class RebarDetectionNode(Node):
                         conf_threshold=conf_threshold,
                         depth_buffer=right_depth_buf
                     )
-                    # Right 카메라: 먼 쪽 = Y가 큰 포인트 (Y+)
-                    right_dets = self._filter_far_side(
-                        right_dets, camera_side='right',
-                        max_points=self.grid_cols
-                    )
 
+                self.get_logger().info(
+                    f'  dedup후: L={len(left_dets)}개, R={len(right_dets)}개')
                 all_detections = left_dets + right_dets
 
             else:
@@ -583,23 +573,38 @@ class RebarDetectionNode(Node):
         """단일 카메라에서 교차점 검출 + 3D 변환"""
         detections = []
 
-        # YOLO 추론
-        results = self.model(rgb, conf=conf_threshold, verbose=False)
+        # YOLO 추론 (낮은 threshold로 전체 후보 확인, 이후 수동 필터링)
+        yolo_min_conf = 0.1
+        results = self.model(rgb, conf=yolo_min_conf, verbose=False)
 
         if not results or len(results[0].boxes) == 0:
+            self.get_logger().info(
+                f'  [{extrinsics.get("side", "?")}] YOLO: 0개 검출 (conf>={yolo_min_conf})')
             return detections
 
-        boxes = results[0].boxes
+        all_boxes = results[0].boxes
+        all_confs = [float(b.conf[0]) for b in all_boxes]
+        above = sum(1 for c in all_confs if c >= conf_threshold)
+        below = len(all_confs) - above
+        conf_str = ', '.join(f'{c:.2f}' for c in sorted(all_confs, reverse=True))
+        self.get_logger().info(
+            f'  [{extrinsics.get("side", "?")}] YOLO: {len(all_boxes)}개 검출 '
+            f'(>={conf_threshold}: {above}개, <{conf_threshold}: {below}개) '
+            f'[{conf_str}]')
 
         camera_side = extrinsics.get('side', 'right')
         use_calibration = camera_side in self.calibration_models
 
-        for box in boxes:
+        for box in all_boxes:
             # 바운딩 박스 중심
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
             cx = int((x1 + x2) / 2)
             cy = int((y1 + y2) / 2)
             confidence = float(box.conf[0])
+
+            # confidence threshold 미만은 스킵
+            if confidence < conf_threshold:
+                continue
 
             # 깊이 샘플링 (공간 median + temporal median)
             depth_m = self._sample_depth(depth, cx, cy, depth_buffer)
@@ -790,11 +795,17 @@ class RebarDetectionNode(Node):
             sorted_dets = sorted(detections, key=lambda d: d.y, reverse=True)
 
         selected = sorted_dets[:max_points]
+        dropped = sorted_dets[max_points:]
 
-        self.get_logger().debug(
-            f'[{camera_side}] 전체 {len(detections)}개 중 '
-            f'먼 쪽 {len(selected)}개 선택'
-        )
+        self.get_logger().info(
+            f'  [{camera_side}] far_side: {len(detections)}개 → {len(selected)}개 선택, '
+            f'{len(dropped)}개 제거')
+        for d in selected:
+            self.get_logger().info(
+                f'    ✓ x={d.x:.1f} y={d.y:.1f} conf={d.confidence:.2f}')
+        for d in dropped:
+            self.get_logger().info(
+                f'    ✗ x={d.x:.1f} y={d.y:.1f} conf={d.confidence:.2f} (제거)')
         return selected
 
     # ============================================

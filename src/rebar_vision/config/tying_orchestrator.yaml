@@ -41,7 +41,19 @@ tying_orchestrator:
     z_settle_margin: 0.1         # Z축 이동 후 추가 대기 마진 (초)
     # tying_z_down_mm 변경 시 z_early_xy_mm도 함께 조정할 것
     # z_early_xy_mm = tying_z_down_mm - (대기높이까지 남은 거리)
-    z_early_xy_mm: 120.0         # Z상승 중 이만큼 오르면 XY 선행 이동 시작 (mm) (250-130=120)
+    z_early_xy_mm: 170.0         # Z상승 중 이만큼 오르면 XY 선행 이동 시작 (mm) (250-80=170)
+
+    # Z축 하강 토크 모니터링 (과부하 감지 → 트리거 스킵)
+    # effective_limit = base + speed_percent * scale
+    z_torque_base_mA: 500         # 토크 임계값 기본값 (mA, 속도 0% 기준)
+    z_torque_scale_mA: 30         # 속도 1%당 추가 임계값 (mA)
+    # 30%→1400mA, 50%→2000mA, 100%→3500mA
+    z_torque_delay_ratio: 0.3     # 하강시간 대비 체크 지연 비율 (0.3=30% 이후부터 체크)
+    z_torque_poll_hz: 40.0        # 0x9C 폴링 주기 (Hz)
+    # 감속 구간 충돌 감지 (정상 감속구간 전류: 300~880mA)
+    z_torque_decel_mA: 1200       # 감속 구간 전류 임계값 (mA)
+    z_torque_decel_ratio: 0.75    # 감속 구간 시작 비율 (z_wait_time의 75% 이후, 전환점~72%)
+    z_torque_decel_count: 2       # 연속 초과 횟수 (오탐 방지, 40Hz 기준 ~50ms)
 
     # 트리거 파라미터
     trigger_speed: 1.0           # 트리거 모터 속도 (-1.0 ~ 1.0)

@@ -125,6 +125,14 @@ class TyingOrchestratorNode(Node):
         self.declare_parameter('z_speed_dps', 200.0)           # Z축 속도 (degree/s)
         self.declare_parameter('z_settle_margin', 1.0)         # Z축 이동 후 추가 대기 (초)
         self.declare_parameter('z_early_xy_mm', 120.0)         # Z상승 중 이 높이 오르면 XY 선행 시작 (mm)
+        # Z축 하강 토크 모니터링 파라미터
+        self.declare_parameter('z_torque_base_mA', 500)        # 토크 임계값 기본값 (mA)
+        self.declare_parameter('z_torque_scale_mA', 30)        # 속도 1%당 추가 임계값 (mA)
+        self.declare_parameter('z_torque_delay_ratio', 0.4)      # 하강시간 대비 체크 지연 비율
+        self.declare_parameter('z_torque_poll_hz', 20.0)       # 0x9C 폴링 주기 (Hz)
+        self.declare_parameter('z_torque_decel_mA', 1200)      # 감속 구간 전류 임계값 (mA)
+        self.declare_parameter('z_torque_decel_ratio', 0.65)   # 감속 구간 시작 비율 (z_wait_time 대비)
+        self.declare_parameter('z_torque_decel_count', 2)      # 연속 초과 횟수 (오탐 방지)
         # 트리거 파라미터
         self.declare_parameter('trigger_speed', 1.0)           # 트리거 모터 속도 (-1.0 ~ 1.0)
         self.declare_parameter('trigger_duration', 1.0)        # 트리거 동작 시간 (초)
@@ -166,6 +174,13 @@ class TyingOrchestratorNode(Node):
         self.z_speed = self.get_parameter('z_speed_dps').value
         self.z_settle_margin = self.get_parameter('z_settle_margin').value
         self.z_early_xy_mm = self.get_parameter('z_early_xy_mm').value
+        self.z_torque_base_mA = self.get_parameter('z_torque_base_mA').value
+        self.z_torque_scale_mA = self.get_parameter('z_torque_scale_mA').value
+        self.z_torque_delay_ratio = self.get_parameter('z_torque_delay_ratio').value
+        self.z_torque_poll_hz = self.get_parameter('z_torque_poll_hz').value
+        self.z_torque_decel_mA = self.get_parameter('z_torque_decel_mA').value
+        self.z_torque_decel_ratio = self.get_parameter('z_torque_decel_ratio').value
+        self.z_torque_decel_count = self.get_parameter('z_torque_decel_count').value
         self.trigger_speed_val = self.get_parameter('trigger_speed').value
         self.trigger_duration = self.get_parameter('trigger_duration').value
         self.multi_detect_tries = self.get_parameter('multi_detect_tries').value
@@ -207,6 +222,13 @@ class TyingOrchestratorNode(Node):
 
         # Z축 대기 시간 (이동 거리 기반 계산)
         self.z_wait_time = 0.0
+        # Z축 토크 모니터링 상태
+        self.z_torque_mA = 0            # 최신 Z축 토크 전류 (mA)
+        self.z_speed_dps = 0            # 최신 Z축 속도 (dps)
+        self.z_descending = False       # Z 하강 중 여부 (토크 체크 활성화 플래그)
+        self.z_torque_poll_timer = None # 0x9C 폴링 타이머
+        self.z_torque_overload = False  # 과부하 감지 플래그
+        self.z_torque_decel_hit = 0     # 감속 구간 연속 초과 카운터
 
         # 트리거 상태
         self.trigger_phase = 0           # 0=fire, 1=wait_fire, 2=return, 3=wait_return
@@ -273,6 +295,11 @@ class TyingOrchestratorNode(Node):
 
         self.joint_pub = self.create_publisher(
             JointControl, '/joint_control', 10
+        )
+
+        # 0x9C 모터 상태 요청용 (Z축 토크 폴링)
+        self.encoder_request_pub = self.create_publisher(
+            JointControl, '/encoder_request', 10
         )
 
         self.motion_cmd_pub = self.create_publisher(
@@ -553,6 +580,10 @@ class TyingOrchestratorNode(Node):
         """
         if msg.motor_id in (0x44, 0x45, 0x47) and msg.status == 0x92:
             self.motor_positions[msg.motor_id] = msg.current_position
+        # Z축 (0x46) 0x9C 응답 → 토크 전류 + 속도 추적
+        if msg.motor_id == 0x46 and msg.status == 0x9C:
+            self.z_torque_mA = abs(msg.current_current)
+            self.z_speed_dps = abs(int(msg.current_speed))
 
     # ============================================
     # 상태 머신
@@ -590,7 +621,36 @@ class TyingOrchestratorNode(Node):
                 self._advance_to_next_action()
 
         elif self.state == TyingState.WAITING_Z:
+            # Z 하강 중 토크 과부하 감지
+            if self.z_descending and elapsed >= self.z_torque_check_delay:
+                # 1) 가속 구간: 기존 고임계값 (안전망)
+                if self.z_torque_mA > self.z_torque_limit_mA:
+                    self.get_logger().warn(
+                        f'    ⚠️ Z축 토크 과부하 감지! {self.z_torque_mA}mA > '
+                        f'{self.z_torque_limit_mA}mA → 하강 정지, 트리거 스킵')
+                    self._log_z_descent_summary('OVERLOAD_ACCEL')
+                    self._stop_z_torque_monitor()
+                    self._handle_z_overload()
+                    return
+                # 2) 감속 구간: 저임계값 + 연속 초과 판정
+                decel_start = self.z_wait_time * self.z_torque_decel_ratio
+                if elapsed >= decel_start:
+                    if self.z_torque_mA > self.z_torque_decel_mA:
+                        self.z_torque_decel_hit += 1
+                        if self.z_torque_decel_hit >= self.z_torque_decel_count:
+                            self.get_logger().warn(
+                                f'    ⚠️ Z축 감속구간 과부하! {self.z_torque_mA}mA > '
+                                f'{self.z_torque_decel_mA}mA (연속 {self.z_torque_decel_hit}회) '
+                                f'→ 하강 정지, 트리거 스킵')
+                            self._log_z_descent_summary('OVERLOAD_DECEL')
+                            self._stop_z_torque_monitor()
+                            self._handle_z_overload()
+                            return
+                    else:
+                        self.z_torque_decel_hit = 0
             if elapsed >= self.z_wait_time:
+                self._log_z_descent_summary('OK')
+                self._stop_z_torque_monitor()
                 self.get_logger().info(
                     f'    Z축 이동 완료 ({elapsed:.1f}s)')
                 self._advance_to_next_action()
@@ -790,6 +850,12 @@ class TyingOrchestratorNode(Node):
         self.get_logger().info(
             f'멀티검출 완료: {len(self.accumulated_points)}개 누적 '
             f'(R:{len(right_pts)}, L:{len(left_pts)})')
+        self.flog(f"DETECT_RAW: total={len(self.accumulated_points)} "
+                  f"right={len(right_pts)} left={len(left_pts)}")
+        for p in self.accumulated_points:
+            self.flog(f"  RAW: cam={p['camera_id']} "
+                      f"x={p['x']:.1f} y={p['y']:.1f} "
+                      f"conf={p.get('confidence', '?')}")
 
         # 카메라별 클러스터링 + 보간 + 추세선
         right_final = self._process_camera_points(right_pts, 'right')
@@ -830,6 +896,9 @@ class TyingOrchestratorNode(Node):
         clusters = self._cluster_points(pts)
         self.get_logger().info(
             f'  [{camera_side}] 클러스터링: {len(pts)}개 → {len(clusters)}개')
+        self.flog(f"DETECT_CLUSTER: [{camera_side}] raw={len(pts)} → clusters={len(clusters)}")
+        for i, c in enumerate(clusters):
+            self.flog(f"  CLUSTER[{i}]: x={c['x']:.1f} y={c['y']:.1f} hits={c['hit_count']}")
 
         # 작업영역 범위 밖 클러스터 사전 제거 (보간 전)
         margin = 30.0  # 클러스터 중심이 범위+마진 밖이면 노이즈로 판단
@@ -848,6 +917,9 @@ class TyingOrchestratorNode(Node):
                 self.get_logger().info(
                     f'  [{camera_side}] 범위 외 클러스터 제거: '
                     f'X={c["x"]:.1f}, Y={c["y"]:.1f}')
+                self.flog(f"  FILTERED_OUT: [{camera_side}] x={c['x']:.1f} y={c['y']:.1f} "
+                          f"(range: x=[-{margin}~{self.max_stage_x_mm+margin}] "
+                          f"y=[{y_min_limit:.0f}~{y_max_limit:.0f}])")
                 continue
             valid_clusters.append(c)
         clusters = valid_clusters
@@ -859,6 +931,8 @@ class TyingOrchestratorNode(Node):
         if interp_count > 0:
             self.get_logger().info(
                 f'  [{camera_side}] 보간: {interp_count}개 추론 추가')
+        self.flog(f"DETECT_INTERP: [{camera_side}] before={before} after={len(clusters)} "
+                  f"interpolated={interp_count}")
 
         # X 내림차순 정렬
         clusters.sort(key=lambda c: c['x'], reverse=True)
@@ -953,6 +1027,8 @@ class TyingOrchestratorNode(Node):
                     self.get_logger().info(
                         f'  [{side}] Y 범위 외 스킵: Y={y:.1f}mm '
                         f'(허용: {y_min_safe}~{y_max_safe}mm)')
+                    self.flog(f"DETECT_Y_FILTER: [{side}] x={x:.1f} y={y:.1f} "
+                              f"(range: {y_min_safe}~{y_max_safe})")
                     continue
                 points.append((None, x, y, side))
 
@@ -1438,6 +1514,9 @@ class TyingOrchestratorNode(Node):
             self._publish_tying_feedback()
             # 이동 시간 계산: 거리/속도 + 마진
             self.z_wait_time = z_deg / self.effective_z_speed + self.z_settle_margin
+            # 토크 모니터링 시작
+            self._z_torque_samples = []  # 폴링 데이터 수집용
+            self._start_z_torque_monitor()
             self._transition_to(TyingState.WAITING_Z)
 
         elif action.action_type == ActionType.MOVE_Z_UP:
@@ -1449,6 +1528,7 @@ class TyingOrchestratorNode(Node):
             self._publish_tying_feedback()
             # 이동 시간 계산
             self.z_wait_time = z_deg / self.effective_z_speed + self.z_settle_margin
+            self.z_descending = False  # 상승 시에는 토크 체크 안 함
             self._transition_to(TyingState.WAITING_Z)
 
         elif action.action_type == ActionType.MOVE_Z_UP_WITH_XY:
@@ -1614,6 +1694,115 @@ class TyingOrchestratorNode(Node):
         self.trigger_pub.publish(msg)
 
     # ============================================
+    # Z축 토크 모니터링
+    # ============================================
+    def _start_z_torque_monitor(self):
+        """Z 하강 시 0x9C 폴링 타이머 시작."""
+        self.z_descending = True
+        self.z_torque_overload = False
+        self.z_torque_mA = 0
+        self.z_torque_decel_hit = 0
+        self._z_descent_start_time = self.get_clock().now()
+        # 속도 비례 임계값 + 하강시간 비율 지연 계산
+        self.z_torque_limit_mA = int(
+            self.z_torque_base_mA + self.speed_percent * self.z_torque_scale_mA)
+        self.z_torque_check_delay = self.z_wait_time * self.z_torque_delay_ratio
+        if self.z_torque_poll_timer is None:
+            period = 1.0 / self.z_torque_poll_hz
+            self.z_torque_poll_timer = self.create_timer(
+                period, self._poll_z_torque)
+            decel_start = self.z_wait_time * self.z_torque_decel_ratio
+            self.get_logger().info(
+                f'    Z축 토크 모니터링 시작 ({self.z_torque_poll_hz}Hz, '
+                f'가속임계={self.z_torque_limit_mA}mA, '
+                f'감속임계={self.z_torque_decel_mA}mA@{decel_start:.2f}s, '
+                f'연속{self.z_torque_decel_count}회 @{self.speed_percent:.0f}%)')
+            self.flog(f"Z_DOWN_START: speed%={self.speed_percent:.0f} "
+                      f"eff_speed={self.effective_z_speed:.0f}dps "
+                      f"accel_limit={self.z_torque_limit_mA}mA "
+                      f"decel_limit={self.z_torque_decel_mA}mA "
+                      f"decel_start={decel_start:.3f}s "
+                      f"decel_count={self.z_torque_decel_count} "
+                      f"z_wait={self.z_wait_time:.3f}s "
+                      f"poll_hz={self.z_torque_poll_hz}")
+
+    def _log_z_descent_summary(self, result):
+        """Z 하강 완료/과부하 시 통계 요약을 파일 로그에 기록."""
+        samples = getattr(self, '_z_torque_samples', [])
+        if not samples:
+            self.flog(f"Z_DOWN_END: result={result} samples=0")
+            return
+        currents = [s[1] for s in samples]
+        speeds = [s[2] for s in samples]
+        duration_ms = samples[-1][0] - samples[0][0]
+        self.flog(
+            f"Z_DOWN_END: result={result} "
+            f"samples={len(samples)} duration_ms={duration_ms:.0f} "
+            f"current_min={min(currents)} current_max={max(currents)} "
+            f"current_avg={sum(currents)/len(currents):.0f} "
+            f"speed_min={min(speeds)} speed_max={max(speeds)} "
+            f"speed_avg={sum(speeds)/len(speeds):.0f} "
+            f"final_current={currents[-1]} final_speed={speeds[-1]}")
+
+    def _stop_z_torque_monitor(self):
+        """0x9C 폴링 타이머 정지."""
+        self.z_descending = False
+        if self.z_torque_poll_timer is not None:
+            self.z_torque_poll_timer.cancel()
+            self.destroy_timer(self.z_torque_poll_timer)
+            self.z_torque_poll_timer = None
+
+    def _poll_z_torque(self):
+        """0x9C 명령으로 Z축 모터 상태 요청."""
+        msg = JointControl()
+        msg.joint_id = 0x146
+        msg.control_mode = 0x9C
+        msg.position = 0.0
+        msg.velocity = 0.0
+        self.encoder_request_pub.publish(msg)
+        # 경과시간 계산
+        elapsed_ms = (self.get_clock().now() - self._z_descent_start_time).nanoseconds / 1e6
+        self.get_logger().info(
+            f'    [토크폴링] Z전류={self.z_torque_mA}mA 속도={self.z_speed_dps}dps')
+        # 파일 로그: CSV 형태로 매 샘플 기록 (분석용)
+        self.flog(f"Z_TORQUE: t_ms={elapsed_ms:.0f} "
+                  f"current_mA={self.z_torque_mA} "
+                  f"speed_dps={self.z_speed_dps} "
+                  f"limit_mA={self.z_torque_limit_mA}")
+        if hasattr(self, '_z_torque_samples'):
+            self._z_torque_samples.append(
+                (elapsed_ms, self.z_torque_mA, self.z_speed_dps))
+
+    def _handle_z_overload(self):
+        """Z축 토크 과부하 시: Z정지 → 트리거 스킵 → Z상승.
+
+        액션 큐: ... → MOVE_Z_DOWN(현재) → TRIGGER → MOVE_Z_UP → ...
+        TRIGGER를 스킵하고 MOVE_Z_UP으로 점프한다.
+        MOVE_Z_UP은 tying_z_down_mm 전체를 상승 시도하지만,
+        실제 하강 거리보다 크더라도 상부 리밋 센서가 보호해준다.
+        """
+        # Z축 즉시 정지 (속도 0 명령)
+        stop_msg = JointControl()
+        stop_msg.joint_id = 0x146
+        stop_msg.position = 0.0
+        stop_msg.velocity = 0.0
+        stop_msg.control_mode = JointControl.MODE_SPEED
+        self.joint_pub.publish(stop_msg)
+
+        # TRIGGER 액션 찾아서 스킵 → MOVE_Z_UP으로 점프
+        idx = self.current_action_index + 1
+        while idx < len(self.action_queue):
+            if self.action_queue[idx].action_type == ActionType.TRIGGER:
+                # TRIGGER를 건너뛰고 그 다음(MOVE_Z_UP)으로
+                self.current_action_index = idx  # _advance 에서 +1 → MOVE_Z_UP
+                self.get_logger().warn(
+                    f'    트리거 스킵 → 액션[{idx + 1}] Z상승으로 전환')
+                break
+            idx += 1
+
+        self._advance_to_next_action()
+
+    # ============================================
     # 완료 / 에러 / 취소 처리
     # ============================================
     def _handle_complete(self):
@@ -1671,6 +1860,7 @@ class TyingOrchestratorNode(Node):
 
     def _handle_error(self, error_msg):
         """에러 처리 (navigator 블록 방지를 위해 완료 신호 발행)"""
+        self._stop_z_torque_monitor()
         self.get_logger().error(f'[ERROR] {error_msg}')
         self.flog(f"ERROR: {error_msg} → TYING_COMPLETE 발행")
 
@@ -1685,6 +1875,8 @@ class TyingOrchestratorNode(Node):
 
     def _handle_cancel(self):
         """작업 취소 처리"""
+        # 토크 모니터링 정지
+        self._stop_z_torque_monitor()
         # 모든 스테이지 모터 즉시 정지
         for motor_id in [0x144, 0x145, 0x146, 0x147]:
             stop_msg = JointControl()
