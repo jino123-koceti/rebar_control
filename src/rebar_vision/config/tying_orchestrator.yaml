@@ -51,7 +51,7 @@ tying_orchestrator:
     z_torque_delay_ratio: 0.3     # 하강시간 대비 체크 지연 비율 (0.3=30% 이후부터 체크)
     z_torque_poll_hz: 40.0        # 0x9C 폴링 주기 (Hz)
     # 감속 구간 충돌 감지 (정상 감속구간 전류: 300~880mA)
-    z_torque_decel_mA: 1200       # 감속 구간 전류 임계값 (mA)
+    z_torque_decel_mA: 1000       # 감속 구간 전류 임계값 (mA)
     z_torque_decel_ratio: 0.75    # 감속 구간 시작 비율 (z_wait_time의 75% 이후, 전환점~72%)
     z_torque_decel_count: 2       # 연속 초과 횟수 (오탐 방지, 40Hz 기준 ~50ms)
 

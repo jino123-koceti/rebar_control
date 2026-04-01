@@ -39,46 +39,10 @@ from std_msgs.msg import String, Float32, Bool
 import json
 import time
 import numpy as np
-from enum import Enum, auto
-from dataclasses import dataclass, field
-from typing import List
-
-
-class ActionType(Enum):
-    """액션 큐 항목 유형"""
-    MOVE_XY = auto()             # XY 스테이지 절대위치 이동 (mm)
-    MOVE_YAW = auto()            # Yaw 절대각도 이동 (deg, 0x92 멀티턴)
-    MOVE_Z_DOWN = auto()         # Z축 하강 (상대 이동, mm)
-    MOVE_Z_UP = auto()           # Z축 상승 (상대 이동, mm)
-    MOVE_Z_UP_WITH_XY = auto()   # Z상승 + 조기 XY이동 (연속 동작)
-    TRIGGER = auto()             # 트리거 동작 (발사 → 정지 → 원복 → 정지)
-    LOG = auto()                 # 로그 출력
-
-
-@dataclass
-class Action:
-    """실행할 액션 정의"""
-    action_type: ActionType
-    x_mm: float = 0.0
-    y_mm: float = 0.0
-    yaw_deg: float = 0.0
-    z_mm: float = 0.0            # Z축 이동 거리 (mm)
-    message: str = ''
-    point_label: str = ''
-
-
-class TyingState(Enum):
-    """오케스트레이터 상태"""
-    IDLE = auto()
-    DETECTING = auto()
-    EXECUTING_ACTION = auto()
-    WAITING_SETTLE = auto()
-    WAITING_Z = auto()           # Z축 이동 대기 (계산된 시간)
-    WAITING_Z_XY = auto()        # Z상승 중 + XY 병렬 이동 대기
-    WAITING_TRIGGER = auto()     # 트리거 동작 대기 (다단계)
-    PAUSED = auto()
-    COMPLETE = auto()
-    ERROR = auto()
+from rebar_vision.tying_common import ActionType, Action, TyingState
+from rebar_vision.z_torque_monitor import ZTorqueMonitor
+from rebar_vision.action_builder import ActionBuilder
+from rebar_vision.detection_manager import DetectionManager
 
 
 class TyingOrchestratorNode(Node):
@@ -222,24 +186,30 @@ class TyingOrchestratorNode(Node):
 
         # Z축 대기 시간 (이동 거리 기반 계산)
         self.z_wait_time = 0.0
-        # Z축 토크 모니터링 상태
-        self.z_torque_mA = 0            # 최신 Z축 토크 전류 (mA)
-        self.z_speed_dps = 0            # 최신 Z축 속도 (dps)
-        self.z_descending = False       # Z 하강 중 여부 (토크 체크 활성화 플래그)
-        self.z_torque_poll_timer = None # 0x9C 폴링 타이머
-        self.z_torque_overload = False  # 과부하 감지 플래그
-        self.z_torque_decel_hit = 0     # 감속 구간 연속 초과 카운터
+
+        # 액션 큐 생성 모듈 (ROS 의존성 없음, 먼저 초기화 가능)
+        self.action_builder = ActionBuilder({
+            'tying_z_down_mm': self.tying_z_down_mm,
+            'x_home_mm': 0.0,  # _start_detection에서 업데이트
+            'pose_change_y_near': self.pose_change_y_near,
+            'pose_change_y_far': self.pose_change_y_far,
+            'yaw_right_cam': 0.0,  # _start_detection에서 업데이트
+            'yaw_left_cam': 0.0,
+            'yaw_left_cam_approach': 0.0,
+            'yaw_mid': 0.0,
+            'home_ref_yaw_deg': 0.0,
+        })
 
         # 트리거 상태
         self.trigger_phase = 0           # 0=fire, 1=wait_fire, 2=return, 3=wait_return
         self.trigger_phase_start = 0.0
 
         # 검출 상태 (멀티검출)
-        self.detection_future = None
-        self.detection_retry = 0
-        self.multi_detect_count = 0          # 현재 검출 시도 횟수
-        self.accumulated_points = []         # 누적 검출 포인트
-        self.multi_detect_wait_until = 0.0   # 다음 검출까지 대기 시각
+        # 검출 상태는 DetectionManager가 관리
+
+        # 2단계 검출/결속
+        self.tying_phase = 1             # 1=현재자세, 2=자세변경 후
+        self._phase2_cam = None          # 자세변경 완료 후 검출할 카메라
 
         # 반복 모드
         self.repeat_mode = False          # TYING_START repeat=ON 시 True
@@ -318,6 +288,33 @@ class TyingOrchestratorNode(Node):
 
         # 상태 머신 타이머 (20Hz)
         self.timer = self.create_timer(0.05, self._state_machine_loop)
+
+        # Z축 토크 모니터링 모듈 (퍼블리셔 생성 이후 초기화)
+        self.z_monitor = ZTorqueMonitor(self, {
+            'z_torque_base_mA': self.z_torque_base_mA,
+            'z_torque_scale_mA': self.z_torque_scale_mA,
+            'z_torque_delay_ratio': self.z_torque_delay_ratio,
+            'z_torque_poll_hz': self.z_torque_poll_hz,
+            'z_torque_decel_mA': self.z_torque_decel_mA,
+            'z_torque_decel_ratio': self.z_torque_decel_ratio,
+            'z_torque_decel_count': self.z_torque_decel_count,
+        }, self.encoder_request_pub, self.joint_pub)
+
+        # 검출 관리 모듈 (서비스 클라이언트 생성 이후 초기화)
+        self.detection_mgr = DetectionManager(self, self.detect_client, {
+            'multi_detect_tries': self.multi_detect_tries,
+            'multi_detect_delay': self.multi_detect_delay,
+            'detection_confidence': self.detection_confidence,
+            'expected_points_per_cam': self.expected_points_per_cam,
+            'cluster_distance_mm': self.cluster_distance_mm,
+            'rebar_spacing_mm': self.rebar_spacing_mm,
+            'max_stage_x_mm': self.max_stage_x_mm,
+            'max_stage_y_mm': self.max_stage_y_mm,
+            'right_cam_y_min': self.right_cam_y_min,
+            'right_cam_y_max': self.right_cam_y_max,
+            'left_cam_y_min': self.left_cam_y_min,
+            'left_cam_y_max': self.left_cam_y_max,
+        })
 
         self.get_logger().info('=' * 60)
         self.get_logger().info('Tying Orchestrator 초기화')
@@ -580,10 +577,9 @@ class TyingOrchestratorNode(Node):
         """
         if msg.motor_id in (0x44, 0x45, 0x47) and msg.status == 0x92:
             self.motor_positions[msg.motor_id] = msg.current_position
-        # Z축 (0x46) 0x9C 응답 → 토크 전류 + 속도 추적
+        # Z축 (0x46) 0x9C 응답 → 토크 모니터링 모듈에 전달
         if msg.motor_id == 0x46 and msg.status == 0x9C:
-            self.z_torque_mA = abs(msg.current_current)
-            self.z_speed_dps = abs(int(msg.current_speed))
+            self.z_monitor.update_feedback(msg.current_current, msg.current_speed)
 
     # ============================================
     # 상태 머신
@@ -622,35 +618,15 @@ class TyingOrchestratorNode(Node):
 
         elif self.state == TyingState.WAITING_Z:
             # Z 하강 중 토크 과부하 감지
-            if self.z_descending and elapsed >= self.z_torque_check_delay:
-                # 1) 가속 구간: 기존 고임계값 (안전망)
-                if self.z_torque_mA > self.z_torque_limit_mA:
-                    self.get_logger().warn(
-                        f'    ⚠️ Z축 토크 과부하 감지! {self.z_torque_mA}mA > '
-                        f'{self.z_torque_limit_mA}mA → 하강 정지, 트리거 스킵')
-                    self._log_z_descent_summary('OVERLOAD_ACCEL')
-                    self._stop_z_torque_monitor()
-                    self._handle_z_overload()
-                    return
-                # 2) 감속 구간: 저임계값 + 연속 초과 판정
-                decel_start = self.z_wait_time * self.z_torque_decel_ratio
-                if elapsed >= decel_start:
-                    if self.z_torque_mA > self.z_torque_decel_mA:
-                        self.z_torque_decel_hit += 1
-                        if self.z_torque_decel_hit >= self.z_torque_decel_count:
-                            self.get_logger().warn(
-                                f'    ⚠️ Z축 감속구간 과부하! {self.z_torque_mA}mA > '
-                                f'{self.z_torque_decel_mA}mA (연속 {self.z_torque_decel_hit}회) '
-                                f'→ 하강 정지, 트리거 스킵')
-                            self._log_z_descent_summary('OVERLOAD_DECEL')
-                            self._stop_z_torque_monitor()
-                            self._handle_z_overload()
-                            return
-                    else:
-                        self.z_torque_decel_hit = 0
+            overload = self.z_monitor.check_overload(elapsed)
+            if overload:
+                self.z_monitor.log_summary(overload)
+                self.z_monitor.stop()
+                self._handle_z_overload()
+                return
             if elapsed >= self.z_wait_time:
-                self._log_z_descent_summary('OK')
-                self._stop_z_torque_monitor()
+                self.z_monitor.log_summary('OK')
+                self.z_monitor.stop()
                 self.get_logger().info(
                     f'    Z축 이동 완료 ({elapsed:.1f}s)')
                 self._advance_to_next_action()
@@ -693,7 +669,12 @@ class TyingOrchestratorNode(Node):
     # 검출 처리
     # ============================================
     def _start_detection(self):
-        """검출 시작 (상태 초기화)"""
+        """검출 시작 (상태 초기화)
+
+        2단계 검출/결속:
+          tying_phase=1: 현재 자세 카메라로 검출 → 결속
+          tying_phase=2: 자세변경 후 다른 카메라로 검출 → 결속
+        """
         if self.home_ref_x_deg is None:
             self.get_logger().error(
                 '호밍 레퍼런스 미수신 - TYING_START 불가 (호밍 먼저 수행 필요)')
@@ -715,754 +696,98 @@ class TyingOrchestratorNode(Node):
 
         self.action_queue = []
         self.current_action_index = 0
-        self.detection_future = None
-        self.detection_retry = 0
-        self.multi_detect_count = 0
-        self.accumulated_points = []
-        self.multi_detect_wait_until = 0.0
-        self._detect_camera_phase = 'right'
         self.total_points = 0
         self.completed_points = 0
         self.tying_message = '교차점 멀티검출 중...'
         self.tying_result = ''
+
+        # 2단계 검출: 현재 자세에 맞는 카메라만 검출
+        self.tying_phase = 1
+        if self.current_pose_state == 'left':
+            cam_side = 'left'
+        else:
+            cam_side = 'right'
+        self.get_logger().info(
+            f'[Phase 1] {cam_side} 카메라 검출 시작 (현재 자세: {self.current_pose_state})')
+        self.flog(f"PHASE1_START: pose={self.current_pose_state} cam={cam_side}")
+        self.detection_mgr.start(camera_side=cam_side)
         self._transition_to(TyingState.DETECTING)
         self._publish_tying_feedback()
 
     def _handle_detecting(self):
-        """멀티검출 서비스 비동기 호출 처리
+        """멀티검출 처리 (DetectionManager 위임).
 
-        최대 multi_detect_tries회 검출을 반복하여 포인트를 누적하고,
-        클러스터링 → 보간 → 추세선 보정을 수행한다.
-        카메라별 개별 호출 (right=2, left=1) 로 _filter_far_side 회피.
+        Phase 1: 현재 자세 카메라 검출 → X큰→작은 순 결속
+        Phase 2: 자세변경 후 카메라 검출 → X작은→큰 순 결속
         """
-        # 다음 검출까지 대기 중
-        if time.monotonic() < self.multi_detect_wait_until:
+        result = self.detection_mgr.update()
+        if result is None:
+            return  # 진행 중
+        if result == 'error':
+            self._handle_error(self.detection_mgr.error)
             return
 
-        if self.detection_future is None:
-            if not self.detect_client.service_is_ready():
-                if self._elapsed() >= 5.0:
-                    self._handle_error('검출 서비스 미가용')
-                return
+        # 검출 완료: result는 포인트 리스트 [(label, x, y, side), ...]
+        points = result
+        self.total_points += len(points)
 
-            # right(2) → left(1) 교대 호출
-            if not hasattr(self, '_detect_camera_phase'):
-                self._detect_camera_phase = 'right'
+        # Phase에 따라 결속 순서 결정
+        if self.tying_phase == 1:
+            # Phase 1: X 큰→작은 (자세변경 시 X=home 근처에서 끝나도록)
+            points.sort(key=lambda p: p[1], reverse=True)  # p[1] = x_mm
+        else:
+            # Phase 2: X 작은→큰 (자세변경 후 X=home 근처에서 시작)
+            points.sort(key=lambda p: p[1])
 
-            if self._detect_camera_phase == 'right':
-                cam_sel = 2
-                cam_label = 'R'
-            else:
-                cam_sel = 1
-                cam_label = 'L'
+        # 라벨 재부여 (정렬 후)
+        points = [(f'P{i+1}', x, y, side) for i, (_, x, y, side) in enumerate(points)]
 
-            request = DetectCrossings.Request()
-            request.camera_selection = cam_sel
-            request.confidence_threshold = self.detection_confidence
-            request.expected_count = 3
-            self.detection_future = self.detect_client.call_async(request)
+        # 액션 큐 생성 (단일 자세 포인트만, 자세변경 없음)
+        self.action_builder.update_params(
+            x_home_mm=self.x_home_mm,
+            yaw_right_cam=self.yaw_right_cam,
+            yaw_left_cam=self.yaw_left_cam,
+            yaw_left_cam_approach=self.yaw_left_cam_approach,
+            yaw_mid=self.yaw_mid,
+            home_ref_yaw_deg=self.home_ref_yaw_deg,
+        )
+        self.action_queue = []
+        for label, x, y, side in points:
+            self.action_queue.extend(
+                self.action_builder._tying_actions(label, x, y))
+        self.action_queue = self.action_builder._optimize_z_xy_overlap(
+            self.action_queue, logger=self.get_logger())
+        self.current_action_index = 0
 
-            if self._detect_camera_phase == 'right':
-                self.multi_detect_count += 1
-            self.get_logger().info(
-                f'멀티검출 [{self.multi_detect_count}/{self.multi_detect_tries}] '
-                f'({cam_label}) 서비스 호출...')
-            return
-
-        if not self.detection_future.done():
-            return
-
-        try:
-            result = self.detection_future.result()
-            self.detection_future = None
-            cam_label = 'R' if self._detect_camera_phase == 'right' else 'L'
-
-            if result.success and len(result.grid.detections) > 0:
-                dets = list(result.grid.detections)
-                self.get_logger().info(
-                    f'  [{self.multi_detect_count}/{self.multi_detect_tries}] '
-                    f'({cam_label}) {len(dets)}개 검출 '
-                    f'({result.detection_time_ms:.0f}ms)')
-
-                # 포인트 누적 (범위 필터링은 _build_final_points에서 수행)
-                for det in dets:
-                    cam_tag = 'R' if det.camera_id == 1 else 'L'
-                    self.get_logger().info(
-                        f'    누적: ({det.x:.1f}, {det.y:.1f}) [{cam_tag}]')
-                    self.accumulated_points.append({
-                        'x': det.x,
-                        'y': det.y,
-                        'camera_id': det.camera_id,
-                    })
-            else:
-                msg_text = result.message if result else '응답 없음'
-                self.get_logger().warn(
-                    f'  [{self.multi_detect_count}/{self.multi_detect_tries}] '
-                    f'({cam_label}) 검출 실패: {msg_text}')
-
-            # 카메라 교대
-            if self._detect_camera_phase == 'right':
-                # right 완료 → left 호출 (대기 없이 즉시)
-                self._detect_camera_phase = 'left'
-                return
-            else:
-                # left 완료 → 1회 시도 완료
-                self._detect_camera_phase = 'right'
-
-            # 조기 종료 체크: 양쪽 카메라 모두 충분한 클러스터 확보
-            if self.multi_detect_count >= 2:
-                right_pts = [p for p in self.accumulated_points
-                             if p['camera_id'] == 1]
-                left_pts = [p for p in self.accumulated_points
-                            if p['camera_id'] == 0]
-                right_clusters = self._cluster_points(right_pts)
-                left_clusters = self._cluster_points(left_pts)
-                if (len(right_clusters) >= self.expected_points_per_cam
-                        and len(left_clusters) >= self.expected_points_per_cam):
-                    self.get_logger().info(
-                        f'  양쪽 카메라 각 {self.expected_points_per_cam}개 '
-                        f'클러스터 확보 → 조기 종료')
-                    self._finalize_multi_detection()
-                    return
-
-            # 최대 시도 횟수 도달 시 최종 처리
-            if self.multi_detect_count >= self.multi_detect_tries:
-                if not self.accumulated_points:
-                    self._handle_error(
-                        f'멀티검출 {self.multi_detect_tries}회 모두 실패')
-                else:
-                    self._finalize_multi_detection()
-            else:
-                # 다음 검출 전 대기
-                self.multi_detect_wait_until = (
-                    time.monotonic() + self.multi_detect_delay)
-
-        except Exception as e:
-            self.detection_future = None
-            self._handle_error(f'검출 서비스 예외: {e}')
-
-    def _finalize_multi_detection(self):
-        """멀티검출 누적 데이터를 클러스터링 → 보간 → 추세선 보정하여 최종 포인트 생성"""
-        # 카메라별 분리 (캘리브레이션 모델이 이미 로봇 좌표계로 변환)
-        right_pts = [p for p in self.accumulated_points if p['camera_id'] == 1]
-        left_pts = [p for p in self.accumulated_points if p['camera_id'] == 0]
-
+        phase_label = f'Phase {self.tying_phase}'
+        order = 'X큰→작은' if self.tying_phase == 1 else 'X작은→큰'
         self.get_logger().info(
-            f'멀티검출 완료: {len(self.accumulated_points)}개 누적 '
-            f'(R:{len(right_pts)}, L:{len(left_pts)})')
-        self.flog(f"DETECT_RAW: total={len(self.accumulated_points)} "
-                  f"right={len(right_pts)} left={len(left_pts)}")
-        for p in self.accumulated_points:
-            self.flog(f"  RAW: cam={p['camera_id']} "
-                      f"x={p['x']:.1f} y={p['y']:.1f} "
-                      f"conf={p.get('confidence', '?')}")
-
-        # 카메라별 클러스터링 + 보간 + 추세선
-        right_final = self._process_camera_points(right_pts, 'right')
-        left_final = self._process_camera_points(left_pts, 'left')
-
-        if not right_final and not left_final:
-            self._handle_error('유효한 교차점 없음 (클러스터링 후)')
-            return
-
-        # 범위 필터링 + 클램핑 + P1~P6 라벨 부여
-        points = self._build_final_points(right_final, left_final)
-
-        if len(points) == 0:
-            self._handle_error('유효한 교차점 없음 (범위 필터링 후)')
-            return
-
-        self._build_action_queue(points, pass_type=self.tying_pass)
-        self.get_logger().info(
-            f'검출 최종: {len(points)}개 포인트, '
-            f'{len(self.action_queue)}개 액션 생성'
-            f' [{self.tying_pass} 패스]')
-        self.flog(f"검출 완료: {len(points)}개 포인트, {len(self.action_queue)}개 액션 [{self.tying_pass}]")
+            f'[{phase_label}] 검출 {len(points)}개 포인트, '
+            f'{len(self.action_queue)}개 액션 ({order})')
+        self.flog(f"검출 완료 [{phase_label}]: {len(points)}개 포인트, "
+                  f"{len(self.action_queue)}개 액션 [{order}]")
         for label, x, y, side in points:
             self.flog(f"  {label}: ({x:.1f}, {y:.1f})mm [{side}]")
         self._transition_to(TyingState.EXECUTING_ACTION)
-
-    def _process_camera_points(self, pts, camera_side):
-        """카메라 한쪽의 누적 포인트를 클러스터링 → 보간 → 추세선 보정
-
-        Returns:
-            list of (x_mm, y_mm) 보정된 좌표 (X 내림차순)
-        """
-        if not pts:
-            self.get_logger().warn(f'  [{camera_side}] 검출 포인트 없음')
-            return []
-
-        # 클러스터링
-        clusters = self._cluster_points(pts)
-        self.get_logger().info(
-            f'  [{camera_side}] 클러스터링: {len(pts)}개 → {len(clusters)}개')
-        self.flog(f"DETECT_CLUSTER: [{camera_side}] raw={len(pts)} → clusters={len(clusters)}")
-        for i, c in enumerate(clusters):
-            self.flog(f"  CLUSTER[{i}]: x={c['x']:.1f} y={c['y']:.1f} hits={c['hit_count']}")
-
-        # 작업영역 범위 밖 클러스터 사전 제거 (보간 전)
-        margin = 30.0  # 클러스터 중심이 범위+마진 밖이면 노이즈로 판단
-        # 자세별 Y 가동 범위
-        if camera_side == 'right':
-            y_min_limit = self.right_cam_y_min - margin
-            y_max_limit = self.right_cam_y_max + margin
-        else:
-            y_min_limit = self.left_cam_y_min - margin
-            y_max_limit = self.left_cam_y_max + margin
-        valid_clusters = []
-        for c in clusters:
-            if (c['x'] < -margin or c['x'] > self.max_stage_x_mm + margin
-                    or c['y'] < y_min_limit
-                    or c['y'] > y_max_limit):
-                self.get_logger().info(
-                    f'  [{camera_side}] 범위 외 클러스터 제거: '
-                    f'X={c["x"]:.1f}, Y={c["y"]:.1f}')
-                self.flog(f"  FILTERED_OUT: [{camera_side}] x={c['x']:.1f} y={c['y']:.1f} "
-                          f"(range: x=[-{margin}~{self.max_stage_x_mm+margin}] "
-                          f"y=[{y_min_limit:.0f}~{y_max_limit:.0f}])")
-                continue
-            valid_clusters.append(c)
-        clusters = valid_clusters
-
-        # 보간 (기대 수보다 적으면)
-        before = len(clusters)
-        clusters = self._interpolate_missing(clusters)
-        interp_count = len(clusters) - before
-        if interp_count > 0:
-            self.get_logger().info(
-                f'  [{camera_side}] 보간: {interp_count}개 추론 추가')
-        self.flog(f"DETECT_INTERP: [{camera_side}] before={before} after={len(clusters)} "
-                  f"interpolated={interp_count}")
-
-        # X 내림차순 정렬
-        clusters.sort(key=lambda c: c['x'], reverse=True)
-
-        # 추세선 피팅 + 보정
-        trendline = self._fit_trendline(clusters)
-        if trendline is not None:
-            corrected = trendline['corrected']
-            avg_err = np.mean(trendline['errors'])
-            slope, intercept, axis = trendline['line_eq']
-            if axis == 'x':
-                eq = f'Y={slope:.4f}*X+{intercept:.1f}'
-            else:
-                eq = f'X={slope:.4f}*Y+{intercept:.1f}'
-            self.get_logger().info(
-                f'  [{camera_side}] 추세선: {eq}, '
-                f'평균오차: {avg_err:.1f}mm')
-            for i, (cx, cy) in enumerate(corrected):
-                orig = clusters[i]
-                src = 'interp' if orig.get('source') == 'interpolated' else 'hits:{}'.format(orig['hit_count'])
-                self.get_logger().info(
-                    '    P{}: ({:.1f},{:.1f}) → ({:.1f},{:.1f}) err:{:.1f}mm [{}]'.format(
-                        i+1, orig['x'], orig['y'], cx, cy,
-                        trendline['errors'][i], src))
-
-            # 이상치 제거 + 재피팅 (err > 100mm)
-            outlier_threshold = 100.0
-            outlier_indices = [i for i, e in enumerate(trendline['errors']) if e > outlier_threshold]
-            if outlier_indices and len(clusters) - len(outlier_indices) >= 2:
-                for idx in outlier_indices:
-                    self.get_logger().warn(
-                        f'  [{camera_side}] 이상치 제거: P{idx+1} '
-                        f'({clusters[idx]["x"]:.1f}, {clusters[idx]["y"]:.1f}) '
-                        f'err:{trendline["errors"][idx]:.1f}mm > {outlier_threshold}mm')
-                clusters = [c for i, c in enumerate(clusters) if i not in outlier_indices]
-                # 재피팅
-                trendline2 = self._fit_trendline(clusters)
-                if trendline2 is not None:
-                    corrected = trendline2['corrected']
-                    avg_err2 = np.mean(trendline2['errors'])
-                    s2, i2, ax2 = trendline2['line_eq']
-                    eq2 = f'Y={s2:.4f}*X+{i2:.1f}' if ax2 == 'x' else f'X={s2:.4f}*Y+{i2:.1f}'
-                    self.get_logger().info(
-                        f'  [{camera_side}] 재피팅: {eq2}, '
-                        f'평균오차: {avg_err:.1f}→{avg_err2:.1f}mm')
-                    for i, (cx, cy) in enumerate(corrected):
-                        orig = clusters[i]
-                        src = 'interp' if orig.get('source') == 'interpolated' else 'hits:{}'.format(orig['hit_count'])
-                        self.get_logger().info(
-                            '    P{}: ({:.1f},{:.1f}) → ({:.1f},{:.1f}) err:{:.1f}mm [{}]'.format(
-                                i+1, orig['x'], orig['y'], cx, cy,
-                                trendline2['errors'][i], src))
-
-            return corrected
-        else:
-            # 추세선 불가 (포인트 1개) → 원본 좌표
-            self.get_logger().info(
-                f'  [{camera_side}] 추세선 불가 → 원본 좌표 사용')
-            return [(c['x'], c['y']) for c in clusters]
-
-    def _build_final_points(self, right_coords, left_coords):
-        """보정된 좌표로 최종 포인트 리스트 생성 (범위 필터링 + 클램핑)
-
-        Returns:
-            list of (label, x_mm, y_mm, side)
-        """
-        clamp_margin = 30.0
-        points = []
-
-        # Right: X내림차순(큰→작은), Left: X오름차순(작은→큰)
-        left_coords_asc = list(reversed(left_coords))
-        for side, coords in [('right', right_coords), ('left', left_coords_asc)]:
-            # 자세별 Y 가동 범위
-            if side == 'right':
-                y_min_safe = self.right_cam_y_min
-                y_max_safe = self.right_cam_y_max
-            else:
-                y_min_safe = self.left_cam_y_min
-                y_max_safe = self.left_cam_y_max
-            for x, y in coords:
-                # 음수 좌표 스킵
-                if x < 0 or y < 0:
-                    self.get_logger().info(
-                        f'  음수 스킵: X={x:.1f}mm, Y={y:.1f}mm')
-                    continue
-                if x > self.max_stage_x_mm or y > self.max_stage_y_mm:
-                    self.get_logger().warn(
-                        f'  범위 외 제거: X={x:.1f}, Y={y:.1f} (초과)')
-                    continue
-                # 자세별 Y 범위 필터링
-                if y < y_min_safe or y > y_max_safe:
-                    self.get_logger().info(
-                        f'  [{side}] Y 범위 외 스킵: Y={y:.1f}mm '
-                        f'(허용: {y_min_safe}~{y_max_safe}mm)')
-                    self.flog(f"DETECT_Y_FILTER: [{side}] x={x:.1f} y={y:.1f} "
-                              f"(range: {y_min_safe}~{y_max_safe})")
-                    continue
-                points.append((None, x, y, side))
-
-        # 라벨 부여 (P1~)
-        labeled = []
-        idx = 1
-        for _, x, y, side in points:
-            labeled.append((f'P{idx}', x, y, side))
-            idx += 1
-
-        if self.tying_pass == 'return':
-            # 복귀 패스: 전진 포인트에 추가
-            self.total_points += len(labeled)
-        else:
-            self.total_points = len(labeled)
-
-        # 포인트 로그
-        pass_label = {'forward': '전진', 'return': '복귀'}.get(
-            self.tying_pass, '')
-        self.get_logger().info(
-            f'  {pass_label}경로: {" → ".join(p[0] for p in labeled)}')
-        for label, x, y, side in labeled:
-            self.get_logger().info(
-                f'    [{label}] X={x:.1f}mm Y={y:.1f}mm ({side})')
-
-        return labeled
-
-    # ============================================
-    # 클러스터링 / 보간 / 추세선
-    # ============================================
-    def _cluster_points(self, pts):
-        """포인트 리스트를 거리 기반 클러스터링.
-
-        Args:
-            pts: list of dict with 'x', 'y' keys
-
-        Returns:
-            list of dict: 클러스터 평균 좌표
-        """
-        dist_mm = self.cluster_distance_mm
-        used = set()
-        clusters = []
-        for i in range(len(pts)):
-            if i in used:
-                continue
-            group = [i]
-            used.add(i)
-            for j in range(i + 1, len(pts)):
-                if j in used:
-                    continue
-                dx = pts[i]['x'] - pts[j]['x']
-                dy = pts[i]['y'] - pts[j]['y']
-                if (dx * dx + dy * dy) ** 0.5 < dist_mm:
-                    group.append(j)
-                    used.add(j)
-            clusters.append(group)
-
-        results = []
-        for group in clusters:
-            gp = [pts[i] for i in group]
-            results.append({
-                'x': np.mean([p['x'] for p in gp]),
-                'y': np.mean([p['y'] for p in gp]),
-                'hit_count': len(group),
-                'source': 'detected',
-            })
-        return results
-
-    def _interpolate_missing(self, clusters):
-        """클러스터가 기대 수보다 적으면 195mm 간격 보간으로 누락 포인트 추론.
-
-        2개 포인트 간 거리를 분석하여 누락 위치를 판단:
-        - 거리 ≈ 1*spacing → 한쪽 끝에 누락 (작업영역에 맞는 방향으로 추가)
-        - 거리 ≈ 2*spacing → 중간에 누락
-        """
-        expected = self.expected_points_per_cam
-        if len(clusters) >= expected or len(clusters) < 1:
-            return clusters
-
-        # X 내림차순 정렬
-        clusters.sort(key=lambda c: c['x'], reverse=True)
-
-        x_vals = [c['x'] for c in clusters]
-        y_avg = np.mean([c['y'] for c in clusters])
-
-        if len(clusters) == 1:
-            # 1개만 검출 → spacing 간격으로 양쪽에 보간 (작업영역 내)
-            spacing = self.rebar_spacing_mm
-            base_x = clusters[0]['x']
-            candidates = [base_x - spacing, base_x + spacing]
-            for cx in candidates:
-                if 0 <= cx <= self.max_stage_x_mm and len(clusters) < expected:
-                    self.get_logger().info(
-                        f'  보간(1pt): X={cx:.1f}mm 추가 '
-                        f'(기준 {base_x:.1f}mm ± {spacing}mm)')
-                    clusters.append({
-                        'x': cx,
-                        'y': y_avg,
-                        'hit_count': 0,
-                        'source': 'interpolated',
-                    })
-
-        elif len(clusters) == 2:
-            spacing = self.rebar_spacing_mm  # 195mm 철근 배근 간격
-            x_max, x_min = max(x_vals), min(x_vals)
-            gap = x_max - x_min
-
-            if gap > spacing * 1.5:
-                # 간격이 2*spacing에 가까움 → 중간에 누락
-                mid_x = (x_max + x_min) / 2.0
-                self.get_logger().info(
-                    f'  보간: 간격 {gap:.0f}mm ≈ 2*{spacing}mm → '
-                    f'중간 X={mid_x:.1f}mm 추가')
-                clusters.append({
-                    'x': mid_x,
-                    'y': y_avg,
-                    'hit_count': 0,
-                    'source': 'interpolated',
-                })
-            else:
-                # 간격이 1*spacing에 가까움 → 끝에 누락
-                # 작업영역(0~max_stage_x_mm) 안에 들어오는 방향으로 추가
-                candidate_high = x_max + spacing
-                candidate_low = x_min - spacing
-                # 작업영역 내에 있는 쪽 선택
-                high_valid = 0 <= candidate_high <= self.max_stage_x_mm
-                low_valid = 0 <= candidate_low <= self.max_stage_x_mm
-                if high_valid and not low_valid:
-                    new_x = candidate_high
-                elif low_valid and not high_valid:
-                    new_x = candidate_low
-                elif high_valid and low_valid:
-                    # 둘 다 유효하면 작업영역 중심에 가까운 쪽
-                    center = self.max_stage_x_mm / 2.0
-                    new_x = (candidate_high
-                             if abs(candidate_high - center)
-                             < abs(candidate_low - center)
-                             else candidate_low)
-                else:
-                    # 둘 다 범위 밖 → 등간격 fallback
-                    new_x = x_max + spacing
-                self.get_logger().info(
-                    f'  보간: 간격 {gap:.0f}mm ≈ 1*{spacing}mm → '
-                    f'X={new_x:.1f}mm 추가')
-                clusters.append({
-                    'x': new_x,
-                    'y': y_avg,
-                    'hit_count': 0,
-                    'source': 'interpolated',
-                })
-
-        clusters.sort(key=lambda c: c['x'], reverse=True)
-        return clusters
-
-    def _fit_trendline(self, clusters):
-        """검출된 포인트들로 직선 추세선 피팅 (로봇 좌표 X,Y 기반).
-
-        Returns:
-            dict with 'corrected', 'line_eq', 'errors' or None
-        """
-        pts = [(c['x'], c['y']) for c in clusters]
-        if len(pts) < 2:
-            return None
-
-        xs = np.array([p[0] for p in pts])
-        ys = np.array([p[1] for p in pts])
-
-        x_range = xs.max() - xs.min()
-        y_range = ys.max() - ys.min()
-
-        if x_range >= y_range:
-            coeffs = np.polyfit(xs, ys, 1)
-            slope, intercept = coeffs
-            axis = 'x'
-            a, b, c = slope, -1.0, intercept
-        else:
-            coeffs = np.polyfit(ys, xs, 1)
-            slope, intercept = coeffs
-            axis = 'y'
-            a, b, c = -1.0, slope, intercept
-
-        corrected = []
-        errors = []
-        for x0, y0 in pts:
-            x_proj = (b * (b * x0 - a * y0) - a * c) / (a * a + b * b)
-            y_proj = (a * (-b * x0 + a * y0) - b * c) / (a * a + b * b)
-            corrected.append((x_proj, y_proj))
-            dist = abs(a * x0 + b * y0 + c) / np.sqrt(a * a + b * b)
-            errors.append(dist)
-
-        return {
-            'corrected': corrected,
-            'line_eq': (slope, intercept, axis),
-            'errors': errors,
-        }
 
     # ============================================
     # 액션 큐 구축
     # ============================================
     def _build_action_queue(self, points, pass_type='normal'):
-        """포인트 목록으로부터 실행할 액션 큐 생성.
-
-        Args:
-            points: list of (label, x_mm, y_mm, side)
-            pass_type: 'normal' (단일), 'forward' (반복 전진), 'return' (반복 복귀)
-
-        current_pose_state를 기반으로 자세변경/복귀 필요 여부를 판단.
-        tying_direction에 따라:
-        - 'forward': Right(P1→P2→P3) → 자세변경(우→좌) → Left(P4→P5→P6)
-        - 'reverse': Left(P6→P5→P4) → 자세변경(좌→우) → Right(P3→P2→P1)
-        """
-        self.action_queue = []
-
-        right_pts = [(l, x, y) for l, x, y, s in points if s == 'right']
-        left_pts = [(l, x, y) for l, x, y, s in points if s == 'left']
-
-        self.get_logger().info(
-            f'자세 상태: {self.current_pose_state} | '
-            f'방향: {self.tying_direction} | 패스: {self.tying_pass} | '
-            f'Right: {len(right_pts)}개, Left: {len(left_pts)}개')
-
-        if self.tying_direction == 'reverse':
-            # reverse: Left(역순) → 자세변경(좌→우) → Right(역순)
-            left_reversed = list(reversed(left_pts))
-            right_reversed = list(reversed(right_pts))
-
-            self.action_queue.append(Action(
-                action_type=ActionType.LOG,
-                message='=== reverse: Left(P6→P4) → 자세변경 → Right(P3→P1) ===',
-            ))
-
-            # Left 결속 전: 현재 Right 자세이면 Left로 전환 필요
-            if left_reversed and self.current_pose_state != 'left':
-                self._append_pose_change_right_to_left()
-                self.current_pose_state = 'left'
-
-            for label, x, y in left_reversed:
-                self._append_tying_actions(label, x, y)
-
-            # Right 결속 전: 현재 Left 자세이면 Right로 전환 필요
-            if right_reversed and self.current_pose_state == 'left':
-                self._append_pose_change_left_to_right()
-                self.current_pose_state = 'right'
-
-            for label, x, y in right_reversed:
-                self._append_tying_actions(label, x, y)
-
-            # 최종 자세 상태 업데이트
-            if right_reversed:
-                self.current_pose_state = 'right'
-            elif left_reversed:
-                self.current_pose_state = 'left'
-
-        else:
-            # forward (기본): Right(P1→P3) → 자세변경(우→좌) → Left(P4→P6)
-            self.action_queue.append(Action(
-                action_type=ActionType.LOG,
-                message='=== forward: Right(P1→P3) → 자세변경 → Left(P4→P6) ===',
-            ))
-
-            # Right 결속 전: 현재 Left 자세이면 Right로 전환 필요
-            if right_pts and self.current_pose_state == 'left':
-                self._append_pose_change_left_to_right()
-                self.current_pose_state = 'right'
-
-            for label, x, y in right_pts:
-                self._append_tying_actions(label, x, y)
-
-            # Left 결속 전: 현재 Right 자세이면 Left로 전환 필요
-            if left_pts and self.current_pose_state != 'left':
-                self._append_pose_change_right_to_left()
-                self.current_pose_state = 'left'
-
-            for label, x, y in left_pts:
-                self._append_tying_actions(label, x, y)
-
-            # 최종 자세 상태 업데이트
-            if left_pts:
-                self.current_pose_state = 'left'
-            elif right_pts:
-                self.current_pose_state = 'right'
-
-        # 후처리: Z_UP + MOVE_XY 연속 패턴 → MOVE_Z_UP_WITH_XY로 합치기
-        self._optimize_z_xy_overlap()
-
-    def _optimize_z_xy_overlap(self):
-        """Z_UP 직후 MOVE_XY가 오는 패턴을 MOVE_Z_UP_WITH_XY로 합침.
-
-        이렇게 하면 Z 상승 중 일정 높이(z_early_xy_mm) 도달 시
-        XY 이동을 미리 시작하여 사이클 타임을 줄입니다.
-        """
-        optimized = []
-        i = 0
-        merged_count = 0
-        while i < len(self.action_queue):
-            action = self.action_queue[i]
-            # Z_UP 다음이 MOVE_XY이면 합치기
-            if (action.action_type == ActionType.MOVE_Z_UP
-                    and i + 1 < len(self.action_queue)
-                    and self.action_queue[i + 1].action_type == ActionType.MOVE_XY):
-                next_action = self.action_queue[i + 1]
-                optimized.append(Action(
-                    action_type=ActionType.MOVE_Z_UP_WITH_XY,
-                    z_mm=action.z_mm,
-                    x_mm=next_action.x_mm,
-                    y_mm=next_action.y_mm,
-                    point_label=action.point_label,
-                    message=f'{action.point_label}: Z↑{action.z_mm}mm + '
-                            f'{next_action.point_label} XY({next_action.x_mm:.1f},{next_action.y_mm:.1f})',
-                ))
-                i += 2  # 두 액션을 하나로
-                merged_count += 1
-            else:
-                optimized.append(action)
-                i += 1
-
-        if merged_count > 0:
-            self.action_queue = optimized
-            self.get_logger().info(
-                f'  [최적화] Z↑+XY 병합: {merged_count}개 (액션 {len(self.action_queue)}개)')
-
-    def _append_tying_actions(self, label, x, y):
-        """한 포인트에 대한 결속 액션 시퀀스 추가.
-
-        XY이동 → Z하강(tying_z_down_mm) → 트리거 → Z상승(tying_z_down_mm)
-        """
-        # XY 이동
-        self.action_queue.append(Action(
-            action_type=ActionType.MOVE_XY,
-            x_mm=x, y_mm=y,
-            point_label=label,
-            message=f'{label}: X={x:.1f}mm, Y={y:.1f}mm',
-        ))
-        # Z축 하강 (대기위치에서 추가 하강)
-        self.action_queue.append(Action(
-            action_type=ActionType.MOVE_Z_DOWN,
-            z_mm=self.tying_z_down_mm,
-            point_label=label,
-            message=f'{label}: Z {self.tying_z_down_mm}mm 하강',
-        ))
-        # 트리거 동작
-        self.action_queue.append(Action(
-            action_type=ActionType.TRIGGER,
-            point_label=label,
-            message=f'{label}: 트리거',
-        ))
-        # Z축 상승 (대기위치로 복귀)
-        self.action_queue.append(Action(
-            action_type=ActionType.MOVE_Z_UP,
-            z_mm=self.tying_z_down_mm,
-            point_label=label,
-            message=f'{label}: Z {self.tying_z_down_mm}mm 상승',
-        ))
-
-    def _append_pose_change_right_to_left(self):
-        """P3→P4 자세 변경 시퀀스 (Right → Left 전환)
-
-        1) X:홈, Y:near → 2) Yaw:mid → 3) Y:far → 4) Yaw:접근(390°) → 5) Yaw:left_cam(393°)
-        """
-        self.action_queue.append(Action(
-            action_type=ActionType.LOG,
-            message='=== 자세 변경: Right → Left ===',
-        ))
-        # Step 1: 안전 위치로 이동 (X→홈)
-        self.action_queue.append(Action(
-            action_type=ActionType.MOVE_XY,
-            x_mm=self.x_home_mm, y_mm=self.pose_change_y_near,
-            message=f'자세변경 1/5: X={self.x_home_mm:.1f}mm(홈), Y={self.pose_change_y_near}mm',
-        ))
-        # Step 2: Yaw 중간 경유
-        self.action_queue.append(Action(
-            action_type=ActionType.MOVE_YAW,
-            yaw_deg=self.yaw_mid,
-            message=f'자세변경 2/5: Yaw → {self.yaw_mid}°',
-        ))
-        # Step 3: Y 원거리 위치
-        self.action_queue.append(Action(
-            action_type=ActionType.MOVE_XY,
-            x_mm=self.x_home_mm, y_mm=self.pose_change_y_far,
-            message=f'자세변경 3/5: X={self.x_home_mm:.1f}mm(홈), Y → {self.pose_change_y_far}mm',
-        ))
-        # Step 4: Yaw Left cam 접근자세 (긴 거리, 오버슈트 방지)
-        self.action_queue.append(Action(
-            action_type=ActionType.MOVE_YAW,
-            yaw_deg=self.yaw_left_cam_approach,
-            message=f'자세변경 4/5: Yaw → {self.yaw_left_cam_approach}° (접근)',
-        ))
-        # Step 5: Yaw Left cam 최종자세 (짧은 거리, 정밀 접근)
-        self.action_queue.append(Action(
-            action_type=ActionType.MOVE_YAW,
-            yaw_deg=self.yaw_left_cam,
-            message=f'자세변경 5/5: Yaw → {self.yaw_left_cam}° (최종)',
-        ))
-
-    def _append_pose_change_left_to_right(self):
-        """P6→P1 자세 복귀 시퀀스 (Left → Right 복귀)
-
-        1) X:홈, Y:far → 2) Yaw:mid → 3) Y:near → 4) Yaw:홈+5° → 5) Yaw:right_cam
-        """
-        self.action_queue.append(Action(
-            action_type=ActionType.LOG,
-            message='=== 자세 복귀: Left → Right ===',
-        ))
-        # Step 1: 안전 위치로 이동 (X→홈)
-        self.action_queue.append(Action(
-            action_type=ActionType.MOVE_XY,
-            x_mm=self.x_home_mm, y_mm=self.pose_change_y_far,
-            message=f'자세복귀 1/5: X={self.x_home_mm:.1f}mm(홈), Y={self.pose_change_y_far}mm',
-        ))
-        # Step 2: Yaw 중간 경유
-        self.action_queue.append(Action(
-            action_type=ActionType.MOVE_YAW,
-            yaw_deg=self.yaw_mid,
-            message=f'자세복귀 2/5: Yaw → {self.yaw_mid}°',
-        ))
-        # Step 3: Y 근접 위치
-        self.action_queue.append(Action(
-            action_type=ActionType.MOVE_XY,
-            x_mm=self.x_home_mm, y_mm=self.pose_change_y_near,
-            message=f'자세복귀 3/5: X={self.x_home_mm:.1f}mm(홈), Y → {self.pose_change_y_near}mm',
-        ))
-        # Step 4: Yaw 경유 (홈+5°, 이동량 감소)
-        yaw_near_home = self.home_ref_yaw_deg + 5.0
-        self.action_queue.append(Action(
-            action_type=ActionType.MOVE_YAW,
-            yaw_deg=yaw_near_home,
-            message=f'자세복귀 4/5: Yaw → {yaw_near_home:.1f}° (홈+5°)',
-        ))
-        # Step 5: Yaw Right cam 자세
-        self.action_queue.append(Action(
-            action_type=ActionType.MOVE_YAW,
-            yaw_deg=self.yaw_right_cam,
-            message=f'자세복귀 5/5: Yaw → {self.yaw_right_cam}°',
-        ))
+        """포인트 목록으로부터 실행할 액션 큐 생성 (ActionBuilder 위임)."""
+        # ActionBuilder 파라미터 업데이트 (런타임 값)
+        self.action_builder.update_params(
+            x_home_mm=self.x_home_mm,
+            yaw_right_cam=self.yaw_right_cam,
+            yaw_left_cam=self.yaw_left_cam,
+            yaw_left_cam_approach=self.yaw_left_cam_approach,
+            yaw_mid=self.yaw_mid,
+            home_ref_yaw_deg=self.home_ref_yaw_deg,
+        )
+        self.action_queue, self.current_pose_state = self.action_builder.build(
+            points, self.current_pose_state, self.tying_direction,
+            logger=self.get_logger()
+        )
 
     # ============================================
     # 액션 실행
@@ -1515,8 +840,7 @@ class TyingOrchestratorNode(Node):
             # 이동 시간 계산: 거리/속도 + 마진
             self.z_wait_time = z_deg / self.effective_z_speed + self.z_settle_margin
             # 토크 모니터링 시작
-            self._z_torque_samples = []  # 폴링 데이터 수집용
-            self._start_z_torque_monitor()
+            self.z_monitor.start(self.z_wait_time, self.speed_percent, self.effective_z_speed)
             self._transition_to(TyingState.WAITING_Z)
 
         elif action.action_type == ActionType.MOVE_Z_UP:
@@ -1528,7 +852,7 @@ class TyingOrchestratorNode(Node):
             self._publish_tying_feedback()
             # 이동 시간 계산
             self.z_wait_time = z_deg / self.effective_z_speed + self.z_settle_margin
-            self.z_descending = False  # 상승 시에는 토크 체크 안 함
+            self.z_monitor.z_descending = False  # 상승 시에는 토크 체크 안 함
             self._transition_to(TyingState.WAITING_Z)
 
         elif action.action_type == ActionType.MOVE_Z_UP_WITH_XY:
@@ -1693,86 +1017,6 @@ class TyingOrchestratorNode(Node):
         msg.data = speed
         self.trigger_pub.publish(msg)
 
-    # ============================================
-    # Z축 토크 모니터링
-    # ============================================
-    def _start_z_torque_monitor(self):
-        """Z 하강 시 0x9C 폴링 타이머 시작."""
-        self.z_descending = True
-        self.z_torque_overload = False
-        self.z_torque_mA = 0
-        self.z_torque_decel_hit = 0
-        self._z_descent_start_time = self.get_clock().now()
-        # 속도 비례 임계값 + 하강시간 비율 지연 계산
-        self.z_torque_limit_mA = int(
-            self.z_torque_base_mA + self.speed_percent * self.z_torque_scale_mA)
-        self.z_torque_check_delay = self.z_wait_time * self.z_torque_delay_ratio
-        if self.z_torque_poll_timer is None:
-            period = 1.0 / self.z_torque_poll_hz
-            self.z_torque_poll_timer = self.create_timer(
-                period, self._poll_z_torque)
-            decel_start = self.z_wait_time * self.z_torque_decel_ratio
-            self.get_logger().info(
-                f'    Z축 토크 모니터링 시작 ({self.z_torque_poll_hz}Hz, '
-                f'가속임계={self.z_torque_limit_mA}mA, '
-                f'감속임계={self.z_torque_decel_mA}mA@{decel_start:.2f}s, '
-                f'연속{self.z_torque_decel_count}회 @{self.speed_percent:.0f}%)')
-            self.flog(f"Z_DOWN_START: speed%={self.speed_percent:.0f} "
-                      f"eff_speed={self.effective_z_speed:.0f}dps "
-                      f"accel_limit={self.z_torque_limit_mA}mA "
-                      f"decel_limit={self.z_torque_decel_mA}mA "
-                      f"decel_start={decel_start:.3f}s "
-                      f"decel_count={self.z_torque_decel_count} "
-                      f"z_wait={self.z_wait_time:.3f}s "
-                      f"poll_hz={self.z_torque_poll_hz}")
-
-    def _log_z_descent_summary(self, result):
-        """Z 하강 완료/과부하 시 통계 요약을 파일 로그에 기록."""
-        samples = getattr(self, '_z_torque_samples', [])
-        if not samples:
-            self.flog(f"Z_DOWN_END: result={result} samples=0")
-            return
-        currents = [s[1] for s in samples]
-        speeds = [s[2] for s in samples]
-        duration_ms = samples[-1][0] - samples[0][0]
-        self.flog(
-            f"Z_DOWN_END: result={result} "
-            f"samples={len(samples)} duration_ms={duration_ms:.0f} "
-            f"current_min={min(currents)} current_max={max(currents)} "
-            f"current_avg={sum(currents)/len(currents):.0f} "
-            f"speed_min={min(speeds)} speed_max={max(speeds)} "
-            f"speed_avg={sum(speeds)/len(speeds):.0f} "
-            f"final_current={currents[-1]} final_speed={speeds[-1]}")
-
-    def _stop_z_torque_monitor(self):
-        """0x9C 폴링 타이머 정지."""
-        self.z_descending = False
-        if self.z_torque_poll_timer is not None:
-            self.z_torque_poll_timer.cancel()
-            self.destroy_timer(self.z_torque_poll_timer)
-            self.z_torque_poll_timer = None
-
-    def _poll_z_torque(self):
-        """0x9C 명령으로 Z축 모터 상태 요청."""
-        msg = JointControl()
-        msg.joint_id = 0x146
-        msg.control_mode = 0x9C
-        msg.position = 0.0
-        msg.velocity = 0.0
-        self.encoder_request_pub.publish(msg)
-        # 경과시간 계산
-        elapsed_ms = (self.get_clock().now() - self._z_descent_start_time).nanoseconds / 1e6
-        self.get_logger().info(
-            f'    [토크폴링] Z전류={self.z_torque_mA}mA 속도={self.z_speed_dps}dps')
-        # 파일 로그: CSV 형태로 매 샘플 기록 (분석용)
-        self.flog(f"Z_TORQUE: t_ms={elapsed_ms:.0f} "
-                  f"current_mA={self.z_torque_mA} "
-                  f"speed_dps={self.z_speed_dps} "
-                  f"limit_mA={self.z_torque_limit_mA}")
-        if hasattr(self, '_z_torque_samples'):
-            self._z_torque_samples.append(
-                (elapsed_ms, self.z_torque_mA, self.z_speed_dps))
-
     def _handle_z_overload(self):
         """Z축 토크 과부하 시: Z정지 → 트리거 스킵 → Z상승.
 
@@ -1781,13 +1025,8 @@ class TyingOrchestratorNode(Node):
         MOVE_Z_UP은 tying_z_down_mm 전체를 상승 시도하지만,
         실제 하강 거리보다 크더라도 상부 리밋 센서가 보호해준다.
         """
-        # Z축 즉시 정지 (속도 0 명령)
-        stop_msg = JointControl()
-        stop_msg.joint_id = 0x146
-        stop_msg.position = 0.0
-        stop_msg.velocity = 0.0
-        stop_msg.control_mode = JointControl.MODE_SPEED
-        self.joint_pub.publish(stop_msg)
+        # Z축 즉시 정지
+        self.z_monitor.stop_z_motor()
 
         # TRIGGER 액션 찾아서 스킵 → MOVE_Z_UP으로 점프
         idx = self.current_action_index + 1
@@ -1806,8 +1045,68 @@ class TyingOrchestratorNode(Node):
     # 완료 / 에러 / 취소 처리
     # ============================================
     def _handle_complete(self):
-        """결속 시퀀스 완료"""
-        # 반복모드 전진 패스 완료 → 복귀 패스 재검출 시작
+        """결속 시퀀스 완료
+
+        Phase 1 완료 → 자세변경 + Phase 2 검출 재진입
+        Phase 2 완료 → 진짜 완료 (또는 repeat 처리)
+        """
+        # 자세변경 완료 → Phase 2 검출 시작
+        if hasattr(self, '_phase2_cam') and self._phase2_cam is not None:
+            cam = self._phase2_cam
+            self._phase2_cam = None  # 1회만 사용
+            self.get_logger().info(
+                f'[Phase 2] {cam} 카메라 검출 시작 (자세변경 완료)')
+            self.flog(f"PHASE2_START: pose={self.current_pose_state} cam={cam}")
+            self.action_queue = []
+            self.current_action_index = 0
+            self.detection_mgr.start(camera_side=cam)
+            self.tying_message = f'{cam} 카메라 검출 중...'
+            self._transition_to(TyingState.DETECTING)
+            self._publish_tying_feedback()
+            return
+
+        # Phase 1 완료 → 자세변경 + Phase 2 검출
+        if self.tying_phase == 1:
+            phase1_completed = self.completed_points
+            self.get_logger().info('=' * 60)
+            self.get_logger().info(
+                f'[Phase 1 완료] {phase1_completed}개 체결, '
+                f'자세변경 → Phase 2 검출 시작')
+            self.get_logger().info('=' * 60)
+            self.flog(f"PHASE1_DONE: completed={phase1_completed}")
+
+            # 자세변경 액션 생성 + 실행
+            if self.current_pose_state == 'right':
+                next_cam = 'left'
+                next_pose = 'left'
+            else:
+                next_cam = 'right'
+                next_pose = 'right'
+
+            self.action_builder.update_params(
+                x_home_mm=self.x_home_mm,
+                yaw_right_cam=self.yaw_right_cam,
+                yaw_left_cam=self.yaw_left_cam,
+                yaw_left_cam_approach=self.yaw_left_cam_approach,
+                yaw_mid=self.yaw_mid,
+                home_ref_yaw_deg=self.home_ref_yaw_deg,
+            )
+            pose_actions = self.action_builder.build_pose_change(
+                self.current_pose_state, next_pose)
+            self.current_pose_state = next_pose
+
+            # 자세변경 액션 실행 후 Phase 2 검출로 전환하기 위해
+            # _phase2_cam을 저장해두고, 자세변경 완료 시 검출 시작
+            self._phase2_cam = next_cam
+            self.tying_phase = 2
+            self.action_queue = pose_actions
+            self.current_action_index = 0
+            self.tying_message = f'자세변경 중 ({self.current_pose_state})...'
+            self._transition_to(TyingState.EXECUTING_ACTION)
+            self._publish_tying_feedback()
+            return
+
+        # Phase 2 완료 → repeat 또는 최종 완료
         if self.repeat_mode and self.tying_pass == 'forward':
             forward_completed = self.completed_points
             self.get_logger().info('=' * 60)
@@ -1816,18 +1115,16 @@ class TyingOrchestratorNode(Node):
                 f'복귀 패스 재검출 시작')
             self.get_logger().info('=' * 60)
             self.tying_pass = 'return'
-            self.tying_direction = 'reverse'  # return 패스는 reverse 방향
+            self.tying_direction = 'reverse'
             self._forward_completed_points = forward_completed
-            # 검출 상태 초기화 (재검출)
+            # 현재 자세 카메라로 Phase 1 재시작
+            self.tying_phase = 1
+            cam_side = 'left' if self.current_pose_state == 'left' else 'right'
             self.action_queue = []
             self.current_action_index = 0
-            self.detection_future = None
-            self.detection_retry = 0
-            self.multi_detect_count = 0
-            self.accumulated_points = []
-            self.multi_detect_wait_until = 0.0
-            self._detect_camera_phase = 'right'
+            self.detection_mgr.start(camera_side=cam_side)
             self.tying_message = '복귀 패스 교차점 멀티검출 중...'
+            self.flog(f"REPEAT_RETURN: pose={self.current_pose_state} cam={cam_side}")
             self._transition_to(TyingState.DETECTING)
             self._publish_tying_feedback()
             return
@@ -1860,7 +1157,7 @@ class TyingOrchestratorNode(Node):
 
     def _handle_error(self, error_msg):
         """에러 처리 (navigator 블록 방지를 위해 완료 신호 발행)"""
-        self._stop_z_torque_monitor()
+        self.z_monitor.stop()
         self.get_logger().error(f'[ERROR] {error_msg}')
         self.flog(f"ERROR: {error_msg} → TYING_COMPLETE 발행")
 
@@ -1876,7 +1173,7 @@ class TyingOrchestratorNode(Node):
     def _handle_cancel(self):
         """작업 취소 처리"""
         # 토크 모니터링 정지
-        self._stop_z_torque_monitor()
+        self.z_monitor.stop()
         # 모든 스테이지 모터 즉시 정지
         for motor_id in [0x144, 0x145, 0x146, 0x147]:
             stop_msg = JointControl()
