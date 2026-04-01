@@ -1018,12 +1018,12 @@ class TyingOrchestratorNode(Node):
         self.trigger_pub.publish(msg)
 
     def _handle_z_overload(self):
-        """Z축 토크 과부하 시: Z정지 → 트리거 스킵 → Z상승.
+        """Z축 토크 과부하 시: Z정지 → 트리거 스킵 → Z상승(순수 상승만).
 
-        액션 큐: ... → MOVE_Z_DOWN(현재) → TRIGGER → MOVE_Z_UP → ...
-        TRIGGER를 스킵하고 MOVE_Z_UP으로 점프한다.
-        MOVE_Z_UP은 tying_z_down_mm 전체를 상승 시도하지만,
-        실제 하강 거리보다 크더라도 상부 리밋 센서가 보호해준다.
+        액션 큐: ... → MOVE_Z_DOWN(현재) → TRIGGER → MOVE_Z_UP(_WITH_XY) → ...
+        TRIGGER를 스킵하고 Z상승으로 점프한다.
+        MOVE_Z_UP_WITH_XY인 경우 순수 MOVE_Z_UP으로 교체하여
+        상승 완료 전 XY 이동을 방지한다 (공구가 철근에 걸리는 문제 방지).
         """
         # Z축 즉시 정지
         self.z_monitor.stop_z_motor()
@@ -1032,7 +1032,20 @@ class TyingOrchestratorNode(Node):
         idx = self.current_action_index + 1
         while idx < len(self.action_queue):
             if self.action_queue[idx].action_type == ActionType.TRIGGER:
-                # TRIGGER를 건너뛰고 그 다음(MOVE_Z_UP)으로
+                # TRIGGER 다음 액션이 Z_UP_WITH_XY이면 순수 Z_UP으로 교체
+                z_up_idx = idx + 1
+                if (z_up_idx < len(self.action_queue)
+                        and self.action_queue[z_up_idx].action_type
+                        == ActionType.MOVE_Z_UP_WITH_XY):
+                    orig = self.action_queue[z_up_idx]
+                    self.action_queue[z_up_idx] = Action(
+                        action_type=ActionType.MOVE_Z_UP,
+                        z_mm=orig.z_mm,
+                        point_label=orig.point_label,
+                        message=f'{orig.point_label}: Z {orig.z_mm}mm 상승 (과부하복구)',
+                    )
+                    self.get_logger().warn(
+                        f'    Z_UP_WITH_XY → Z_UP 교체 (XY 선행이동 방지)')
                 self.current_action_index = idx  # _advance 에서 +1 → MOVE_Z_UP
                 self.get_logger().warn(
                     f'    트리거 스킵 → 액션[{idx + 1}] Z상승으로 전환')
