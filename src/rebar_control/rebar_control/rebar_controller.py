@@ -45,8 +45,9 @@ class RebarController(Node):
         self.declare_parameter('max_angular_vel', 1.0)  # rad/s
 
         self.declare_parameter('distance_tolerance', 0.001)  # m (1mm) - 0x92 position 기반 정밀 제어
+        self.declare_parameter('arrival_tolerance', 0.03)    # m - WP 도달 여유(관성 오버슈트 방지, 시연 3cm)
         self.declare_parameter('heading_tolerance', 0.1)  # rad (~6도)
-        self.declare_parameter('max_tying_points', 100)  # repeat 모드 종료 기준 (총 결속 포인트)
+        self.declare_parameter('max_tying_points', 0)  # repeat 종료 기준(총 결속pt). 0이하=무제한(S18/E-stop만 정지)
 
         # PID 파라미터
         self.declare_parameter('min_linear_vel', 0.01)  # m/s (모터 stiction 극복 최소 속도)
@@ -67,6 +68,7 @@ class RebarController(Node):
         self.min_linear = self.get_parameter('min_linear_vel').value
 
         self.distance_tolerance = self.get_parameter('distance_tolerance').value
+        self.arrival_tolerance = self.get_parameter('arrival_tolerance').value
         self.heading_tolerance = self.get_parameter('heading_tolerance').value
 
         self.kp_linear = self.get_parameter('kp_linear').value
@@ -94,6 +96,18 @@ class RebarController(Node):
         self.tying_complete_received = False  # TYING_COMPLETE 수신 플래그
         self.waypoint_reached_time = 0.0  # 도달 확정 시각
         self.waypoint_dwelling = False  # 대기 중 플래그
+
+        # WP 도달 후 실제 정지 확인 (블러/위치오차 방지) — encoder_pose 안정성 기반.
+        # TYING_START 전에 base가 stop_pos_tol 이내로 stop_settle_time 유지되면 정지확정.
+        self.declare_parameter('stop_pos_tol', 0.003)     # m (3mm) 이내면 정지 간주
+        self.declare_parameter('stop_settle_time', 0.3)   # s 이 시간 안정 유지 시 확정
+        self.declare_parameter('stop_max_wait', 2.0)      # s 정지대기 최대(fallback)
+        self.stop_pos_tol = self.get_parameter('stop_pos_tol').value
+        self.stop_settle_time = self.get_parameter('stop_settle_time').value
+        self.stop_max_wait = self.get_parameter('stop_max_wait').value
+        self._stop_ref_pose = None    # 안정성 판정 기준 위치
+        self._stop_ref_time = 0.0      # 기준 갱신(마지막 움직임) 시각
+        self._stop_wait_start = 0.0    # 정지대기 시작 시각
 
         # Repeat 모드 (핑퐁)
         self.repeat_mode = False  # repeat ON/OFF
@@ -123,8 +137,9 @@ class RebarController(Node):
         # Lateral motion 파라미터
         self.lateral_tolerance = 0.005  # 5mm
         self.lateral_speed_dps = 200.0  # degrees per second
-        self.mm_per_rotation = 44.0  # 44mm = 360도 = 1회전 (실측: 9회전=396mm)
+        self.mm_per_rotation = 70.0  # 70mm = 360도 = 1회전 (HW 업그레이드 후, 기존 44mm)
         self.lateral_y_offset = 0.0  # 횡이동 누적 Y 오프셋 (m)
+        self.paused = False  # 일시정지(S23) 플래그
 
         # 횡이동 분할 실행 상태
         self.lateral_total_rotations = 0  # 총 회전 횟수
@@ -395,8 +410,9 @@ class RebarController(Node):
     def _set_current_waypoint_as_target(self):
         """현재 인덱스의 웨이포인트를 목표로 설정"""
         if self.current_waypoint_index >= len(self.waypoint_array_x):
-            # repeat 모드: 핑퐁 반복
-            if self.repeat_mode and self.total_tying_points < self.max_tying_points:
+            # repeat 모드: 핑퐁 반복 (max_tying_points<=0 이면 무제한 → S18/E-stop으로만 정지)
+            unlimited = self.max_tying_points <= 0
+            if self.repeat_mode and (unlimited or self.total_tying_points < self.max_tying_points):
                 self._start_pingpong_next_lap()
                 return
 
@@ -485,17 +501,27 @@ class RebarController(Node):
         self.pingpong_lap += 1
         n = len(self.original_waypoints_x)
 
-        if self.pingpong_lap % 2 == 1:
-            # 역방향: 끝에서 두번째 → 처음 (마지막=현재위치 제외)
-            indices = list(range(n - 2, -1, -1))
-        else:
+        # 닫힌 루프(시작WP≈끝WP) → 정방향 반복(loop, 한방향 연속). 열린 경로 → 핑퐁(왕복 retrace)
+        is_closed = (
+            abs(self.original_waypoints_x[0] - self.original_waypoints_x[-1]) < 0.02 and
+            abs(self.original_waypoints_y[0] - self.original_waypoints_y[-1]) < 0.02)
+
+        if is_closed or self.pingpong_lap % 2 == 0:
             # 정방향: 두번째 → 끝 (처음=현재위치 제외)
             indices = list(range(1, n))
+            mt = [self.original_waypoints_motion_type[i] for i in indices]
+        else:
+            # 역방향(핑퐁): 끝에서 두번째 → 처음. motion_type은 i+1번째 구간 타입
+            indices = list(range(n - 2, -1, -1))
+            mt = [self.original_waypoints_motion_type[i + 1] for i in indices]
 
         self.waypoint_array_x = [self.original_waypoints_x[i] for i in indices]
         self.waypoint_array_y = [self.original_waypoints_y[i] for i in indices]
-        self.waypoint_array_motion_type = [self.original_waypoints_motion_type[i] for i in indices]
+        self.waypoint_array_motion_type = mt
         self.waypoint_array_max_speed = [self.original_waypoints_max_speed[i] for i in indices]
+        _otp = getattr(self, 'original_waypoints_tying_points', [])
+        if len(_otp) == len(self.original_waypoints_x):
+            self.waypoint_array_tying_points = [_otp[i] for i in indices]
         self.current_waypoint_index = 0
 
         # 경로 방향 업데이트
@@ -557,6 +583,7 @@ class RebarController(Node):
 
     def _reset_mission_state(self):
         """미션 상태 리셋"""
+        self.paused = False  # 취소 시 일시정지 해제
         self.waypoint_array_x = []
         self.waypoint_array_y = []
         self.waypoint_array_motion_type = []
@@ -592,6 +619,14 @@ class RebarController(Node):
         direction_msg.data = 'forward'
         self.travel_direction_pub.publish(direction_msg)
 
+    def _current_tying_points(self):
+        """현재 웨이포인트의 사전지정 결속포인트 [[x,y],...] (없으면 [])."""
+        tp = getattr(self, 'waypoint_array_tying_points', [])
+        i = self.current_waypoint_index
+        if 0 <= i < len(tp) and tp[i]:
+            return tp[i]
+        return []
+
     def mission_command_callback(self, msg: String):
         """미션 명령 처리 (CANCEL, SET_REPEAT 등)"""
         command = msg.data
@@ -605,6 +640,26 @@ class RebarController(Node):
                     self.get_logger().info(f"Repeat 모드: {'ON' if self.repeat_mode else 'OFF'} "
                                            f"(max={self.max_tying_points}pt)")
                     self.flog(f"SET_REPEAT: {'ON' if self.repeat_mode else 'OFF'} max={self.max_tying_points}")
+                    return
+                if data.get('command') == 'PAUSE':
+                    self.paused = True
+                    self.publish_cmd_vel(0.0, 0.0)
+                    self.get_logger().info("⏸️ 주행 일시정지(PAUSE)")
+                    self.flog("PAUSE")
+                    return
+                if data.get('command') == 'RESUME':
+                    self.paused = False
+                    self.get_logger().info("▶️ 주행 재개(RESUME)")
+                    self.flog("RESUME")
+                    return
+                if data.get('command') == 'SET_TYING_POINTS':
+                    # WP별 사전지정 결속포인트 [[ [x,y],... ], ...] (없는 WP는 빈 리스트)
+                    pts = data.get('points', [])
+                    self.original_waypoints_tying_points = list(pts)
+                    self.waypoint_array_tying_points = list(pts)
+                    n_with = sum(1 for p in pts if p)
+                    self.get_logger().info(f"SET_TYING_POINTS: {len(pts)}WP 중 {n_with}개 결속좌표 지정")
+                    self.flog(f"SET_TYING_POINTS: {len(pts)}WP, {n_with}개 지정")
                     return
             except json.JSONDecodeError:
                 pass
@@ -914,6 +969,11 @@ class RebarController(Node):
         - DIFFERENTIAL: PID 제어로 전진/후진
         - LATERAL: 횡이동 제어 (joint_control)
         """
+        if self.paused:
+            # 일시정지(S23): 주행 정지, 인덱스/상태 유지 (S24 RESUME 시 이어감)
+            self.publish_cmd_vel(0.0, 0.0)
+            return
+
         if self.encoder_pose is None or self.target_pose is None:
             # 엔코더 odometry 또는 목표가 없으면 정지
             self.publish_cmd_vel(0.0, 0.0)
@@ -1006,17 +1066,41 @@ class RebarController(Node):
 
         if distance < self.distance_tolerance:
             waypoint_reached = True
-        elif along_path_remaining <= 0.0:
-            # 경로 방향으로 목표 지점을 통과함 (along-path 기준)
+        elif along_path_remaining <= self.arrival_tolerance:
+            # WP 앞 arrival_tolerance 이내(또는 통과) → 도달 (관성 오버슈트 방지용 여유)
             self.get_logger().info(
-                f"📍 경로상 WP 통과: along={along_path_remaining*1000:.1f}mm, "
-                f"유클리드={distance*1000:.1f}mm → 도달 판정"
+                f"📍 WP 도달: along={along_path_remaining*1000:.1f}mm "
+                f"(tol={self.arrival_tolerance*1000:.0f}mm), 유클리드={distance*1000:.1f}mm"
             )
             waypoint_reached = True
 
         if waypoint_reached:
             if not self.waypoint_reached_sent:
-                self.publish_cmd_vel(0.0, 0.0)
+                self.publish_cmd_vel(0.0, 0.0)   # 계속 정지 명령
+                # === 실제 정지 확인 후 TYING_START (블러/위치오차 방지) ===
+                _now = time.monotonic()
+                _px = self.encoder_pose.pose.position.x if self.encoder_pose else 0.0
+                _py = self.encoder_pose.pose.position.y if self.encoder_pose else 0.0
+                if self._stop_ref_pose is None:
+                    self._stop_ref_pose = (_px, _py)
+                    self._stop_ref_time = _now
+                    self._stop_wait_start = _now
+                    return   # 정지대기 시작 → 다음 틱에서 재확인
+                if math.hypot(_px - self._stop_ref_pose[0],
+                              _py - self._stop_ref_pose[1]) > self.stop_pos_tol:
+                    self._stop_ref_pose = (_px, _py)   # 움직임 감지 → 기준+안정타이머 리셋
+                    self._stop_ref_time = _now
+                _stable = (_now - self._stop_ref_time) >= self.stop_settle_time
+                _timeout = (_now - self._stop_wait_start) >= self.stop_max_wait
+                if not (_stable or _timeout):
+                    return   # 아직 정지 확정 전 → 대기 (정지명령 유지)
+                self._stop_ref_pose = None
+                self.get_logger().info(
+                    f"🛑 정지 확정 ({'settle' if _stable else 'timeout'}, "
+                    f"대기 {_now - self._stop_wait_start:.2f}s) → 결속 진행")
+                self.flog(f"정지확정 {'settle' if _stable else 'timeout'} "
+                          f"{_now - self._stop_wait_start:.2f}s")
+
                 self.waypoint_reached_sent = True
                 self.waypoint_reached_time = time.monotonic()
                 # VSLAM 동결 감지 타이머 리셋 (정지 중 동결 오탐 방지)
@@ -1036,11 +1120,12 @@ class RebarController(Node):
                     f"dist={distance*1000:.1f}mm → TYING_START direction={tying_dir}"
                 )
 
-                # TYING_START 발행
+                # TYING_START 발행 (현재 WP 사전지정 결속포인트 첨부)
                 tying_cmd = json.dumps({
                     'command': 'TYING_START',
                     'speed': 70,
                     'direction': tying_dir,
+                    'points': self._current_tying_points(),
                 })
                 cmd_msg = String()
                 cmd_msg.data = tying_cmd
@@ -1298,15 +1383,15 @@ class RebarController(Node):
                 f"오차={(zed_dy - actual_dy)*1000:.1f}mm"
             )
 
-            # 위치 보정은 하지 않음 (ZED odometry 사용)
-            # 대신 mission_offset_y를 조정하여 다음 웨이포인트 계산에 반영
-            # 엔코더 이동량과 ZED 이동량의 차이만큼 오프셋 보정
+            # mission_offset_y 보정 비활성화 (2026-06-15)
+            # 횡이동은 이미 encoder_pose.y(lateral_y_offset 포함)에 반영되므로 별도 보정 불필요.
+            # ZED는 로봇이 yaw=-180°로 뒤돌아 있을 때 횡이동을 반대 부호(-455mm)로 읽어,
+            # actual_dy - zed_dy = +875mm 의 잘못된 오프셋이 주입되어 다음 차동 웨이포인트
+            # 목표 Y가 부풀려지고 후진이 과주행(600mm 초과)하는 버그 발생 → 보정 제거.
             encoder_zed_diff = actual_dy - zed_dy
-            self.mission_offset_y += encoder_zed_diff
-
             self.get_logger().info(
-                f"📍 오프셋 보정: Y offset += {encoder_zed_diff*1000:.1f}mm "
-                f"(총 오프셋: {self.mission_offset_y*1000:.1f}mm)"
+                f"📍 오프셋 보정 비활성: 엔코더-ZED 차이={encoder_zed_diff*1000:.1f}mm "
+                f"(mission_offset_y 유지={self.mission_offset_y*1000:.1f}mm)"
             )
         else:
             self.get_logger().info(
@@ -1338,6 +1423,7 @@ class RebarController(Node):
             'command': 'TYING_START',
             'speed': 70,
             'direction': tying_dir,
+            'points': self._current_tying_points(),
         })
         cmd_msg = String()
         cmd_msg.data = tying_cmd

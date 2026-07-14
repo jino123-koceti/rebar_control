@@ -187,6 +187,16 @@ class Navigator(Node):
             10
         )
 
+        # /homing_cmd 구독: 리모콘 S21(authority_controller) 등 navigator 외부에서
+        # 호밍을 시작해도 인식하도록. navigator.start_homing()이 발행하는 것도 여기로
+        # 들어오지만 homing_in_progress 재설정이라 무해 (UI GO_HOME 경로도 그대로 동작).
+        self.homing_cmd_sub = self.create_subscription(
+            String,
+            '/homing_cmd',
+            self.homing_cmd_callback,
+            10
+        )
+
         # Homing 상태 추적
         self.homing_in_progress = False
         self.is_homed = False
@@ -226,7 +236,7 @@ class Navigator(Node):
 
         # 횡이동 오프셋 (encoder_odom에 반영 안 되는 Y 이동량)
         self.lateral_y_offset = 0.0  # mm
-        self.mm_per_rotation = 44.0  # 1회전 = 44mm (실측: 9회전=396mm)
+        self.mm_per_rotation = 70.0  # 1회전 = 70mm (HW 업그레이드 후, 기존 44mm)
         self.lateral_complete_sub = self.create_subscription(
             String,
             '/lateral_motion_complete',
@@ -251,6 +261,25 @@ class Navigator(Node):
 
         # 주기적 업데이트 타이머 (5Hz)
         self.timer = self.create_timer(0.2, self.update_mission)
+
+        # 부팅 시 default 경로 1회 자동로드 (파일 있으면 로드, 없으면 skip)
+        #   camera_mode(=tying_orchestrator.yaml의 단일 소스)에 따라 경로파일 선택:
+        #   1=양카메라 → default_path.json,  2=우측전용 → default_path_one_cam.json
+        self.declare_parameter(
+            'default_path_file',
+            os.path.expanduser('~/ros2_ws/config/default_path.json'))
+        self.declare_parameter(
+            'default_path_file_one_cam',
+            os.path.expanduser('~/ros2_ws/config/default_path_one_cam.json'))
+        cam_mode = self._read_camera_mode()
+        if cam_mode == 2:
+            self._default_path_file = self.get_parameter('default_path_file_one_cam').value
+            self.get_logger().info(
+                f"📷 camera_mode=2 → 우측전용 경로 사용: {self._default_path_file}")
+        else:
+            self._default_path_file = self.get_parameter('default_path_file').value
+        self._default_path_timer = self.create_timer(
+            2.0, self._load_default_path_once)  # 2초 후 1회 (자기취소)
 
         self.get_logger().info("Navigator 노드 초기화 완료")
         self.flog("=== Navigator 시작 ===")
@@ -314,8 +343,19 @@ class Navigator(Node):
                     if json_command == "START_MISSION":
                         # repeat 모드 파싱 (ON/OFF)
                         self.mission_repeat = data.get("repeat", "OFF").upper() == "ON"
-                        self.get_logger().info(f"START_MISSION: repeat={'ON' if self.mission_repeat else 'OFF'}")
-                        self.flog(f"START_MISSION: repeat={'ON' if self.mission_repeat else 'OFF'}")
+                        # path 지정 시 그 경로 로드 (리모콘 S22 등: 1회 실결속용 별도경로)
+                        path_override = data.get("path")
+                        self.get_logger().info(
+                            f"START_MISSION: repeat={'ON' if self.mission_repeat else 'OFF'} "
+                            f"path={path_override or 'default'}")
+                        self.flog(f"START_MISSION: repeat={'ON' if self.mission_repeat else 'OFF'} "
+                                  f"path={path_override or 'default'}")
+
+                        # 경로 로드: path 지정 있으면 그 파일(기존 덮어씀), 없고 비었으면 default
+                        if path_override:
+                            self._load_named_path(path_override)
+                        elif not self.waypoints:
+                            self._reload_default_path()
 
                         if self.sm.current_state == self.sm.planning:
                             self.sm.start()
@@ -507,6 +547,80 @@ class Navigator(Node):
         else:
             return Waypoint.MOTION_DIFFERENTIAL
 
+    def _read_camera_mode(self):
+        """camera_mode를 tying_orchestrator.yaml에서 읽음 (단일 소스). 실패 시 1."""
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            import yaml
+            p = os.path.join(
+                get_package_share_directory('rebar_vision'),
+                'config', 'tying_orchestrator.yaml')
+            with open(p, 'r') as f:
+                d = yaml.safe_load(f)
+            return int(d['tying_orchestrator']['ros__parameters'].get('camera_mode', 1))
+        except Exception as e:
+            self.get_logger().warn(f"camera_mode 읽기 실패({e}) → 기본 1")
+            return 1
+
+    def _reload_default_path(self):
+        """default 경로 파일을 다시 로드 (취소 후 S17 재시작용)."""
+        path = self._default_path_file
+        if not path or not os.path.isfile(path):
+            self.get_logger().warn(f"default 경로 재로드 실패: 파일 없음 ({path})")
+            return
+        try:
+            with open(path, 'r') as f:
+                self.load_waypoints_from_json(f.read())
+            self.get_logger().info(f"📂 default 경로 재로드: {len(self.waypoints)}개 WP")
+        except Exception as e:
+            self.get_logger().warn(f"default 경로 재로드 실패: {e}")
+
+    def _load_named_path(self, filename):
+        """지정 경로 파일 로드 (config/ 하위 파일명 또는 절대경로). 기존 waypoints 덮어씀.
+        리모콘 S22 등에서 START_MISSION path=... 로 특정 경로 실행 시 사용."""
+        path = filename if os.path.isabs(filename) else \
+            os.path.expanduser(os.path.join('~/ros2_ws/config', filename))
+        if not os.path.isfile(path):
+            self.get_logger().warn(f"지정 경로 파일 없음: {path} → default로 fallback")
+            self._reload_default_path()
+            return
+        try:
+            with open(path, 'r') as f:
+                self.load_waypoints_from_json(f.read())
+            self.get_logger().info(
+                f"📂 지정 경로 로드: {os.path.basename(path)} ({len(self.waypoints)}개 WP)")
+        except Exception as e:
+            self.get_logger().warn(f"지정 경로 로드 실패 {path}: {e}")
+
+    def _load_default_path_once(self):
+        """부팅 후 1회: default 경로 파일이 있으면 로드, 없으면 skip.
+
+        파일: default_path_file 파라미터 (기본 ~/ros2_ws/config/default_path.json)
+        {"waypoints":[...]} 형식. 파일 없음/waypoints 비어있음 → skip.
+        로드 시 load_waypoints_from_json → planning 상태 → UI/리모콘(S20→S17)로 시작 가능.
+        """
+        # one-shot: 타이머 즉시 취소
+        try:
+            self._default_path_timer.cancel()
+        except Exception:
+            pass
+
+        path = self._default_path_file
+        if not path or not os.path.isfile(path):
+            self.get_logger().info(f"📂 default 경로 파일 없음 → skip ({path})")
+            return
+        try:
+            with open(path, 'r') as f:
+                content = f.read()
+            data = json.loads(content)
+            if not data.get('waypoints'):
+                self.get_logger().info("📂 default 경로 비어있음(waypoints 없음) → skip")
+                return
+            self.get_logger().info(f"📂 default 경로 자동로드: {path}")
+            self.load_waypoints_from_json(content)
+        except Exception as e:
+            self.get_logger().warn(f"📂 default 경로 로드 실패: {e} → skip")
+
     def load_waypoints_from_json(self, json_str):
         """
         웨이포인트 JSON 로드
@@ -586,7 +700,9 @@ class Navigator(Node):
                     'x': x_m,
                     'y': y_m,
                     'motion_type': motion_type,
-                    'max_speed': max_speed
+                    'max_speed': max_speed,
+                    # 사전지정 결속포인트 [[x,y],...] mm (없으면 [] → 해당 WP는 Z스킵)
+                    'tying_points': wp.get('tying_points', []),
                 }
 
                 self.waypoints.append(waypoint_dict)
@@ -662,9 +778,10 @@ class Navigator(Node):
         """
         msg = WaypointArray()
 
-        # 현재 위치 기준 상대좌표 변환 (엔코더 리셋 후 (0,0) 기준과 일치시킴)
-        origin_x = self.current_pose['x'] / 1000.0  # mm → m
-        origin_y = self.current_pose['y'] / 1000.0
+        # 상대경로: 첫 웨이포인트(abs[0]) 기준 델타로 발행 → rebar가 현재위치에서 그만큼만 이동.
+        # (current_pose 기준이면 lateral_y_offset 누적/odom 드리프트가 origin을 오염시켜 폭주)
+        origin_x = float(self.waypoints[0]['x'])
+        origin_y = float(self.waypoints[0]['y'])
 
         self.flog(f"경로 발행: {len(self.waypoints)}개 WP (origin=({origin_x:.3f},{origin_y:.3f})m)")
         for i, wp in enumerate(self.waypoints):
@@ -678,6 +795,14 @@ class Navigator(Node):
             self.flog(f"  WP[{i}]: abs=({wp['x']:.3f},{wp['y']:.3f})m → rel=({rel_x:.3f},{rel_y:.3f})m @ {mt}")
 
         self.waypoint_array_pub.publish(msg)
+
+        # WP별 사전지정 결속포인트 전달 (rebar_controller가 TYING_START에 첨부)
+        tp_msg = String()
+        tp_msg.data = json.dumps({
+            'command': 'SET_TYING_POINTS',
+            'points': [wp.get('tying_points', []) for wp in self.waypoints],
+        })
+        self.mission_command_pub.publish(tp_msg)
 
         # repeat 모드 전달 (rebar_controller에 JSON으로)
         repeat_msg = String()
@@ -821,6 +946,19 @@ class Navigator(Node):
 
         # 피드백 발행 (UI에 호밍 상태 알림)
         self._publish_homing_feedback('homing')
+
+    def homing_cmd_callback(self, msg):
+        """/homing_cmd 수신 → 호밍 추적 시작 (UI GO_HOME / 리모콘 S21 공통).
+
+        homing_in_progress가 False일 때만 처리하므로 start_homing()이 직접 발행하는
+        'START'(이미 True)는 무시되고, 리모콘 S21처럼 navigator를 안 거친 호밍만
+        여기서 추적을 켠다. 이후 /homing_status 'COMPLETE:{refs}' 수신 시
+        is_homed=True + home_references가 정상 세팅된다.
+        """
+        if msg.data.strip().upper() == 'START' and not self.homing_in_progress:
+            self.get_logger().info("🏠 외부 /homing_cmd START 감지 → 호밍 추적 시작 (리모콘 S21 등)")
+            self.homing_in_progress = True
+            self._publish_homing_feedback('homing')
 
     def homing_status_callback(self, msg):
         """joint_controller로부터 호밍 상태 수신"""

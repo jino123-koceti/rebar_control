@@ -169,6 +169,64 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('use_zedxmini'))
     )
 
+    # ZED X One (mono, SN: 313997679, 4K) - 결속건 부착, 미세보정(top-view)용
+    # pipe_rover(jino123-koceti) 검증 방식: ZED 래퍼 + depth NONE override config로
+    #  모노 구동. startup에 스테레오와 함께 열려 GMSL 코디네이트 → 공존 (커스텀 pyzed는
+    #  나중에 따로 open하며 GMSL 재스캔 → 스테레오 크래시했음).
+    # Topic: /zedxone/zed_node/left/image_rect_color
+    zedxone_config = os.path.join(
+        get_package_share_directory('rebar_vision'), 'config', 'zedxone_params.yaml')
+    zedxone = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            PathJoinSubstitution([
+                FindPackageShare('zed_wrapper'), 'launch', 'zed_camera.launch.py'
+            ])
+        ]),
+        launch_arguments={
+            'camera_name': 'zedxone',
+            'camera_model': 'zedxone4k',
+            'ros_params_override_path': zedxone_config,
+            'publish_tf': 'false',
+            'publish_map_tf': 'false',
+            'serial_number': '313997679',
+        }.items(),
+        condition=IfCondition(LaunchConfiguration('use_zedxmini'))
+    )
+
+    # USB 캠 (UVC) - 결속 미세보정 top-view (GMSL과 별개라 충돌 없음)
+    # Topic: /usbcam/image_raw
+    usbcam = Node(
+        package='rebar_vision',
+        executable='usbcam_publisher',
+        name='usbcam_publisher',
+        output='screen',
+        parameters=[{
+            'device': '/dev/video9',
+            'width': 1920,
+            'height': 1080,
+            'fps': 15,
+        }],
+        emulate_tty=True,
+        condition=IfCondition(LaunchConfiguration('use_zedxmini'))
+    )
+
+    # Orbbec Gemini 2L - 상단 정면 교차점 검출 (호모그래피 자율결속). USB3, GMSL과 별개라 충돌 없음.
+    # Topic: /camera/color/image_raw (1280x800), /camera/depth/image_raw
+    orbbec_camera = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            PathJoinSubstitution([
+                FindPackageShare('orbbec_camera'), 'launch', 'gemini2L.launch.py'
+            ])
+        ]),
+        condition=IfCondition(LaunchConfiguration('use_orbbec'))
+    )
+
+    use_orbbec_arg = DeclareLaunchArgument(
+        'use_orbbec',
+        default_value='true',
+        description='Set to false to disable Orbbec Gemini 2L (교차점 검출)'
+    )
+
     # Launch argument for ZED X Mini cameras
     use_zedxmini_arg = DeclareLaunchArgument(
         'use_zedxmini',
@@ -208,12 +266,23 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('use_vision'))
     )
 
+    # Obstacle Detector Node (person/obstacle detection with front/back cameras)
+    obstacle_detector_node = Node(
+        package='rebar_vision',
+        executable='obstacle_detector',
+        name='obstacle_detector',
+        output='screen',
+        emulate_tty=True,
+        condition=IfCondition(LaunchConfiguration('use_vision'))
+    )
+
     return LaunchDescription([
         # Launch Arguments
         use_zed_arg,
         use_dual_zed_arg,
         single_zed_topic_arg,
         use_zedxmini_arg,
+        use_orbbec_arg,
         use_vision_arg,
 
         # Control Systems (먼저 시작)
@@ -221,14 +290,30 @@ def generate_launch_description():
         control_system,
 
         # ZED Cameras - odom/navigation
+        # 주행 영상 캡처/주행제어 개발 위해 활성화 (2026-07-14):
+        # 전면 철근격자 인식 데이터 확보 — zedxmini1/2와 GMSL 대역폭 공존 위해
+        # 결속카메라(zedxmini1/2)는 아래에서 임시 비활성.
         zed_front,
         zed_back,
 
         # ZED X Mini Cameras - rebar detection
-        zedxmini1,
-        zedxmini2,
+        # 주행 캡처 중 GMSL 대역폭 확보 위해 임시 비활성 (2026-07-14). 결속 복귀 시 주석 해제.
+        # zedxmini1,
+        # zedxmini2,
+
+        # ZED X One - Orbbec 결속 전환으로 미사용 + 물리적 제거(313997679 not found)
+        # → 무한재시도로 컨테이너 막혀 orbbec 스트리밍 방해 → 비활성 (2026-07-04)
+        # zedxone,
+        # usbcam,
+
+        # Orbbec Gemini 2L - ZED와 컨테이너명(camera_container) 충돌로 same-launch 불가.
+        # → robot_control_service.sh에서 별도 프로세스로 실행 (독립 컨테이너)
+        # orbbec_camera,
 
         # Vision - rebar detection service & tying orchestrator
-        detection_node,
+        # detection_node: zedxmini 기반 교차점 검출 → orbbec_mode 전환으로 미사용,
+        # zedxmini 비활성 중 유휴/에러만 내므로 임시 주석 (2026-07-14). 결속 zedxmini 복귀 시 해제.
+        # detection_node,
         orchestrator_node,
+        obstacle_detector_node,
     ])

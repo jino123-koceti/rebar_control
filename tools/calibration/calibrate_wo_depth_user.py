@@ -163,6 +163,10 @@ class CalibrationUserAdd(Node):
         with open(self.data_file, 'w') as f:
             json.dump(self.cal_data, f, indent=2)
 
+    def _fit_rows(self):
+        """회귀에 사용할 점만 반환 (enabled:false 인 점은 제외, 데이터엔 보존)."""
+        return [d for d in self.cal_data if d.get('enabled', True)]
+
     def _build_features(self, pixel_u, pixel_v):
         pixel_u = np.asarray(pixel_u, dtype=np.float64)
         pixel_v = np.asarray(pixel_v, dtype=np.float64)
@@ -193,27 +197,32 @@ class CalibrationUserAdd(Node):
         ])
 
     def _compute_mapping_silent(self):
-        n = len(self.cal_data)
+        rows = self._fit_rows()
+        n = len(rows)
         if n < 6:
             return
-        pixel_u = np.array([d['pixel_u'] for d in self.cal_data], dtype=np.float64)
-        pixel_v = np.array([d['pixel_v'] for d in self.cal_data], dtype=np.float64)
-        actual_x = np.array([d['actual_x_mm'] for d in self.cal_data], dtype=np.float64)
-        actual_y = np.array([d['actual_y_mm'] for d in self.cal_data], dtype=np.float64)
+        pixel_u = np.array([d['pixel_u'] for d in rows], dtype=np.float64)
+        pixel_v = np.array([d['pixel_v'] for d in rows], dtype=np.float64)
+        actual_x = np.array([d['actual_x_mm'] for d in rows], dtype=np.float64)
+        actual_y = np.array([d['actual_y_mm'] for d in rows], dtype=np.float64)
         A = self._build_features(pixel_u, pixel_v)
         self.x_coeffs, _, _, _ = np.linalg.lstsq(A, actual_x, rcond=None)
         self.y_coeffs, _, _, _ = np.linalg.lstsq(A, actual_y, rcond=None)
 
     def _compute_mapping(self):
-        n = len(self.cal_data)
+        rows = self._fit_rows()
+        n = len(rows)
+        n_excluded = len(self.cal_data) - n
         if n < 6:
             print('  [매핑] 최소 6쌍 필요 (현재 %d쌍)' % n)
             return
+        if n_excluded:
+            print('  [매핑] %d점 제외(enabled:false), %d점으로 적합' % (n_excluded, n))
 
-        pixel_u = np.array([d['pixel_u'] for d in self.cal_data], dtype=np.float64)
-        pixel_v = np.array([d['pixel_v'] for d in self.cal_data], dtype=np.float64)
-        actual_x = np.array([d['actual_x_mm'] for d in self.cal_data], dtype=np.float64)
-        actual_y = np.array([d['actual_y_mm'] for d in self.cal_data], dtype=np.float64)
+        pixel_u = np.array([d['pixel_u'] for d in rows], dtype=np.float64)
+        pixel_v = np.array([d['pixel_v'] for d in rows], dtype=np.float64)
+        actual_x = np.array([d['actual_x_mm'] for d in rows], dtype=np.float64)
+        actual_y = np.array([d['actual_y_mm'] for d in rows], dtype=np.float64)
 
         # --- pixel-only 회귀 ---
         A = self._build_features(pixel_u, pixel_v)
@@ -252,7 +261,7 @@ class CalibrationUserAdd(Node):
 
         # --- depth 포함 회귀 비교 ---
         depth_mm = np.array(
-            [d.get('depth_mm', 0.0) for d in self.cal_data], dtype=np.float64)
+            [d.get('depth_mm', 0.0) for d in rows], dtype=np.float64)
         depth_valid = depth_mm > 10.0  # 10mm 이상만 유효
         n_depth = int(np.sum(depth_valid))
 
@@ -369,11 +378,51 @@ class CalibrationUserAdd(Node):
             else:
                 print('    클릭: pixel=(%d, %d) (매핑 없음)' % (x, y))
 
+    def _user_add_points_text(self, detections, mapped_list):
+        """키보드로 픽셀 좌표를 입력해 교차점 추가 (마우스 GUI 대체, 원격용).
+        시각화 PNG(_save_viz)에서 픽셀 좌표를 읽어 'u v' 형식으로 입력."""
+        h, w = self.camera_image.shape[:2]
+        print('  교차점 픽셀좌표를 "u v"로 입력 (이미지 %dx%d). 빈줄/done/q=완료' % (w, h))
+        print('  참고: data/calibration/calibration_detect_*.png 에서 좌표 확인')
+        added = 0
+        while True:
+            raw = input('    추가 pixel(u v): ').strip()
+            if raw in ('', 'q', 'done'):
+                break
+            parts = raw.replace(',', ' ').split()
+            try:
+                u, v = int(round(float(parts[0]))), int(round(float(parts[1])))
+            except (ValueError, IndexError):
+                print('    형식 오류 — "u v" (예: 512 240)')
+                continue
+            if not (0 <= u < w and 0 <= v < h):
+                print('    범위 밖 (0~%d, 0~%d)' % (w - 1, h - 1))
+                continue
+            up = UserPoint(u, v)
+            detections.append(up)
+            if self.x_coeffs is not None:
+                mx, my = self._apply_mapping(u, v)
+                mapped_list.append((mx, my, 1))
+                print('    추가: pixel=(%d, %d) → 추정 X=%.1f, Y=%.1fmm' % (u, v, mx, my))
+            else:
+                mapped_list.append((0.0, 0.0, 1))
+                print('    추가: pixel=(%d, %d) (매핑 없음)' % (u, v))
+            added += 1
+        if added > 0:
+            print('  %d개 포인트 추가됨 (총 %d개)' % (added, len(detections)))
+        return detections, mapped_list
+
     def _user_add_points(self, detections, mapped_list):
-        """마우스 클릭으로 교차점 추가 - OpenCV 윈도우"""
+        """마우스 클릭으로 교차점 추가 - OpenCV 윈도우.
+        DISPLAY 없으면(원격 등) 키보드 픽셀입력 모드로 자동 폴백."""
         if self.camera_image is None:
             print('  [오류] 이미지 없음')
             return detections, mapped_list
+
+        # 디스플레이 없으면 텍스트 입력 모드 (원격 접속/헤드리스)
+        if not os.environ.get('DISPLAY'):
+            print('  [DISPLAY 없음 → 키보드 입력 모드]')
+            return self._user_add_points_text(detections, mapped_list)
 
         self.click_points = []
         self.clicking = True
@@ -391,8 +440,13 @@ class CalibrationUserAdd(Node):
                     (10, 30), font, 0.7, (0, 255, 0), 2)
 
         win_name = 'Add Crossing Points'
-        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-        cv2.setMouseCallback(win_name, self._mouse_callback)
+        try:
+            cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+            cv2.setMouseCallback(win_name, self._mouse_callback)
+        except cv2.error as e:
+            print('  [GUI 실패 → 키보드 입력 모드] %s' % e)
+            self.clicking = False
+            return self._user_add_points_text(detections, mapped_list)
 
         while True:
             # 클릭된 점 표시
@@ -437,14 +491,19 @@ class CalibrationUserAdd(Node):
 
         return detections, mapped_list
 
-    def _dedup_detections(self, detections, dist_mm=20.0):
-        if self.x_coeffs is None or not detections:
+    def _dedup_detections(self, detections, dist_mm=20.0, dist_px=15.0):
+        if not detections:
             return detections, []
 
-        mapped = []
+        # 모델(x_coeffs) 있으면 매핑좌표(mm)로, 없으면(초기 캘리브) 픽셀거리로 dedup
+        use_map = self.x_coeffs is not None
+        coords = []
         for det in detections:
-            mx, my = self._apply_mapping(det.pixel_u, det.pixel_v)
-            mapped.append((mx, my))
+            if use_map:
+                coords.append(self._apply_mapping(det.pixel_u, det.pixel_v))
+            else:
+                coords.append((float(det.pixel_u), float(det.pixel_v)))
+        thresh = dist_mm if use_map else dist_px
 
         used = set()
         groups = []
@@ -456,20 +515,22 @@ class CalibrationUserAdd(Node):
             for j in range(i + 1, len(detections)):
                 if j in used:
                     continue
-                dx = mapped[i][0] - mapped[j][0]
-                dy = mapped[i][1] - mapped[j][1]
-                if (dx * dx + dy * dy) ** 0.5 < dist_mm:
+                dx = coords[i][0] - coords[j][0]
+                dy = coords[i][1] - coords[j][1]
+                if (dx * dx + dy * dy) ** 0.5 < thresh:
                     group.append(j)
                     used.add(j)
             groups.append(group)
 
         result_dets, result_mapped = [], []
         for group in groups:
-            avg_mx = sum(mapped[i][0] for i in group) / len(group)
-            avg_my = sum(mapped[i][1] for i in group) / len(group)
             best = max(group, key=lambda i: detections[i].confidence)
             result_dets.append(detections[best])
-            result_mapped.append((avg_mx, avg_my, len(group)))
+            # 매핑 가능할 때만 mapped 평균 반환 (없으면 빈 리스트 → det.x로 정렬)
+            if use_map:
+                avg_mx = sum(coords[i][0] for i in group) / len(group)
+                avg_my = sum(coords[i][1] for i in group) / len(group)
+                result_mapped.append((avg_mx, avg_my, len(group)))
 
         return result_dets, result_mapped
 
@@ -535,15 +596,16 @@ class CalibrationUserAdd(Node):
 
         raw_count = len(detections) if detections else 0
         mapped_list = []
-        if detections and self.x_coeffs is not None:
+        if detections:
+            # 모델 없어도(초기 캘리브) 픽셀거리 dedup 수행
             detections, mapped_list = self._dedup_detections(detections, dist_mm=20.0)
             if mapped_list:
                 pairs = list(zip(detections, mapped_list))
                 pairs.sort(key=lambda p: p[1][0], reverse=True)
                 detections, mapped_list = zip(*pairs)
                 detections, mapped_list = list(detections), list(mapped_list)
-        elif detections:
-            detections.sort(key=lambda d: d.x, reverse=True)
+            else:
+                detections.sort(key=lambda d: d.x, reverse=True)
         else:
             detections = []
 

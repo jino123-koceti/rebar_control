@@ -46,6 +46,8 @@ class SequenceState(Enum):
     S22_WAIT_OPEN = auto()
     S22_Z_UP = auto()
     S22_WAIT_Z_UP = auto()  # Z축 상승 대기 (리밋 감지까지)
+    S22_Z_TO_STANDBY = auto()  # 리밋 후 대기자세까지 하강
+    S22_WAIT_STANDBY = auto()  # 대기자세 하강 대기
     S22_COMPLETE = auto()
 
 
@@ -56,8 +58,9 @@ class SequenceController(Node):
         super().__init__('sequence_controller')
 
         # 파라미터 선언
-        self.declare_parameter('z_down_deg', 1100.0)      # S21 Z축 하강 각도
-        self.declare_parameter('z_up_deg', 3600.0)        # S22 Z축 상승 각도 (리밋까지)
+        self.declare_parameter('z_down_deg', 726.0)       # S21 Z축 하강 각도 (270mm @ 2.69°/mm, 오토 결속과 동일)
+        self.declare_parameter('z_up_deg', 1050.0)        # S22 상승 상한(리밋 미감지 시 폭주방지). 깊이995°+여유55°
+        self.declare_parameter('z_standby_deg', 134.5)    # 리밋 도달 후 대기자세까지 하강 (실측 ≈100mm)
         self.declare_parameter('z_speed', 200.0)          # Z축 속도 (dps)
         self.declare_parameter('gripper_speed', 50)       # 그리퍼 속도 (0-100%)
         self.declare_parameter('gripper_force', 50)       # 그리퍼 힘 (0-100%)
@@ -70,6 +73,7 @@ class SequenceController(Node):
         # 파라미터 가져오기
         self.z_down_deg = self.get_parameter('z_down_deg').value
         self.z_up_deg = self.get_parameter('z_up_deg').value
+        self.z_standby_deg = self.get_parameter('z_standby_deg').value
         self.z_speed = self.get_parameter('z_speed').value
         self.gripper_speed = self.get_parameter('gripper_speed').value
         self.gripper_force = self.get_parameter('gripper_force').value
@@ -209,9 +213,9 @@ class SequenceController(Node):
         # S22 상승 대기 중 z_min 리밋 도달 시 정지
         if msg.data and not prev_state and self.state == SequenceState.S22_WAIT_Z_UP:
             self._send_z_stop()
-            self._reset_z_position()  # Z축 위치 기준점 리셋
-            self.get_logger().info("🛑 Z축 상승 리밋 도달 - 정지 및 위치 리셋")
-            self._transition_to(SequenceState.S22_COMPLETE)
+            self._reset_z_position()  # Z축 위치 기준점 리셋 (리밋=상단 기준)
+            self.get_logger().info("🛑 Z축 상승 리밋 도달 - 정지 및 위치 리셋 → 대기자세로 하강")
+            self._transition_to(SequenceState.S22_Z_TO_STANDBY)
 
     def state_machine_loop(self):
         """상태 머신 메인 루프"""
@@ -340,12 +344,30 @@ class SequenceController(Node):
             self._transition_to(SequenceState.S22_WAIT_Z_UP)
 
         elif self.state == SequenceState.S22_WAIT_Z_UP:
-            # 리밋 감지 시 z_min_limit_callback에서 S22_COMPLETE로 전환
-            # 타임아웃 (20초) 시 강제 완료
-            if elapsed >= 20.0:
-                self.get_logger().warn("⚠️ Z축 상승 타임아웃 - 강제 완료")
+            # 주기적(20Hz) 레벨 체크: 리밋이 현재 HIGH면 정지 (콜백 엣지 놓침 대비 backup)
+            if self.z_lower_limit:
                 self._send_z_stop()
-                self._reset_z_position()  # Z축 위치 기준점 리셋
+                self._reset_z_position()  # 리밋=상단 기준 재설정
+                self.get_logger().info("🛑 Z축 상승 리밋(레벨) 감지 - 정지 → 대기자세로 하강")
+                self._transition_to(SequenceState.S22_Z_TO_STANDBY)
+            # 리밋 미감지로 z_up_deg(1050°) 다 올라가면 모터가 스스로 멈춤(폭주방지).
+            # 타임아웃 (20초) 시 강제 완료 (리밋 미도달 → 위치 불확실, 대기자세 하강 생략)
+            elif elapsed >= 20.0:
+                self.get_logger().warn("⚠️ Z축 상승 타임아웃(리밋 미도달) - 강제 완료")
+                self._send_z_stop()
+                self._reset_z_position()
+                self._transition_to(SequenceState.S22_COMPLETE)
+
+        elif self.state == SequenceState.S22_Z_TO_STANDBY:
+            # 리밋(상단)에서 대기자세까지 하강 (오토 z_home_offset과 동일)
+            self._send_z_command(self.z_standby_deg)  # + = 하강
+            self.get_logger().info(
+                f"  [6/7] 대기자세로 하강 +{self.z_standby_deg}° (오토 대기깊이)")
+            self._transition_to(SequenceState.S22_WAIT_STANDBY)
+
+        elif self.state == SequenceState.S22_WAIT_STANDBY:
+            if elapsed >= self.wait_z_down:
+                self.get_logger().info(f"  [7/7] 대기자세 도달 ({self.wait_z_down}초)")
                 self._transition_to(SequenceState.S22_COMPLETE)
 
         elif self.state == SequenceState.S22_COMPLETE:

@@ -36,6 +36,8 @@ setup(
             'rebar_detection = rebar_vision.rebar_detection_node:main',
             'tying_orchestrator = rebar_vision.tying_orchestrator_node:main',
             'obstacle_detector = rebar_vision.obstacle_detector_node:main',
+            'zedxone_publisher = rebar_vision.zedxone_publisher:main',
+            'usbcam_publisher = rebar_vision.usbcam_publisher:main',
         ],
     },
 )

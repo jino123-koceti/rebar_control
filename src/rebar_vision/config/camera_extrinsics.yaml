@@ -10,6 +10,11 @@ rebar_detection_node:
     max_depth_m: 2.0
     min_depth_m: 0.05
 
+    # 좌표변환 모델: nodepth(2D회귀) / linear / gbr / 3d(강체변환)
+    # 3d = depth 최근접표면 복원 + Hand-Eye 강체변환
+    #   (right만 캘리브됨, left는 미보정 → 기존 기하 fallback)
+    calibration_model: '3d'
+
     # 그리드 설정
     grid_rows: 2
     grid_cols: 3

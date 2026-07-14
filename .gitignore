@@ -43,3 +43,7 @@ captured_training/
 
 # IDE
 .vscode/
+
+# --- vision_test: 대용량 원본/영상 제외 (요약 PNG만 커밋) ---
+data/vision_test/**/*.mp4
+data/vision_test/**/frame_*.jpg

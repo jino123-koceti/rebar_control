@@ -79,8 +79,9 @@ def generate_launch_description():
             name='sequence_controller',
             output='screen',
             parameters=[{
-                'z_down_deg': 900.0,
-                'z_up_deg': 3600.0,
+                'z_down_deg': 726.0,
+                'z_up_deg': 1050.0,
+                'z_standby_deg': 134.5,
                 'z_speed': 200.0,
                 'gripper_speed': 50,
                 'gripper_force': 50,

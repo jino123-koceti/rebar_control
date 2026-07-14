@@ -41,7 +41,7 @@ class ObstacleDetectorNode(Node):
 
         # 파라미터 선언
         self.declare_parameter('enabled', True)
-        self.declare_parameter('distance_threshold_m', 0.5)
+        self.declare_parameter('distance_threshold_m', 0.1)
         self.declare_parameter('monitor_while_tying', True)
         self.declare_parameter('detection_interval_sec', 0.5)
         self.declare_parameter('yolo_model', 'yolov8n.pt')
@@ -62,6 +62,9 @@ class ObstacleDetectorNode(Node):
         # YOLO 모델 로드
         self.model = None
         self._load_yolo_model()
+
+        # 파일 로거
+        self._setup_file_logger()
 
         # CvBridge
         self.bridge = CvBridge()
@@ -129,6 +132,26 @@ class ObstacleDetectorNode(Node):
         self.get_logger().info(f'  target_classes: {self.target_classes}')
         self.get_logger().info(f'  yolo_model: {self.yolo_model_name}')
 
+    def _setup_file_logger(self):
+        """파일 로거 설정"""
+        import logging
+        from datetime import datetime
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._log_path = f'/tmp/obstacle_detector_{timestamp}.log'
+        self._file_logger = logging.getLogger('obstacle_detector_file')
+        self._file_logger.setLevel(logging.DEBUG)
+        self._file_logger.handlers.clear()
+        fh = logging.FileHandler(self._log_path, mode='a', encoding='utf-8')
+        fh.setFormatter(logging.Formatter(
+            '%(asctime)s.%(msecs)03d %(message)s', datefmt='%H:%M:%S'))
+        self._file_logger.addHandler(fh)
+        self._file_handler = fh
+        self.get_logger().info(f'파일 로그: {self._log_path}')
+
+    def flog(self, msg):
+        self._file_logger.info(msg)
+        self._file_handler.flush()
+
     def _load_yolo_model(self):
         """YOLO COCO 모델 로드"""
         try:
@@ -179,6 +202,13 @@ class ObstacleDetectorNode(Node):
                 self.back_rgb, self.back_depth, 'back')
             detections.extend(back_dets)
 
+        # 파일 로그: 검출 결과 (감지 있을 때만)
+        if detections:
+            for d in detections:
+                self.flog(f"DETECT: cam={d['camera']} class={d['class_name']} "
+                          f"conf={d['confidence']:.2f} dist={d['distance_m']:.2f}m "
+                          f"bbox={d['bbox']}")
+
         # 임계거리 이내 장애물 확인
         close_obstacles = [
             d for d in detections if d['distance_m'] < self.distance_threshold
@@ -186,14 +216,16 @@ class ObstacleDetectorNode(Node):
 
         if close_obstacles:
             self.last_obstacle_time = now
+            closest = min(close_obstacles, key=lambda d: d['distance_m'])
+            cls_name = self.class_names.get(
+                closest['class_id'], str(closest['class_id']))
             if not self.obstacle_detected:
                 self.obstacle_detected = True
-                closest = min(close_obstacles, key=lambda d: d['distance_m'])
-                cls_name = self.class_names.get(
-                    closest['class_id'], str(closest['class_id']))
                 self.get_logger().warn(
                     f'장애물 감지! {cls_name} @ {closest["distance_m"]:.2f}m '
                     f'({closest["camera"]})')
+            self.flog(f"PAUSE: {cls_name} @ {closest['distance_m']:.2f}m "
+                      f"({closest['camera']}) threshold={self.distance_threshold}m")
             self._publish_pause(True)
         else:
             # pause_hold 시간 경과 후 해제
@@ -201,6 +233,7 @@ class ObstacleDetectorNode(Node):
                 if (now - self.last_obstacle_time) > self.pause_hold_sec:
                     self.obstacle_detected = False
                     self.get_logger().info('장애물 해제 → RESUME')
+                    self.flog("RESUME: 장애물 해제")
                     self._publish_pause(False)
 
         # 상태 발행

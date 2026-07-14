@@ -186,7 +186,10 @@ class RebarDetectionNode(Node):
             )
         for cam, model in self.calibration_models.items():
             mtype = model.get('type', 'linear')
-            info = f'  캘리브레이션[{cam}]: {mtype}, {model["num_points"]}쌍'
+            if mtype == '3d':
+                self.get_logger().info(f'  캘리브레이션[{cam}]: 3d 강체변환 (R,t)')
+                continue
+            info = f'  캘리브레이션[{cam}]: {mtype}, {model.get("num_points", 0)}쌍'
             if mtype == 'gbr':
                 info += f', 평균오차={model.get("mean_error", 0):.1f}mm'
             else:
@@ -249,12 +252,16 @@ class RebarDetectionNode(Node):
                 'left': os.path.join(calib_dir, 'calibration_result_left.yaml'),
                 'right': os.path.join(calib_dir, 'calibration_result_right.yaml'),
             },
+            '3d': {
+                'left': os.path.join(calib_dir, 'calib3d_result_left.yaml'),
+                'right': os.path.join(calib_dir, 'calib3d_result_right.yaml'),
+            },
         }
 
         if model_type not in file_map:
             self.get_logger().error(
                 f'알 수 없는 캘리브레이션 모델: {model_type} '
-                f'(gbr, nodepth, linear 중 선택)')
+                f'(gbr, nodepth, linear, 3d 중 선택)')
             return
 
         calib_files = file_map[model_type]
@@ -266,8 +273,11 @@ class RebarDetectionNode(Node):
             try:
                 with open(path, 'r') as f:
                     data = yaml.safe_load(f)
-                cal = data['calibration']
 
+                if model_type == '3d':
+                    self._load_3d_model(cam, data)
+                    continue
+                cal = data['calibration']
                 if model_type == 'gbr':
                     self._load_gbr_model(cam, cal)
                 elif model_type == 'nodepth':
@@ -277,6 +287,17 @@ class RebarDetectionNode(Node):
 
             except Exception as e:
                 self.get_logger().error(f'캘리브레이션 로드 실패 [{cam}]: {e}')
+
+    def _load_3d_model(self, cam, data):
+        """3D 강체변환 모델 로드 (calib3d_result_{cam}.yaml: rigid_transform R,t).
+        P_tool = R @ P_cam + t  (P_cam은 최근접표면 depth로 복원한 카메라 3D, mm)"""
+        rt = data['rigid_transform']
+        self.calibration_models[cam] = {
+            'type': '3d',
+            'R': np.array(rt['R'], dtype=float),
+            't': np.array(rt['t'], dtype=float),
+        }
+        self.get_logger().info(f'  [{cam}] 3D 강체변환 로드 (R,t)')
 
     def _load_gbr_model(self, cam, cal):
         """GBR joblib 모델 로드"""
@@ -606,28 +627,44 @@ class RebarDetectionNode(Node):
             if confidence < conf_threshold:
                 continue
 
-            # 깊이 샘플링 (공간 median + temporal median)
-            depth_m = self._sample_depth(depth, cx, cy, depth_buffer)
-            if depth_m is None:
-                continue
+            model_type_cam = (self.calibration_models[camera_side]['type']
+                              if use_calibration else None)
 
-            depth_mm = depth_m * 1000.0
-
-            if use_calibration:
-                # 캘리브레이션 회귀 모델로 직접 변환
-                robot_x, robot_y = self._apply_calibration(
-                    cx, cy, depth_mm, camera_side
-                )
-                robot_z = 0.0  # Z는 스테이지에서 별도 제어
+            if model_type_cam == '3d':
+                # 3D 강체변환: 최근접표면 depth → 카메라3D → R·P_cam+t (calibrate_3d 동일)
+                z_mm = self._near_surface_depth_mm(depth_buffer, depth, cx, cy)
+                if z_mm is None:
+                    continue
+                ppx, ppy = camera_info['cx'], camera_info['cy']
+                fx, fy = camera_info['fx'], camera_info['fy']
+                p_cam = np.array([(cx - ppx) * z_mm / fx,
+                                  (cy - ppy) * z_mm / fy, z_mm])
+                m = self.calibration_models[camera_side]
+                rob = m['R'] @ p_cam + m['t']
+                robot_x, robot_y, robot_z = float(rob[0]), float(rob[1]), 0.0
+                depth_mm = z_mm
             else:
-                # fallback: 기하학적 변환
-                point_cam = self._pixel_to_camera_3d(
-                    cx, cy, depth_m, camera_info
-                )
-                point_robot = self._camera_to_robot(point_cam, extrinsics)
-                robot_x = float(point_robot[0])
-                robot_y = float(point_robot[1])
-                robot_z = float(point_robot[2])
+                # 깊이 샘플링 (공간 median + temporal median)
+                depth_m = self._sample_depth(depth, cx, cy, depth_buffer)
+                if depth_m is None:
+                    continue
+                depth_mm = depth_m * 1000.0
+
+                if use_calibration:
+                    # 캘리브레이션 회귀 모델로 직접 변환
+                    robot_x, robot_y = self._apply_calibration(
+                        cx, cy, depth_mm, camera_side
+                    )
+                    robot_z = 0.0  # Z는 스테이지에서 별도 제어
+                else:
+                    # fallback: 기하학적 변환
+                    point_cam = self._pixel_to_camera_3d(
+                        cx, cy, depth_m, camera_info
+                    )
+                    point_robot = self._camera_to_robot(point_cam, extrinsics)
+                    robot_x = float(point_robot[0])
+                    robot_y = float(point_robot[1])
+                    robot_z = float(point_robot[2])
 
             det = RebarDetection()
             det.x = robot_x
@@ -668,6 +705,30 @@ class RebarDetectionNode(Node):
             return None
 
         return float(np.median(valid))
+
+    def _near_surface_depth_mm(self, depth_buffer, depth_image, u, v, win=9):
+        """철근 교차점=최근접표면 depth(mm). calibrate_3d.rebar_depth_mm와 동일.
+        윈도우+버퍼 풀 → 5%분위 근접밴드(+25mm) 평균 → 철판 섞여도 철근면 고정."""
+        r = win // 2
+        frames = list(depth_buffer) if depth_buffer else (
+            [depth_image] if depth_image is not None else [])
+        pool = []
+        for frame in frames:
+            h, w = frame.shape[:2]
+            if not (0 <= u < w and 0 <= v < h):
+                continue
+            patch = frame[max(0, v-r):v+r+1, max(0, u-r):u+r+1].ravel()
+            valid = patch[np.isfinite(patch) &
+                          (patch > self.min_depth_m) & (patch < self.max_depth_m)]
+            pool.extend((valid * 1000.0).tolist())
+        if len(pool) < 10:
+            return None
+        pool = np.array(pool)
+        lo = np.percentile(pool, 5)
+        band = pool[pool < lo + 25.0]
+        if band.size < 3:
+            band = pool
+        return float(band.mean())
 
     def _sample_depth(self, depth_image, u, v, depth_buffer=None):
         """깊이 추출: 공간 median + temporal median (미터)

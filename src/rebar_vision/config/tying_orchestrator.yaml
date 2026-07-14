@@ -12,7 +12,8 @@ tying_orchestrator:
     position_tolerance_deg: 1.0  # 위치 허용오차 (~0.22mm)
 
     # 스테이지 이동 범위 제한 (2026-03-04 실측)
-    max_stage_x_mm: 411.0        # X축 최대 스트로크 (실측)
+    max_stage_x_mm: 345.0        # X축 최대 스트로크 (Orbbec 전방장착으로 411→345 감소)
+    detect_x_min_mm: 30.0        # 검출 X 최소값 (이 값 미만 교차점 제거)
     max_stage_y_mm: 288.0        # Y축 전체 스트로크 (물리적 한계)
     max_yaw_deg: 399.0           # Yaw 풀 스트로크
 
@@ -21,6 +22,7 @@ tying_orchestrator:
     right_cam_y_max_mm: 142.0    # Right cam 자세 Y 최대
     left_cam_y_min_mm: 124.0     # Left cam 자세 Y 최소
     left_cam_y_max_mm: 288.0     # Left cam 자세 Y 최대
+    left_min_x_mm: 0.0         # 좌측자세 X 하한 — 저-X 결속점 검출오차로 배근 충돌 → 스킵 (0=끔)
 
     # Yaw 자세 (홈 기준 오프셋, 절대값 = home_ref_yaw + offset)
     yaw_right_cam_offset: -3.0   # Right cam 작업자세 (홈 기준 -3°)
@@ -31,23 +33,30 @@ tying_orchestrator:
     # 자세 변경 시퀀스 Y 위치
     pose_change_y_near_mm: 100.0   # 자세 변경 시 Y 근접 위치 (Right cam side)
     pose_change_y_far_mm: 250.0    # 자세 변경 시 Y 원거리 위치 (Left cam side)
+    pose_change_backlash_x_mm: 0.0 # 자세변경 직후(X 0→증가) 첫 포인트 X 백래쉬 보정(mm). 0=끔
 
     # Z축 결속 파라미터
-    z_home_offset_mm: 100.0      # 호밍 후 Z 대기위치 (홈에서 하강 거리)
-    tying_z_down_mm: 250.0       # 결속 시 추가 Z 하강 (대기위치에서)
-    # tying_z_down_mm: 50.0     # 동작 테스트용 (결속 없이 Z 소폭 하강만)
-    deg_per_mm_z: 2.69           # Z축: 1mm = 2.69°
+    z_home_offset_mm: 10.0       # 검출자세 Z 하강(실제 10mm). retract=Orbbec 가림↓
+    # Orbbec 검출자세 (검출 겸 주행 위치): 우측=(0,ready_pose_y,20), 좌측=(0,detect_left_y,20)
+    ready_pose_x_mm: 0.0         # 검출자세 X (홈, Orbbec 가림 최소)
+    ready_pose_y_mm: 100.0       # 우측 검출자세 Y
+    detect_left_y_mm: 160.0      # 좌측 검출자세 Y (좌측 자세는 Y≥124라 100 불가)
+    # ⚠️ deg_per_mm_z 스케일 수정(2.69→13.45)으로 tie 깊이 재캘리 필요.
+    #    지금은 안전 placeholder(20mm). 결속 테스트 시 skip_z/소폭부터 실측해 조정할 것.
+    tying_z_down_mm: 58.0       # 63→58 (5mm 낮춤). 검출자세10+58=총68mm       # 결속 추가 Z하강(검출자세서, 실제 mm)
+    # tying_z_down_mm: 63.0       # 실물 검증됨(2점 결속 OK, 2026-07-04)     # 동작 테스트용 (결속 없이 Z 소폭 하강만)
+    deg_per_mm_z: 13.45           # Z축: 1mm=13.45° (호밍 캘리브값. 기존 2.69는 5배 오류였음)
     z_speed_dps: 1000.0          # Z축 속도 (degree/s)
     z_settle_margin: 0.1         # Z축 이동 후 추가 대기 마진 (초)
     # tying_z_down_mm 변경 시 z_early_xy_mm도 함께 조정할 것
     # z_early_xy_mm = tying_z_down_mm - (대기높이까지 남은 거리)
-    z_early_xy_mm: 170.0         # Z상승 중 이만큼 오르면 XY 선행 이동 시작 (mm) (250-80=170)
+    z_early_xy_mm: 53.0         # Z상승 중 이만큼 오르면 XY 선행 시작(mm). tying_z_down 63→58 따라 58→53
 
     # Z축 하강 토크 모니터링 (과부하 감지 → 트리거 스킵)
     # effective_limit = base + speed_percent * scale
-    z_torque_base_mA: 500         # 토크 임계값 기본값 (mA, 속도 0% 기준)
+    z_torque_base_mA: 400         # 토크 임계값 기본 (70%→2500mA. 300=2400, 500=2600)
     z_torque_scale_mA: 30         # 속도 1%당 추가 임계값 (mA)
-    # 30%→1400mA, 50%→2000mA, 100%→3500mA
+    # 50%→1900mA, 70%→2500mA, 100%→3400mA
     z_torque_delay_ratio: 0.3     # 하강시간 대비 체크 지연 비율 (0.3=30% 이후부터 체크)
     z_torque_poll_hz: 40.0        # 0x9C 폴링 주기 (Hz)
     # 감속 구간 충돌 감지 (정상 감속구간 전류: 300~880mA)
@@ -68,7 +77,25 @@ tying_orchestrator:
     cluster_distance_mm: 40.0    # 클러스터링 거리 임계값 (mm)
     expected_points_per_cam: 3   # 카메라당 기대 포인트 수
     detection_confidence: 0.3    # 검출 confidence 임계값
+    # 카메라 모드: 1=양카메라(검출→자세변경→반대카메라 Phase2), 2=우측카메라 전용(자세변경 없음)
+    camera_mode: 2
+    # 시연용: true면 Z 하강/상승 생략(XY·yaw·트리거만, 실제 결속 안 함). 실제 결속 시 false
+    skip_z_motion: false
+
+    # [Stage2] 툴캠 서보 미세보정 모드 (true면 zedxone YOLO+게인 로드, SERVO_ONE 명령 활성)
+    # false면 기존 동작 그대로 (서보 인프라 미로드)
+    # Orbbec 결속으로 전환하며 비주얼서보잉 제외 → false
+    servo_mode: false
+    # [Orbbec] 상단 Orbbec 1대 검출+호모그래피 지그재그 직접결속 (비주얼서보잉 대체)
+    # true면 TYING_START가 Orbbec 흐름으로 (기존 zedxmini/서보 흐름 미사용)
+    orbbec_mode: true
+    # WP 도달 후 base 정착 대기(초) — 주행 정지 관성 후 신선 프레임으로 검출
+    orbbec_settle_sec: 0.0  # rebar_controller가 정지확인 → 여기선 버퍼클리어+신선프레임(0.3s)만
     rebar_spacing_mm: 195.0      # 철근 배근 간격 (mm)
+    # 좌측자세 서보 코스이동 Y (우측=ready_pose_y_mm 사용, 좌측=이 값)
+    # 좌측 작업영역 Y범위 124~288mm 내에서 툴캠이 교차점을 보는 Y (좌측 캘리브 시 튜닝)
+    # TODO(좌측 통합): 실측 후 조정
+    servo_ready_y_left_mm: 168.0
 
     # 검출 재시도 (멀티검출 내 서비스 실패 시)
     detection_retry_count: 3     # 검출 실패 시 재시도 횟수

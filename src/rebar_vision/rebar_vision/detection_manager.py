@@ -269,15 +269,16 @@ class DetectionManager:
             y_min_limit = p['left_cam_y_min'] - margin
             y_max_limit = p['left_cam_y_max'] + margin
 
+        x_min_limit = p.get('detect_x_min_mm', -margin)  # 검출 X 최소값 (기본 -margin)
         valid_clusters = []
         for c in clusters:
-            if (c['x'] < -margin or c['x'] > p['max_stage_x_mm'] + margin
+            if (c['x'] < x_min_limit or c['x'] > p['max_stage_x_mm'] + margin
                     or c['y'] < y_min_limit or c['y'] > y_max_limit):
                 logger.info(
                     f'  [{camera_side}] 범위 외 클러스터 제거: '
                     f'X={c["x"]:.1f}, Y={c["y"]:.1f}')
                 flog(f"  FILTERED_OUT: [{camera_side}] x={c['x']:.1f} y={c['y']:.1f} "
-                     f"(range: x=[-{margin}~{p['max_stage_x_mm']+margin}] "
+                     f"(range: x=[{x_min_limit:.0f}~{p['max_stage_x_mm']+margin:.0f}] "
                      f"y=[{y_min_limit:.0f}~{y_max_limit:.0f}])")
                 continue
             valid_clusters.append(c)
@@ -408,6 +409,7 @@ class DetectionManager:
         """클러스터가 기대 수보다 적으면 보간."""
         expected = self._p['expected_points_per_cam']
         max_x = self._p['max_stage_x_mm']
+        x_min = self._p.get('detect_x_min_mm', 0.0)  # 보간 X 하한 (검출 필터와 동일)
         spacing = self._p['rebar_spacing_mm']
         logger = self._node.get_logger()
 
@@ -421,7 +423,7 @@ class DetectionManager:
         if len(clusters) == 1:
             base_x = clusters[0]['x']
             for cx in [base_x - spacing, base_x + spacing]:
-                if 0 <= cx <= max_x and len(clusters) < expected:
+                if x_min <= cx <= max_x and len(clusters) < expected:
                     logger.info(
                         f'  보간(1pt): X={cx:.1f}mm 추가 '
                         f'(기준 {base_x:.1f}mm ± {spacing}mm)')
@@ -446,8 +448,8 @@ class DetectionManager:
             else:
                 candidate_high = x_max + spacing
                 candidate_low = x_min - spacing
-                high_valid = 0 <= candidate_high <= max_x
-                low_valid = 0 <= candidate_low <= max_x
+                high_valid = x_min <= candidate_high <= max_x
+                low_valid = x_min <= candidate_low <= max_x
                 if high_valid and not low_valid:
                     new_x = candidate_high
                 elif low_valid and not high_valid:

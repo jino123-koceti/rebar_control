@@ -3,14 +3,17 @@
 Authority Controller Node
 제어권한 관리 (Manual/Auto 전환)
 
-S10 (S19): Manual 모드 - 리모콘 제어 허용
-S20: Auto 모드 - UI/Navigator 제어만 허용, 리모콘 무시
+S10 (S19): Manual 모드 - 리모콘 제어 허용 (횡이동/yaw/시퀀스 등)
+S20: Auto 모드 - UI/Navigator 제어 + 리모콘 S17/S18로 UI 미션 시작/중단
+  · S17 → START_MISSION (자율작업 시작)
+  · S18 → CANCEL (중단)
 """
 
 import rclpy
 from rclpy.node import Node
 from rebar_base_interfaces.msg import RemoteControl
 from std_msgs.msg import String, Bool
+import json
 
 
 class AuthorityController(Node):
@@ -52,6 +55,20 @@ class AuthorityController(Node):
             10
         )
 
+        # Auto 모드에서 리모콘 S17/S18 → UI와 동일한 미션 명령 발행
+        self.mission_cmd_pub = self.create_publisher(
+            String,
+            '/mission/command',
+            10
+        )
+        # 호밍 명령 발행 (Auto 모드 S21 → homing_controller /homing_cmd)
+        self.homing_cmd_pub = self.create_publisher(
+            String,
+            '/homing_cmd',
+            10
+        )
+        self.prev_buttons = []  # rising-edge 감지용
+
         # 상태 발행 타이머 (5Hz)
         self.status_timer = self.create_timer(0.2, self.publish_status)
 
@@ -87,8 +104,9 @@ class AuthorityController(Node):
                 estop_msg.data = False
                 self.emergency_stop_pub.publish(estop_msg)
 
-        # 비상정지 중에는 모드 전환 불가
+        # 비상정지 중에는 모드 전환/미션 불가 (prev_buttons만 갱신)
         if self.emergency_stopped:
+            self.prev_buttons = list(msg.buttons)
             return
 
         # 모드 전환 처리
@@ -108,6 +126,77 @@ class AuthorityController(Node):
             old_mode = self.current_mode
             self.current_mode = new_mode
             self.get_logger().info(f"모드 전환: {old_mode} → {new_mode}")
+
+        # Auto 모드: 리모콘 S17/S18 → UI 미션 명령 (rising edge)
+        self._handle_auto_mission_buttons(msg)
+        self.prev_buttons = list(msg.buttons)
+
+    def _handle_auto_mission_buttons(self, msg):
+        """Auto 모드에서 리모콘 버튼 → 미션/호밍 명령 발행 (rising edge)
+
+        buttons = [s13, s14, s17, s18, s21, s22, s23, s24]  (can_parser 기준)
+          · S17 (buttons[2]) → START_MISSION repeat=ON (반복 자율결속, 시연용)
+          · S18 (buttons[3]) → CANCEL (반복 중지 + 정지)
+          · S21 (buttons[4]) → 호밍 시작 (/homing_cmd "START")
+        manual 모드에선 무시 (횡이동/Z 등 기존 기능은 joint_controller가 처리).
+        """
+        if self.current_mode != 'auto':
+            return
+        if len(msg.buttons) < 4:
+            return
+
+        def b(i):
+            return msg.buttons[i] if len(msg.buttons) > i else 0
+
+        def pb(i):
+            return self.prev_buttons[i] if len(self.prev_buttons) > i else 0
+
+        s17, s18, s21 = b(2), b(3), b(4)
+        s22 = b(5)             # S22=경로/모드 선택 (ON유지=1회 실결속, OFF=무한전시)
+        s23, s24 = b(6), b(7)  # S23=일시중지, S24=재개
+
+        if pb(2) == 0 and s17 == 1:
+            if s22 == 1:
+                # S22 ON + S17: 별도 경로(path2) 1회만 결속 (실결속, 끝나면 정지 → 결속점 끊을 시간)
+                self._publish_mission('START_MISSION', repeat='OFF',
+                                      path='default_path_one_cam2.json')
+                self.get_logger().info(
+                    "🟢 [리모콘 AUTO] S22+S17 → 1회 결속 (path2=default_path_one_cam2, repeat OFF)")
+            else:
+                # 기본 S17: default 경로(path1) 무한반복 (상시 전시/시연)
+                self._publish_mission('START_MISSION', repeat='ON',
+                                      path='default_path_one_cam.json')
+                self.get_logger().info(
+                    "🟢 [리모콘 AUTO] S17 → 무한반복 전시 (path1=default_path_one_cam, repeat ON)")
+        elif pb(3) == 0 and s18 == 1:
+            self._publish_mission('CANCEL')
+            self.get_logger().info("🛑 [리모콘 AUTO] S18 → CANCEL (반복 중지)")
+        elif pb(4) == 0 and s21 == 1:
+            self._publish_homing()
+            self.get_logger().info("🏠 [리모콘 AUTO] S21 → 호밍 시작")
+        elif pb(6) == 0 and s23 == 1:
+            self._publish_mission('PAUSE')
+            self.get_logger().info("⏸️ [리모콘 AUTO] S23 → PAUSE (일시중지)")
+        elif pb(7) == 0 and s24 == 1:
+            self._publish_mission('RESUME')
+            self.get_logger().info("▶️ [리모콘 AUTO] S24 → RESUME (재개)")
+
+    def _publish_mission(self, command, repeat=None, path=None):
+        """UI와 동일한 /mission/command(JSON) 발행. repeat='ON'/'OFF', path=경로파일명 선택."""
+        payload = {"command": command}
+        if repeat is not None:
+            payload["repeat"] = repeat
+        if path is not None:
+            payload["path"] = path   # navigator가 그 경로 로드 (기존 waypoints 덮어씀)
+        out = String()
+        out.data = json.dumps(payload)
+        self.mission_cmd_pub.publish(out)
+
+    def _publish_homing(self):
+        """homing_controller에 호밍 시작 명령 발행 (/homing_cmd 'START')."""
+        out = String()
+        out.data = 'START'
+        self.homing_cmd_pub.publish(out)
 
     def control_mode_request_callback(self, msg):
         """

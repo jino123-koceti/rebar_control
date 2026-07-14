@@ -172,6 +172,9 @@ class JointController(Node):
         self.auto_lateral_aligning_to_home = False  # 12시 정렬 중 플래그
         self.auto_lateral_rotation_deg = 0.0  # 완료 시 발행용 회전 각도
         self.auto_lateral_start_angle = None  # 시작 0x92 각도 (회전 추적용)
+        self.auto_lateral_target_angle = None  # 목표 0x92 멀티턴 각도 (완료 판정용, 시작각 기준 상대)
+        # 횡이동 완료 판정 tolerance (deg). 0x92 멀티턴이 목표각에 이 범위 들면 완료.
+        self.auto_lateral_complete_tol_deg = max(self.position_tolerance, 5.0)
         self.auto_lateral_completed_turns = 0  # 이미 발행한 회전수
         # 360° 회전 명령 전송 후 settling time (모터가 움직이기 시작할 때까지 대기)
         self.auto_lateral_command_time = None  # 명령 전송 시간 (monotonic)
@@ -962,9 +965,10 @@ class JointController(Node):
         # 12시 정렬 + N회전을 한 번에 (가감속 1회)
         target_angle = nearest_home + rotation_deg
 
-        # 목표 엔코더 값 계산 (완료 감지용)
-        # N회전(N*360°)이므로 돌아온 후 홈 엔코더와 같아야 함
-        self.auto_lateral_target_encoder = self.home_encoder
+        # 완료 판정: 0x92 멀티턴이 target_angle 도달 (시작각 기준 상대 → 전원 리셋 무관).
+        # 0x90 단회전 home복귀 방식은 N회전 중 매 회전마다 오발화 → 사용 안 함.
+        self.auto_lateral_target_angle = target_angle
+        self.auto_lateral_target_encoder = self.home_encoder  # (로깅/참고용)
         self.auto_lateral_in_progress = True
         self.auto_lateral_rotation_deg = rotation_deg  # 완료 시 발행용
         self.auto_lateral_start_angle = current_angle  # 회전 추적 시작
@@ -1035,16 +1039,12 @@ class JointController(Node):
                 self.get_logger().info(
                     f"🔄 [Auto] 횡이동 {current_turns}회전 완료 ({moved_deg:.0f}°)")
 
-        # 엔코더 차이 계산 (wrap-around 처리)
-        delta = self.current_encoder - self.auto_lateral_target_encoder
-
-        if delta > self.lateral_cpr / 2:
-            delta -= self.lateral_cpr
-        elif delta < -self.lateral_cpr / 2:
-            delta += self.lateral_cpr
-
-        # 목표 도달 체크
-        if abs(delta) <= self.auto_lateral_tolerance_counts:
+        # 목표 도달 체크: 0x92 멀티턴이 target_angle 도달 (시작각 기준 상대값).
+        # 0x90 단회전은 N회전 중 매 회전 home각을 통과해 조기 완료 → 사용 안 함.
+        if self.auto_lateral_target_angle is None or self.current_angle_deg is None:
+            return
+        angle_err = abs(self.current_angle_deg - self.auto_lateral_target_angle)
+        if angle_err <= self.auto_lateral_complete_tol_deg:
             # 남은 회전분 발행 (중간 발행에서 누락된 분)
             total_turns = int(abs(self.auto_lateral_rotation_deg) / 360.0)
             remaining = total_turns - self.auto_lateral_completed_turns
@@ -1055,13 +1055,14 @@ class JointController(Node):
 
             self.get_logger().info(
                 f"✅ [Auto] 횡이동 완료! {total_turns}회전 "
-                f"(현재={self.current_encoder}, 목표={self.auto_lateral_target_encoder}, "
-                f"오차={delta} counts ≈ {delta/self.lateral_cpr*360:.1f}°)"
+                f"(0x92={self.current_angle_deg:.1f}°, 목표={self.auto_lateral_target_angle:.1f}°, "
+                f"오차={angle_err:.1f}°)"
             )
 
             # 상태 초기화
             self.auto_lateral_in_progress = False
             self.auto_lateral_target_encoder = None
+            self.auto_lateral_target_angle = None
             self.auto_lateral_command_time = None
             self.auto_lateral_start_angle = None
             self.auto_lateral_completed_turns = 0
@@ -1139,6 +1140,7 @@ class JointController(Node):
                 # Auto 횡이동 중이면 중지
                 self.auto_lateral_in_progress = False
                 self.auto_lateral_target_encoder = None
+                self.auto_lateral_target_angle = None
         else:
             if self.emergency_stopped:
                 self.emergency_stopped = False

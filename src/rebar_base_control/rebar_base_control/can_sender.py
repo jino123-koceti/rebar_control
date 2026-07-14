@@ -228,7 +228,8 @@ class CANSender(Node):
             command = msg.control_mode
 
             # control_mode = 0x90/0x92/0x94: 엔코더/각도 읽기
-            if command in (0x90, 0x92, 0x94):
+            # 0x9C: Read Motor Status 2 (temp, torque_current, speed, angle)
+            if command in (0x90, 0x92, 0x94, 0x9C):
                 can_msg = can.Message(
                     arbitration_id=motor_id,
                     data=[command, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],

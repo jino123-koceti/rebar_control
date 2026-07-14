@@ -20,7 +20,15 @@ source /opt/ros/humble/setup.bash
 source install/setup.bash
 
 log_msg "ROS2 환경 설정 완료"
-log_msg "실행: ros2 launch rebar_control full_system.launch.py"
 
+# Orbbec Gemini 2L - 별도 프로세스로 실행 (ZED와 camera_container 이름충돌 회피)
+# 같은 launch에 넣으면 orbbec 노드가 ZED 컨테이너로 로드돼 스트림 안 됨 → 독립 프로세스
+log_msg "Orbbec 카메라 별도 실행 (background)"
+ros2 launch orbbec_camera gemini2L.launch.py >> $LOG_FILE 2>&1 &
+ORBBEC_PID=$!
+log_msg "Orbbec PID=$ORBBEC_PID (서비스 종료 시 cgroup으로 함께 종료됨)"
+sleep 3
+
+log_msg "실행: ros2 launch rebar_control full_system.launch.py"
 # 전체 시스템 launch 실행 (HAL + 상위 제어 + ZED)
 ros2 launch rebar_control full_system.launch.py 2>&1 | tee -a $LOG_FILE

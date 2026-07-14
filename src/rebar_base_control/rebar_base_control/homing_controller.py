@@ -102,6 +102,8 @@ class HomingController(Node):
         self.declare_parameter('pose_change_y_near_mm', 100.0)
         self.declare_parameter('yaw_approach_deg', 390.0)
         self.declare_parameter('yaw_mid_deg', 173.0)
+        # YAW_SAFE에서 yaw_home 리미트 접근 속도 (dps) - 센서 과주행/충돌 방지 (정밀은 FINE_HOME 담당)
+        self.declare_parameter('yaw_home_approach_speed', 25.0)
 
         # === Load parameter values ===
         self.homing_speed = self.get_parameter('homing_speed').value
@@ -131,6 +133,7 @@ class HomingController(Node):
         self.pose_y_near_mm = self.get_parameter('pose_change_y_near_mm').value
         self.yaw_approach_deg = self.get_parameter('yaw_approach_deg').value
         self.yaw_mid_deg = self.get_parameter('yaw_mid_deg').value
+        self.yaw_home_approach_speed = self.get_parameter('yaw_home_approach_speed').value
 
         # === State ===
         self.homing_state = HomingState.IDLE
@@ -476,13 +479,14 @@ class HomingController(Node):
                     self.get_logger().info("YAW_SAFE: already at yaw_home, skip")
                     self._enter_state(HomingState.Y_SAFE)
                     return
-                # Yaw: 모터 음수 = home 방향
-                self._send_speed_command(0x147, -self.homing_speed * 0.5)
+                # Yaw: 모터 음수 = home 방향 (센서 과주행 방지용 저속 접근)
+                self._send_speed_command(0x147, -self.yaw_home_approach_speed)
                 self.homing_cmd_sent = True
-                self.get_logger().info("YAW_SAFE: moving to yaw_home")
+                self.get_logger().info(
+                    f"YAW_SAFE: moving to yaw_home @ {self.yaw_home_approach_speed}dps")
             else:
                 if not self.limit_sensors.get('yaw_home', False):
-                    self._send_speed_command(0x147, -self.homing_speed * 0.5)
+                    self._send_speed_command(0x147, -self.yaw_home_approach_speed)
             # Transition via _on_limit_triggered('yaw_home')
 
         # === Y_SAFE: Y축 y_min까지 이동 ===

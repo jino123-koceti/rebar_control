@@ -33,8 +33,8 @@ drive_controller:
 joint_controller:
   ros__parameters:
     # === 횡이동 모터 (0x143) ===
-    lateral_step_deg: 3240.0  # S17, S18 단위 (degree) - 9회전=396mm
-    # lateral_step_deg: 360.0  # 1회전=44mm (미세 조작용)
+    # lateral_step_deg: 3240.0  # S17, S18 단위 (degree) - 9회전=396mm
+    lateral_step_deg: 360.0  # 1회전 = 70mm (HW 업그레이드 후, 기존 44mm)
     # RMD X4-36 (0x143): 정격 속도 83rpm (498 dps)
     # 테스트 결과: 150dps → 실속도 37.6dps (25%), 200dps로 상향 시도
     lateral_max_speed: 200.0  # 0x143 최대 속도 (dps) - 정격: 498 dps
@@ -61,8 +61,8 @@ joint_controller:
     joystick_scale: 1.0         # 조이스틱 감도 스케일
 
     # 명령 간격
-    command_interval: 20.0  # 명령 간 최소 간격 (초) - 3240°/200dps≈16초 + 여유
-    # command_interval: 6.0  # 1회전 모드용
+    # command_interval: 20.0  # 명령 간 최소 간격 (초) - 3240°/200dps≈16초 + 여유
+    command_interval: 6.0  # 1회전 모드용 (360°/200dps≈1.8초 + 여유)
 
     # 리밋 센서 사용 여부
     use_limit_sensors: true  # false로 설정하면 리밋 체크 비활성화
@@ -80,10 +80,25 @@ joint_controller:
     yaw_left_threshold_90: 43000  # Left/Right 판단 임계값 (0x90) - (home+max)/2 ≈ 43877, 여유있게 43000
 
     # 준비 위치 오프셋 (홈 위치 기준)
-    ready_x_mm: -300.0           # X축 (음수=xMax 방향, 작업 시작포인트 P1 부근)
+    # Orbbec 검출자세는 orchestrator가 (0,100,100)로 이동 → 호밍 X 경유(-300) 불필요, 0으로
+    ready_x_mm: 0.0             # X축 (0=홈, orchestrator가 검출자세로 최종이동)
     ready_y_mm: 0.0              # Y축 (y_min 기준, mm)
     ready_z_mm: 0.0              # Z축 (z_min 기준, mm)
     ready_yaw_deg: 0.0            # Yaw (홈 센서 기준, deg) - 2026-03-15 오프셋 0으로 변경
+
+homing_controller:
+  ros__parameters:
+    # YAW_SAFE에서 yaw_home 리미트 접근 속도 (dps)
+    # 너무 빠르면 센서 감지 전 기계스톱 충돌 → 낮출 것 (정밀 호밍은 FINE_HOME이 담당)
+    # 기존 50dps(homing_speed*0.5)에서 충돌 발생 → 25로 하향 (2026-06-20)
+    yaw_home_approach_speed: 25.0
+    # 준비 위치 오프셋 (홈 기준) — homing_controller가 READY에서 실제 사용하는 값.
+    # Orbbec 검출자세는 orchestrator가 (0,100,100)로 이동하므로 호밍 X경유 불필요 → 0
+    # (기존엔 이 섹션에 없어 코드 기본값 -300이 쓰여 X 3단계 이동했음)
+    ready_x_mm: 0.0
+    ready_y_mm: 0.0
+    ready_z_mm: 0.0
+    ready_yaw_deg: 0.0
 
 encoder_odom:
   ros__parameters:
