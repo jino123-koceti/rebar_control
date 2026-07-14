@@ -1,0 +1,45 @@
+# ZED Odometry-Only Configuration
+# Enables positional tracking (VSLAM) while minimizing topic publishing
+# Depth computation runs internally but depth/image topics are disabled
+---
+/**:
+    ros__parameters:
+        general:
+            camera_model: 'zedx'
+            grab_resolution: 'HD1200'
+            grab_frame_rate: 30
+            pub_resolution: 'NATIVE'
+            pub_frame_rate: 0.0  # Disable image publishing (odom still works)
+
+        depth:
+            depth_mode: 'NEURAL_LIGHT'  # Required for positional tracking
+            depth_stabilization: 30
+            point_cloud_freq: 0.0  # Disable point cloud publishing
+
+        pos_tracking:
+            pos_tracking_enabled: true
+            pos_tracking_mode: 'GEN_2'  # Better accuracy
+            imu_fusion: true
+            publish_tf: true
+            publish_map_tf: false  # Only odom->base_link
+            area_memory: false  # Disable loop closure DB
+            path_pub_rate: 0.0  # Disable path topic
+
+        sensors:
+            publish_imu_tf: true
+            sensors_pub_rate: 100.0  # IMU rate
+
+        mapping:
+            mapping_enabled: false
+
+        object_detection:
+            od_enabled: false
+
+        body_tracking:
+            bt_enabled: false
+
+        stream_server:
+            stream_enabled: false
+
+        debug:
+            sdk_verbose: 0

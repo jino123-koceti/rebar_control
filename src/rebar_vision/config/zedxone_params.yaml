@@ -1,0 +1,34 @@
+# ZED X One 4K (mono) — 결속 미세보정(tool-cam) override
+# pipe_rover(jino123-koceti) 검증 설정 복제: top-level 섹션 구조 + HD1200.
+# ⚠️ grab_resolution: SVGA → INVALID RESOLUTION 실패. pipe_rover 검증값 'HD1200' 사용.
+# ⚠️ '/** ros__parameters' 래퍼 쓰지 말 것 — ZED override는 top-level 섹션을 직접 읽음
+#    (pipe_rover의 zed_side_params.yaml도 래퍼 없이 top-level 구조로 동작).
+
+general:
+  camera_model: 'zedxone4k'
+  grab_resolution: 'HD1200'   # 1920x1200. pipe_rover 검증값 (SVGA는 INVALID RESOLUTION)
+  grab_frame_rate: 15
+  gpu_id: -1
+
+pos_tracking:
+  pos_tracking_enabled: false
+  publish_tf: false
+  publish_map_tf: false
+
+depth:
+  depth_mode: 'NONE'          # 모노 → depth 비활성
+
+video:
+  auto_exposure_gain: true
+
+sensors:
+  sensors_image_sync: false
+  publish_imu_tf: false
+  imu:
+    imu_pubrate: 0
+
+mapping:
+  mapping_enabled: false
+
+object_detection:
+  od_enabled: false
