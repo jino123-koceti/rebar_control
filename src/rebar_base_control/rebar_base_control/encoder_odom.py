@@ -29,8 +29,9 @@ class EncoderOdom(Node):
         self.declare_parameter('wheel_radius', 0.02865)  # m (1 rev = 0.18m)
         self.declare_parameter('wheel_base', 0.5)  # m (바퀴 간 거리)
         self.declare_parameter('publish_rate', 20.0)  # Hz
-        self.declare_parameter('left_motor_id', 0x41)  # CAN parser에서 변환된 ID
-        self.declare_parameter('right_motor_id', 0x42)
+        # 2026-09-08 전진방향 재정의: ID1(0x141→0x41)=우측, ID2(0x142→0x42)=좌측
+        self.declare_parameter('left_motor_id', 0x42)  # CAN parser에서 변환된 ID
+        self.declare_parameter('right_motor_id', 0x41)
         # dps → 실제 이동거리 보정 계수 (캘리브레이션 후 조정, speed 모드 전용)
         self.declare_parameter('dps_to_mps_scale', 1.0)
         # 오도메트리 모드: 'speed' (기존 dps 적분) / 'position' (0x92 각도 차분)

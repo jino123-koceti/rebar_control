@@ -26,8 +26,9 @@ class CANSender(Node):
         # 파라미터 선언
         self.declare_parameter('can_interface', 'can2')
         self.declare_parameter('can_bitrate', 1000000)  # 1Mbps
-        self.declare_parameter('left_motor_id', 0x141)
-        self.declare_parameter('right_motor_id', 0x142)
+        # 2026-09-08 전진방향 재정의: ID1(0x141)=우측, ID2(0x142)=좌측
+        self.declare_parameter('left_motor_id', 0x142)
+        self.declare_parameter('right_motor_id', 0x141)
         self.declare_parameter('lateral_motor_id', 0x143)
         # 0x141/0x142: 1 rev = 0.18 m → radius ≈ 0.02865 m
         self.declare_parameter('wheel_radius', 0.02865)  # m

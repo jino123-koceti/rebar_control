@@ -19,6 +19,8 @@ from typing import Dict, Optional, List
 
 from .can_manager import CANManager
 from .rmd_x4_protocol import RMDX4Protocol, CommandType
+from .lateral_axes import (
+    Protection, I_RATED_A, I_HARD_A, I2T_BUDGET, TEMP_STOP_C, SEV_HARD)
 
 
 class PositionControlNode(Node):
@@ -58,12 +60,17 @@ class PositionControlNode(Node):
         self.declare_parameter('position_tolerance', 1.0)  # 위치 허용 오차 (도)
         
         # CMD_VEL 파라미터 선언
-        self.declare_parameter('left_motor_id', 0x141)
-        self.declare_parameter('right_motor_id', 0x142)
-        self.declare_parameter('wheel_radius', 0.1)  # 바퀴 반지름 (m)
+        # 2026-09-08 전진방향 재정의: ID1(0x141)=우측, ID2(0x142)=좌측
+        self.declare_parameter('left_motor_id', 0x142)
+        self.declare_parameter('right_motor_id', 0x141)
+        self.declare_parameter('wheel_radius', 0.02912)  # 바퀴 반지름 (m) - 2026-09-08 실측
         self.declare_parameter('wheel_base', 0.5)     # 바퀴 간 거리 (m)
-        self.declare_parameter('max_linear_vel', 10.0)  # 최대 선속도 (m/s) - 1.0 → 10.0 (10배)
-        self.declare_parameter('max_angular_vel', 2.0) # 최대 각속도 (rad/s) - 1.0 → 10.0 → 2.0 (10배→5분의1로 감소)
+        self.declare_parameter('max_linear_vel', 0.25)  # 최대 선속도 (m/s) - 모터 정격 498dps 기준
+        self.declare_parameter('wheel_max_dps', 498.0)  # 바퀴 출력축 속도 상한 (RMD-X4-36 정격)
+        self.declare_parameter('max_angular_vel', 0.5) # 최대 각속도 (rad/s) - 2026-09-08 선회 공진 회피
+        # 주행 모터 하드 차단(0x80) 임계 [A]. RMD-X4-36 피크 21.5A(rms) 를 넘기지 말 것.
+        # 실측 참고: 전후진 최대 5.51A, 선회 최대 7.63A 이므로 18A 는 이미 2.4배 여유다.
+        self.declare_parameter('drive_i_hard_a', 18.0)
         
         # 파라미터 가져오기
         self.can_interface = self.get_parameter('can_interface').value
@@ -80,14 +87,30 @@ class PositionControlNode(Node):
         self.wheel_radius = self.get_parameter('wheel_radius').value
         self.wheel_base = self.get_parameter('wheel_base').value
         self.max_linear_vel = self.get_parameter('max_linear_vel').value
+        self.wheel_max_dps = self.get_parameter('wheel_max_dps').value
         self.max_angular_vel = self.get_parameter('max_angular_vel').value
+        self.drive_i_hard_a = float(self.get_parameter('drive_i_hard_a').value)
         
         # CAN 매니저 및 프로토콜 초기화
         self.can_manager = CANManager(self.can_interface)
         self.protocol = RMDX4Protocol()
 
-        # 주행 모터 가감속 상한 상승 (RAM+ROM 저장)
-        self.apply_drive_accel_limits(accel_dpss=20000)
+        self.drive_prot = {
+            self.left_motor_id: Protection(self.left_motor_id, '좌측주행',
+                                           i_hard=self.drive_i_hard_a),
+            self.right_motor_id: Protection(self.right_motor_id, '우측주행',
+                                            i_hard=self.drive_i_hard_a),
+        }
+        self.get_logger().info(
+            f"주행 보호: 정격 {I_RATED_A}A / 즉시차단 {self.drive_i_hard_a}A / "
+            f"I²t {I2T_BUDGET:.0f} A²s / 온도 {TEMP_STOP_C}°C")
+
+        # 주행 모터 가감속 상한 설정은 기동 시 호출하지 않는다 (2026-09-08):
+        #  1) 이 시점엔 can_manager.connect() 전이라 소켓이 없어 8건 전부 실패했다.
+        #  2) 0x43 은 RAM+ROM 저장이라 노드가 뜰 때마다 ROM 에 쓸 이유가 없다.
+        #  3) X4-10 -> X4-36 으로 감속비가 커져(토크 2.9배, 최고속도 하락)
+        #     20000 dps/s 는 과한 값이다. 현재 모터 설정값은 5000 dps/s.
+        # 값을 바꿔야 하면 apply_drive_accel_limits() 를 도구로 1회만 호출할 것.
 
         # 모터 상태 저장 (위치제어 모터)
         self.motor_states: Dict[int, Dict] = {}
@@ -145,6 +168,20 @@ class PositionControlNode(Node):
         self.drive_last_left_command_time = 0.0  # 좌측 모터 마지막 명령 시간
         self.drive_last_right_command_time = 0.0  # 우측 모터 마지막 명령 시간
         self.drive_command_sync_window = 0.2  # 명령 동기화 시간 윈도우 (초)
+
+        # 주행 모터(0x141/0x142) 전용 보호 — 2026-09-08 추가.
+        # 기존 motor_current_limits 방식의 결함 세 가지:
+        #   (1) send_motor_stop 이 0xA2 speed=0 이라 모터가 꺼지지 않는다 (실측 확인).
+        #   (2) emergency(18A) x 2샘플이어야 발동. 그 아래 지속 전류는 무방비.
+        #   (3) 정격 초과 '지속'(I²t)을 보지 않아 10A 로 계속 돌아도 조치가 없다.
+        # 2차년도에 횡이동 모터를 소손시킨 것이 이 조합이다.
+        # NOTE(2026-09-15): 여기서 self.drive_prot 를 {} 로 다시 초기화하고 있었다.
+        # __init__ 앞부분에서 만든 Protection 2개를 덮어써서 drive_protect() 의
+        # `pr = self.drive_prot.get(motor_id)` 가 항상 None → 즉시 return 이었다.
+        # 즉 주행 보호가 한 번도 동작한 적이 없다. 재초기화만 제거한다.
+        self.drive_tripped = False    # 래치: 해제 전까지 cmd_vel 무시
+        self.drive_trip_reason = ""
+        self.drive_normal_since = None
 
         # 모터 전류 보호 시스템
         self.motor_current_limits = {
@@ -888,6 +925,65 @@ class PositionControlNode(Node):
 
         # 향후 speed_limited 동작은 실제 테스트 후 활성화 예정
 
+    def drive_protect(self, motor_id: int, current: float, speed: float, temperature: int):
+        """주행 모터 보호 감시. 응답이 올 때마다 호출된다.
+
+        SEV_HARD(18A 초과) → 두 주행 모터 모두 0x80 SHUTDOWN.
+        그 외(I²t 초과, 스톨, 온도) → 속도 0 + 0x81 정지.
+        어느 쪽이든 래치가 걸려 해제 전까지 cmd_vel 을 무시한다.
+        바퀴는 떨어질 것이 없으므로 횡이동과 달리 '후퇴' 동작은 없다.
+        """
+        pr = self.drive_prot.get(motor_id)
+        if pr is None:
+            return
+        now = time.time()
+        reason, sev = pr.update(current, speed, temperature, now)
+
+        if reason and not self.drive_tripped:
+            self.drive_tripped = True
+            self.drive_trip_reason = f"0x{motor_id:03X} {reason}"
+            self.drive_normal_since = None
+            if sev == SEV_HARD:
+                self.get_logger().error(f"⛔ 주행 즉시 차단: {self.drive_trip_reason}")
+                self.shutdown_drive_motors()
+            else:
+                self.get_logger().error(f"⛔ 주행 정지: {self.drive_trip_reason}")
+                for mid in self.drive_prot:
+                    self.send_speed_command(mid, 0)
+                    self.can_manager.send_frame(
+                        mid, self.protocol.create_system_command(CommandType.MOTOR_STOP))
+            for q in self.drive_prot.values():
+                self.get_logger().error(f"   {q.summary()}")
+            return
+
+        # 래치 해제: 두 축 모두 정격 이하로 3초 유지
+        if self.drive_tripped:
+            hot = any(abs(q.peak_a) > I_RATED_A and q.i2t > I2T_BUDGET * 0.5
+                      for q in self.drive_prot.values())
+            if abs(current) < I_RATED_A and not hot:
+                if self.drive_normal_since is None:
+                    self.drive_normal_since = now
+                elif now - self.drive_normal_since > 3.0:
+                    self.get_logger().info("✅ 주행 보호 해제 (3초간 정격 이하)")
+                    self.drive_tripped = False
+                    self.drive_trip_reason = ""
+                    for q in self.drive_prot.values():
+                        q.reset()
+            else:
+                self.drive_normal_since = None
+
+    def shutdown_drive_motors(self):
+        """주행 모터 완전 차단. 0x80 만이 실제로 출력을 끊는다.
+
+        0xA2 speed=0 과 0x81 은 모터를 여자 상태로 남긴다 (2026-09-08 실측:
+        0x81 후에도 0.6~1.4A 가 계속 흘렀고 0x80 에서만 0.00A 가 되었다).
+        """
+        cmd = self.protocol.create_system_command(CommandType.MOTOR_SHUTDOWN)
+        for _ in range(2):
+            for mid in self.drive_prot:
+                self.can_manager.send_frame(mid, cmd)
+            time.sleep(0.02)
+
     def send_motor_stop(self, motor_id: int):
         """모터 긴급 정지 (0xA2 속도 제어로 속도 0 전송)"""
         try:
@@ -1388,6 +1484,11 @@ class PositionControlNode(Node):
     
     def cmd_vel_callback(self, msg: Twist):
         """CMD_VEL 콜백 (0x141, 0x142 모터 속도 제어)"""
+        if self.drive_tripped:
+            self.get_logger().warning(
+                f"주행 보호 작동 중 — cmd_vel 무시 ({self.drive_trip_reason}). "
+                f"전류가 정격 이하로 3초 유지되면 자동 해제됩니다.")
+            return
         # 로그: 수신한 cmd_vel
         self.get_logger().info(
             f'📥 [ROS2] /cmd_vel 수신: linear.x={msg.linear.x:.3f}, angular.z={msg.angular.z:.3f}'
@@ -1430,24 +1531,30 @@ class PositionControlNode(Node):
             f'Calc: left_dps={left_dps:.1f}, right_dps={right_dps:.1f}'
         )
 
-        # 방향 반전 제거 - 둘 다 같은 방향으로 회전
-        # (모터가 같은 방향으로 장착되어 있는 경우)
+        # 좌우 바퀴 속도 상한 — 둘 중 하나라도 정격을 넘으면 같은 비율로 축소한다.
+        # linear/angular 를 따로만 제한하면 직진+회전이 겹칠 때 한쪽만 포화되어
+        # 의도치 않게 휘어진다. 비율을 유지해야 주행 궤적이 보존된다.
+        peak = max(abs(left_dps), abs(right_dps))
+        if peak > self.wheel_max_dps:
+            k = self.wheel_max_dps / peak
+            self.get_logger().warning(
+                f"바퀴 속도 상한 초과 {peak:.0f} dps > {self.wheel_max_dps:.0f} — "
+                f"좌우 {k:.2f}배로 축소")
+            left_dps *= k
+            right_dps *= k
 
         # 속도 제어값 변환 (0.01dps/LSB)
+        # 2026-09-08 전진방향 재정의 후 실물 기준:
+        #   좌측 모터(0x142) = 전진 방향 그대로, 우측 모터(0x141) = 반전
+        #   좌우 바퀴가 서로 마주보게 장착되어 있어 부호가 반대여야 같은 쪽으로 굴러간다.
+        #   (rebar_base_control/can_sender.py 의 "오른쪽만 반전" 규약과 동일)
         left_speed_control = int(left_dps * 100)
-        right_speed_control = int(right_dps * 100)
-        
-        # 좌우 모터 180도 반대 장착으로 인한 방향 보정:
-        # - 0x141과 0x142는 180도 회전된 상태로 좌우에 장착
-        # - AN3 앞으로(AN3-) → 전진, AN3 아래로(AN3+) → 후진
-        # - AN4 왼쪽(AN4+) → CW, AN4 오른쪽(AN4-) → CCW
-        # - 모터 방향 반전 유지 (현재 설정이 올바름)
-        left_speed_control = -left_speed_control
-        right_speed_control = -right_speed_control
+        right_speed_control = -int(right_dps * 100)
 
         # 로그: CAN 명령 전송 전 (DEBUG 레벨)
         self.get_logger().debug(
-            f'CAN2: 0x141={left_speed_control}, 0x142={right_speed_control}'
+            f'CAN2: 좌 0x{self.left_motor_id:03X}={left_speed_control}, '
+            f'우 0x{self.right_motor_id:03X}={right_speed_control}'
         )
 
         # 속도 명령 전송 (동기 제어를 위해 간격 최소화)
@@ -1556,9 +1663,9 @@ class PositionControlNode(Node):
                     torque = torque_raw * 0.01
                     speed = speed_raw
 
-                    # ✨ 전류 안전성 모니터링
-                    safety_level = self.check_motor_current_safety(self.left_motor_id, torque, temperature)
-                    self.apply_current_protection_action(self.left_motor_id, safety_level)
+                    # 전류/열/스톨 보호 (2026-09-08 교체)
+                    self.drive_protect(self.left_motor_id, torque, speed, temperature)
+                    safety_level = 'n/a'
 
                     # 상세 로그 (debug 레벨로 변경하여 스팸 방지)
                     self.debug_logger.debug(f"✓ 0x141 속도 응답: speed={speed:.1f}dps, torque={torque:.2f}A, level={safety_level}, RAW={data.hex().upper()}")
@@ -1634,8 +1741,8 @@ class PositionControlNode(Node):
                         self.get_logger().error(f"WARNING: 0x142 비정상: torque={torque:.2f}A, temp={temperature}°C")
                         self.read_motor_error(self.right_motor_id)
                     
-                    safety_level = self.check_motor_current_safety(self.right_motor_id, torque, temperature)
-                    self.apply_current_protection_action(self.right_motor_id, safety_level)
+                    self.drive_protect(self.right_motor_id, torque, speed, temperature)
+                    safety_level = 'n/a'
 
                     self.get_logger().warning(f"★ 0x142 속도 응답: speed={speed:.1f}dps, torque={torque:.2f}A")
                     self.debug_logger.warning(f"★ 0x142 속도 응답: speed={speed:.1f}dps, torque={torque:.2f}A, level={safety_level}, RAW={data.hex().upper()}")

@@ -11,26 +11,44 @@ unified_control_node:
     max_velocity: 100.0   # 최대 속도 (도/초)
     position_tolerance: 1.0  # 위치 허용 오차 (도) - 주행/조인트 목표 판정 정밀도 향상
     # CMD_VEL 모터 (0x141, 0x142)
-    left_motor_id: 0x141
-    right_motor_id: 0x142
-    wheel_radius: 0.1  # 바퀴 반지름 (m)
+    left_motor_id: 0x142  # 2026-09-08 전진방향 재정의: ID1(0x141)=우측, ID2(0x142)=좌측
+    right_motor_id: 0x141
+    wheel_radius: 0.02912  # 바퀴 반지름 (m) - 2026-09-08 실측 (이 섹션은 미적용)
     wheel_base: 0.5   # 바퀴 간 거리 (m)
-    max_linear_vel: 1.0   # 최대 선속도 (m/s)
+    max_linear_vel: 0.25   # 최대 선속도 (m/s)  (이 섹션은 미적용)
     max_angular_vel: 1.0  # 최대 각속도 (rad/s)
 
 # 개별 노드 설정 (하위 호환성)
 cmd_vel_control_node:
   ros__parameters:
     can_interface: "can2"
-    left_motor_id: 0x141
-    right_motor_id: 0x142
-    wheel_radius: 0.1  # 바퀴 반지름 (m)
+    left_motor_id: 0x142  # 2026-09-08 전진방향 재정의: ID1(0x141)=우측, ID2(0x142)=좌측
+    right_motor_id: 0x141
+    wheel_radius: 0.02912  # 바퀴 반지름 (m) - 2026-09-08 실측 (이 섹션은 미적용)
     wheel_base: 0.5   # 바퀴 간 거리 (m)
-    max_linear_vel: 1.0   # 최대 선속도 (m/s)
+    max_linear_vel: 0.25   # 최대 선속도 (m/s)  (이 섹션은 미적용)
     max_angular_vel: 1.0  # 최대 각속도 (rad/s)
 
 position_control_node:
   ros__parameters:
+    # ── CMD_VEL 주행 파라미터 ──────────────────────────────────────────
+    # 런치가 노드를 'position_control_node' 이름으로 띄우므로 이 섹션이 실제 적용된다.
+    # 여기에 없으면 코드의 declare_parameter 기본값이 쓰인다 (2026-09-08 이전까지 그랬음).
+    # 2026-09-08 전진방향 재정의: ID1(0x141)=우측, ID2(0x142)=좌측
+    left_motor_id: 0x142
+    right_motor_id: 0x141
+    # 2026-09-08 실측: 바퀴 1회전 = 183 mm → r = 183/(2π) = 29.12 mm
+    #   기존 0.1 m 는 1회전 628 mm 를 뜻해 3.4배 과대. 명령 0.1 m/s 가
+    #   실제로는 0.029 m/s 로 나가고 있었다.
+    wheel_radius: 0.02912   # m (실측)
+    wheel_base: 0.5         # m
+    # 모터 정격 498 dps(83rpm) → 최대 선속도 0.25 m/s. 기존 1.0 은 도달 불가값이었다.
+    max_linear_vel: 0.25    # m/s
+    # 2026-09-08 실측: 선회 시 25~28Hz 기구 공진. 선회 속도를 절반으로 낮추면
+    # 진동이 33~61% 감소(3회 반복, 편차 ±0.005~0.044A)하고 미끄러짐도 29°→7° 로 준다.
+    # 게인(spd_kp 0.5배/2배)으로는 잡음 수준을 넘는 개선이 없었다 → 제어가 아닌 기구 문제.
+    max_angular_vel: 0.5    # rad/s (각 바퀴 246 dps). 1.0 은 정격 492dps 로 진동 영역.
+    wheel_max_dps: 498.0    # RMD-X4-36 정격 출력속도. 초과 시 좌우 동일 비율로 축소
     can_interface: "can2"
     motor_ids: [0x143, 0x144, 0x145, 0x146, 0x147]
     joint_names: ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5"]

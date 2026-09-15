@@ -11,8 +11,8 @@ can_sender:
   ros__parameters:
     can_interface: 'can2'
     can_bitrate: 1000000  # 1Mbps
-    left_motor_id: 0x141
-    right_motor_id: 0x142
+    left_motor_id: 0x142  # 2026-09-08 전진방향 재정의: ID1(0x141)=우측, ID2(0x142)=좌측
+    right_motor_id: 0x141
     lateral_motor_id: 0x143
     wheel_radius: 0.02865  # meters (0x141/0x142: 1 rev = 0.18 m)
 
@@ -105,8 +105,8 @@ encoder_odom:
     wheel_radius: 0.02865     # m (1 rev = 0.18m)
     wheel_base: 0.5           # m (바퀴 간 거리)
     publish_rate: 20.0        # Hz
-    left_motor_id: 0x41       # CAN parser 변환 ID (0x141 → 0x41)
-    right_motor_id: 0x42      # CAN parser 변환 ID (0x142 → 0x42)
+    left_motor_id: 0x42       # CAN parser 변환 ID (0x142 → 0x42), 좌측
+    right_motor_id: 0x41      # CAN parser 변환 ID (0x141 → 0x41), 우측
     dps_to_mps_scale: 0.989   # 캘리브레이션 보정 계수 (실측: 710mm/718mm) - speed 모드 전용
     odom_mode: 'position'     # 'position': 0x92 각도 차분 (정밀) / 'speed': dps 적분 (기존)
 
