@@ -13,6 +13,14 @@ Homing Controller Node
 7. FINE_HOME  — 느린 속도로 리미트 재접근 (정밀 호밍, 레퍼런스 기록)
 8. READY      — 준비 위치로 이동 (X 3단계 분할)
 9. COMPLETE   — 레퍼런스 발행, IDLE 복귀
+
+✅ [YAW 복원] 2026-08-05 요축 모터 교체(신규 CANID 0x147) 후 Yaw 호밍 복원.
+   시퀀스: Z_SAFE → X_SAFE → YAW_CHECK → (YAW_L2R) → YAW_SAFE → Y_SAFE
+           → BACK_OFF(X+Y+Yaw) → FINE_HOME(X+Y+Yaw) → READY → COMPLETE
+   ✅ 2026-08-06 신 모터 0x90 기준상수 재실측 완료:
+      home=17994 (0x92=-65.28°), max=47594 (0x92=+335.36°), stroke=400.64°
+      → wrap 없음(home < max 단순증가), 73.88 counts/deg (구모터 74.12와 일치 = 교차검증)
+      → 홈은 0x92 음수쪽이므로 YAW_SAFE/FINE_HOME의 -dps(홈 방향) 부호도 그대로 유효.
 """
 
 import rclpy
@@ -75,12 +83,37 @@ class HomingController(Node):
         self.declare_parameter('homing_fine_speed', 30.0)
         self.declare_parameter('homing_backoff_time', 0.5)
         self.declare_parameter('homing_timeout', 30.0)
+        self.declare_parameter('limit_stale_sec', 2.0)
+        # ⚠️ [2026-08-19] 리미트 신호 생존 감시 — 이 값보다 오래 신호가 없으면
+        #   호밍을 시작하지 않고, 진행 중이면 즉시 정지한다.
+        #   사고: DIO(ezi_io_controller)가 보드와의 연결을 잃어 리미트 토픽이 전혀
+        #   발행되지 않았는데, 호밍은 "아직 x_min이 아니다"로만 보고 **30초 내내
+        #   X축을 밀어 리미트를 물리적으로 뚫었다.**
+        #   신호가 없는 것과 신호가 False인 것은 **완전히 다르다** — 전자에서는
+        #   절대 움직이면 안 된다.
+        #   리미트는 평소 ~16Hz로 들어오므로 2초면 32주기 결손 = 확실한 두절이다.
 
         # Yaw 0x90 엔코더
-        self.declare_parameter('yaw_home_encoder_90', 61857)
-        self.declare_parameter('yaw_max_encoder_90', 25896)
-        self.declare_parameter('yaw_full_stroke_deg', 399.0)
-        self.declare_parameter('yaw_left_threshold_90', 43000)
+        # (구모터: home=61857, max=25896, stroke=399.0, th=43000 / wrap 있었음)
+        # 2026-08-06 모터 교체 실측: home=17994 max=47594 th=32794
+        #   wrap 없음(home < max 단순증가), 29600 counts / 400.64° = 73.88 counts/deg
+        #
+        # ★ 2026-09-02: 모터를 **뗐다 다시 달아** 축 위상이 바뀌었다.
+        #   홈 리미트(yaw_home=True)가 켜진 상태에서 0x90을 실측 → **11245**
+        #   (설정값 17994 대비 -6749 counts ≈ 출력축 91°).
+        #   ⚠ home만 실측이고 max/th는 **가동범위 29600 counts가 그대로**라는
+        #     가정에서 나온 계산값이다(사용자 확인: 기구는 안 건드림).
+        #     좌우 자세가 어긋나면 좌측 끝에서 0x90을 실측해 max를 다시 잡을 것.
+        #   ⚠ 모터를 탈착할 때마다 이 값은 다시 재야 한다.
+        self.declare_parameter('yaw_home_encoder_90', 10978)
+        self.declare_parameter('yaw_max_encoder_90', 34145)     # 2026-09-02 실측
+        self.declare_parameter('yaw_full_stroke_deg', 391.82)
+        # ★ 2026-09-22 0x90 좌/우 판정 → 좌→우 4단계 복귀(−220° 절대이동)는 기본 끔.
+        #   0x90이 전원 차단 때마다 틀어져 홈에서도 LEFT로 오판 → 리미트 너머 충돌이 반복됐다.
+        #   끄면: 홈 리미트가 안 눌려 있으면 YAW_SAFE(저속 −방향, 홈 감지 시 정지)로 바로 간다.
+        #   ⚠ Y축 간섭은 제어로 못 막는다 → **호밍 전 사용자가 간섭 없는 자세로 둘 것.**
+        self.declare_parameter('yaw_l2r_enabled', False)
+        self.declare_parameter('yaw_left_threshold_90', 22562)  # 홈~max 중간
 
         # 스테이지 deg_per_mm
         self.declare_parameter('stage_x_step_deg', 4.497)
@@ -110,6 +143,8 @@ class HomingController(Node):
         self.homing_fine_speed = self.get_parameter('homing_fine_speed').value
         self.homing_backoff_time = self.get_parameter('homing_backoff_time').value
         self.homing_timeout = self.get_parameter('homing_timeout').value
+        self.limit_stale_sec = self.get_parameter('limit_stale_sec').value
+        self._limit_last_time = 0.0     # 리미트 메시지 마지막 수신 시각(monotonic)
 
         self.yaw_home_enc_90 = int(self.get_parameter('yaw_home_encoder_90').value)
         self.yaw_max_enc_90 = int(self.get_parameter('yaw_max_encoder_90').value)
@@ -134,6 +169,9 @@ class HomingController(Node):
         self.yaw_approach_deg = self.get_parameter('yaw_approach_deg').value
         self.yaw_mid_deg = self.get_parameter('yaw_mid_deg').value
         self.yaw_home_approach_speed = self.get_parameter('yaw_home_approach_speed').value
+        self.yaw_l2r_enabled = bool(self.get_parameter('yaw_l2r_enabled').value)
+        self.yaw_full_stroke_deg = float(self.get_parameter('yaw_full_stroke_deg').value)
+        self.yaw_safe_start_angle = None
 
         # === State ===
         self.homing_state = HomingState.IDLE
@@ -275,6 +313,7 @@ class HomingController(Node):
                 self.yaw_encoder_90_time = time.monotonic()
 
     def _recv_limit_sensor(self, name: str, msg: Bool):
+        self._limit_last_time = time.monotonic()   # ★ 신호원 생존 증거
         prev = self.limit_sensors.get(name, False)
         self.limit_sensors[name] = msg.data
 
@@ -288,6 +327,12 @@ class HomingController(Node):
         if cmd == 'START':
             if self.homing_state != HomingState.IDLE:
                 self.get_logger().warn("Homing already in progress")
+                return
+            age, alive = self._limits_alive()
+            if not alive:
+                self.get_logger().error(f'❌ 호밍 거부: {self._limit_guard_msg(age)}')
+                self.flog(f'REJECTED: limit signal stale ({age:.1f}s)')
+                self._publish_status('FAILED:NO_LIMIT_SIGNAL')
                 return
             self.get_logger().info("=" * 60)
             self.get_logger().info("  HOMING SEQUENCE START (new)")
@@ -309,6 +354,12 @@ class HomingController(Node):
         elif cmd == 'Z_HOME':
             if self.homing_state != HomingState.IDLE:
                 self.get_logger().warn("Z_HOME: homing already in progress")
+                return
+            age, alive = self._limits_alive()
+            if not alive:
+                self.get_logger().error(f'❌ Z_HOME 거부: {self._limit_guard_msg(age)}')
+                self.flog(f'Z_HOME REJECTED: limit signal stale ({age:.1f}s)')
+                self._publish_status('FAILED:NO_LIMIT_SIGNAL')
                 return
             self.get_logger().info("=" * 60)
             self.get_logger().info("  Z ONLY HOMING START")
@@ -362,6 +413,22 @@ class HomingController(Node):
         for mid in [0x144, 0x145, 0x146, 0x147]:
             self._send_speed_command(mid, 0.0)
 
+    def _limits_alive(self):
+        """리미트 신호가 살아 있는가. (age_sec, alive) 반환.
+
+        한 번도 못 받았으면 age는 무한대다 — DIO가 아직 안 떴거나 죽은 것이므로
+        움직여선 안 된다.
+        """
+        if self._limit_last_time <= 0.0:
+            return float('inf'), False
+        age = time.monotonic() - self._limit_last_time
+        return age, age <= self.limit_stale_sec
+
+    def _limit_guard_msg(self, age):
+        aged = '한 번도 수신 없음' if age == float('inf') else f'{age:.1f}s 두절'
+        return (f'리미트 신호 없음 ({aged}) — DIO(ezi_io_controller) 통신 확인 필요. '
+                f'신호 없이 움직이면 리미트를 뚫는다.')
+
     def _homing_fail(self, reason: str):
         self._stop_all_motors()
         self.homing_state = HomingState.IDLE
@@ -385,6 +452,15 @@ class HomingController(Node):
             self._request_encoder(0x147, 0x92)
             self._request_encoder(0x147, 0x90)  # Yaw 0x90
             self.last_encoder_request_time = now
+
+        # ★ 리미트 신호 두절 감시 — 타임아웃(30s)보다 **먼저** 본다.
+        #   신호가 끊긴 채로 30초를 기다리면 그동안 축이 계속 밀린다.
+        #   두절이면 1초 안에 멈춘다.
+        age, alive = self._limits_alive()
+        if not alive:
+            self.get_logger().error(f'🛑 호밍 중단: {self._limit_guard_msg(age)}')
+            self._homing_fail('NO_LIMIT_SIGNAL')
+            return
 
         # 타임아웃 체크 (YAW_L2R은 서브 단계별 타임아웃 별도 관리)
         if self.homing_state != HomingState.YAW_L2R:
@@ -439,9 +515,10 @@ class HomingController(Node):
             # Transition via _on_limit_triggered('x_min')
 
         # === YAW_CHECK: 0x90으로 Left/Right 판단 ===
+        # 기록값은 yaw_home / yaw_max 두 개뿐이고, 그 사이 거리로 판정한다.
+        # ⚠ [2026-09-02] 모터 탈착으로 두 값이 바뀌어 재실측했다 (10978 / 34145).
         elif self.homing_state == HomingState.YAW_CHECK:
             if self.yaw_encoder_90 is None:
-                # 아직 0x90 값이 없으면 요청 후 대기
                 if not self.homing_cmd_sent:
                     self._request_encoder(0x147, 0x90)
                     self.homing_cmd_sent = True
@@ -449,13 +526,28 @@ class HomingController(Node):
                 return
 
             enc = self.yaw_encoder_90
-            # 0x90은 16bit wrapping (0~65535)
-            # Home→Max 경로: 61857 → 65535 → 0 → ... → 25896
-            # wrap-around 고려한 거리 계산
+            # ★ 2026-09-22 **홈 리미트가 눌려 있으면 무조건 홈(우측)이다.**
+            #   리미트는 한쪽에만 있고 반대쪽은 범퍼라 360° 회전이 불가 → 눌림 = 홈 확정.
+            #   0x90은 전원을 껐다 켜면 틀어진다(같은 홈에서 10978/10689/9025/3875/2058…).
+            #   그런데 판정을 0x90 하나에만 맡겨, 홈에 있는데 LEFT로 오판 → 좌→우 복귀
+            #   1단계가 **−220°** 를 명령해 홈 리미트 너머 기구 끝에 충돌했다(반복 사고).
+            if self.limit_sensors.get('yaw_home', False):
+                self.get_logger().info(
+                    f"YAW_CHECK: 홈 리미트 ON → RIGHT(홈) 확정 (0x90={enc} 무시)")
+                self.flog(f"YAW_CHECK: yaw_home ON -> RIGHT (0x90={enc} ignored)")
+                self._enter_state(HomingState.YAW_SAFE)
+                return
+            if not self.yaw_l2r_enabled:
+                self.get_logger().info(
+                    "YAW_CHECK: 홈 리미트 OFF → 저속으로 홈 방향 회전(홈 감지 시 정지) "
+                    f"@ {self.yaw_home_approach_speed}dps (0x90 판정 안 씀)")
+                self.flog("YAW_CHECK: yaw_home OFF -> YAW_SAFE slow approach (L2R disabled)")
+                self._enter_state(HomingState.YAW_SAFE)
+                return
             is_left = self._is_yaw_left(enc)
             self.get_logger().info(
-                f"YAW_CHECK: 0x90={enc}, threshold={self.yaw_left_threshold_90}, "
-                f"{'LEFT' if is_left else 'RIGHT'}")
+                f"YAW_CHECK: 0x90={enc}, home={self.yaw_home_enc_90}, "
+                f"max={self.yaw_max_enc_90} → {'LEFT' if is_left else 'RIGHT'}")
             self.flog(f"YAW_CHECK: 0x90={enc} -> {'LEFT' if is_left else 'RIGHT'}")
 
             if is_left:
@@ -482,10 +574,27 @@ class HomingController(Node):
                 # Yaw: 모터 음수 = home 방향 (센서 과주행 방지용 저속 접근)
                 self._send_speed_command(0x147, -self.yaw_home_approach_speed)
                 self.homing_cmd_sent = True
+                self.yaw_safe_start_angle = self.yaw_angle
                 self.get_logger().info(
-                    f"YAW_SAFE: moving to yaw_home @ {self.yaw_home_approach_speed}dps")
+                    f"YAW_SAFE: moving to yaw_home @ {self.yaw_home_approach_speed}dps "
+                    f"(시작 0x92={self.yaw_angle})")
             else:
                 if not self.limit_sensors.get('yaw_home', False):
+                    # ★ 2026-09-22 이동량 상한: 전 스트로크(+20°)를 돌았는데도 홈이 안 잡히면
+                    #   센서 고장/배선 문제 → 계속 돌면 기구 끝에 부딪힌다. 멈추고 실패 처리.
+                    #   반대로 0x92가 **늘어나면** 방향이 거꾸로다 → 즉시 중단.
+                    if self.yaw_safe_start_angle is None:
+                        self.yaw_safe_start_angle = self.yaw_angle
+                    if self.yaw_angle is not None and self.yaw_safe_start_angle is not None:
+                        moved = self.yaw_safe_start_angle - self.yaw_angle
+                        if moved > self.yaw_full_stroke_deg + 20.0 or moved < -15.0:
+                            self._send_speed_command(0x147, 0.0)
+                            self.get_logger().error(
+                                f"YAW_SAFE: {moved:+.1f}° 돌았는데 홈 미감지 → 정지 "
+                                f"(상한 {self.yaw_full_stroke_deg + 20:.0f}°, 역방향 -15°). "
+                                f"홈 센서/배선 확인")
+                            self._homing_fail("YAW_HOME_NOT_FOUND")
+                            return
                     self._send_speed_command(0x147, -self.yaw_home_approach_speed)
             # Transition via _on_limit_triggered('yaw_home')
 
@@ -877,6 +986,21 @@ class HomingController(Node):
             total = (65536 - home) + max_enc
         else:
             total = max_enc - home
+
+        # ★ [2026-09-02] **홈보다 아래(우측 작업자세)를 LEFT로 오판하던 문제 수정.**
+        #   우측 작업자세는 홈 -16.3°라 0x90이 홈보다 작게(랩해서 큰 값으로) 나온다.
+        #   실측 오판 사례: enc=65098 → 옛 계산 dist=(65536-10978)+65098=119,656
+        #   → 65536을 넘는 값이라 애초에 성립하지 않는데 total/2를 넘어 LEFT가 됐다.
+        #   (0x90=65098, 63185, 63904 등은 전부 홈 아래 = 우측 영역이다)
+        #
+        #   ★ 판별 근거: **max보다 큰 값은 기구적으로 불가능하다.**
+        #     홈~max가 정상 가동범위이므로, max를 넘는 값은 랩해서 홈 아래로
+        #     내려간 것뿐이다 → 우측.
+        #   ⚠ 0x90은 스트로크 동안 여러 번 랩하므로 중간 위치는 이 규칙으로 못 가린다.
+        #     다만 요축이 쉬는 곳은 좌/우 작업자세 두 곳뿐이고, 그 둘은 갈린다:
+        #       우측자세 ≈ 65098 (>max) → RIGHT / 좌측자세 ≈ 32920 (<max) → LEFT
+        if enc > max_enc:
+            return False                    # 홈 아래 = 우측
 
         # Home에서 현재까지 거리 (Home→Max 방향)
         if enc >= home:

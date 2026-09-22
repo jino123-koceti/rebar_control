@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 VSLAM 특징점 시각화 스크립트
-ZED X 주행 카메라(zed_front, zed_back) 이미지에서 ORB 특징점을 추출하고
+주행 카메라(zedxmini1, zedxmini2) 이미지에서 ORB 특징점을 추출하고
 프레임 간 매칭을 시각화합니다.
 
-장비 구성:
-  - zed_front (ZED X, SN: 45320958): 물리적 전방 장착, 후진시 VSLAM 사용
-  - zed_back  (ZED X, SN: 46674448): 물리적 후방 장착, 전진시 VSLAM 사용
+장비 구성: [2026-08-06] ZED X(zed_front/zed_back) → ZED X Mini로 교체
+  - zedxmini2 (ZED X Mini, SN: 54946194): 물리적 전방 장착, 후진시 VSLAM 사용
+  - zedxmini1 (ZED X Mini, SN: 56755054): 물리적 후방 장착, 전진시 VSLAM 사용
   - pose_mux: cmd_vel 방향에 따라 활성 카메라 선택 → /robot_pose 발행
 
 사용법:
@@ -33,12 +33,12 @@ from datetime import datetime
 
 # ── 카메라 토픽 정의 ──
 CAMERA_TOPICS = {
-    'front': '/zed_front/zed_node/left/image_rect_color',
-    'back':  '/zed_back/zed_node/left/image_rect_color',
+    'front': '/zedxmini2/zed_node/left/image_rect_color',
+    'back':  '/zedxmini1/zed_node/left/image_rect_color',
 }
 CAMERA_LABELS = {
-    'front': 'ZED X Front (SN:45320958) - Backward VSLAM',
-    'back':  'ZED X Back (SN:46674448) - Forward VSLAM',
+    'front': 'ZED X Mini Front (SN:54946194) - Backward VSLAM',
+    'back':  'ZED X Mini Back (SN:56755054) - Forward VSLAM',
 }
 
 
@@ -251,8 +251,8 @@ def create_dual_camera_comparison(front_frames, back_frames, output_path):
                   top=0.91, bottom=0.08, left=0.04, right=0.96)
 
     cam_data = [
-        ('back', back_frames, 'Forward Motion (zed_back)', 0),
-        ('front', front_frames, 'Backward Motion (zed_front)', 1),
+        ('back', back_frames, 'Forward Motion (zedxmini1)', 0),
+        ('front', front_frames, 'Backward Motion (zedxmini2)', 1),
     ]
 
     stats_text_parts = []

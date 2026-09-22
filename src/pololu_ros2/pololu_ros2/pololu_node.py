@@ -4,7 +4,8 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32
-from pololu_ros2.pololu_driver import Daisy
+import serial
+from pololu_ros2.pololu_driver import Daisy, BAUD_SYNC
 
 
 class PololuNode(Node):
@@ -23,6 +24,7 @@ class PololuNode(Node):
         baudrate = self.get_parameter('baudrate').value
         motor_ids = self.get_parameter('motor_ids').value
         motor_topics = self.get_parameter('motor_topics').value
+        self.serial_port, self.baudrate = serial_port, baudrate
         
         if len(motor_ids) != len(motor_topics):
             self.get_logger().error('motor_ids and motor_topics must have the same length!')
@@ -59,7 +61,16 @@ class PololuNode(Node):
             speed = int(msg.data * 3200)
             speed = max(min(3200, speed), -3200)  # clamp
             
-            self.motors[motor_id].drive(speed)
+            try:
+                self.motors[motor_id].drive(speed)
+            except (OSError, serial.SerialException) as e:
+                # ★ 2026-09-22 USB 허브가 EMI로 포트를 껐다 켜면(dmesg "disabled by hub
+                #   (EMI?)") 장치는 새로 잡히는데 옛 핸들은 영원히 EIO → 트리거 불발인데
+                #   결속 시퀀스는 '완료'로 끝난다. 포트를 다시 열고 한 번 재시도한다.
+                self.get_logger().error(f'motor {motor_id} 쓰기 실패({e}) → 포트 재연결')
+                self._reopen()
+                self.motors[motor_id].drive(speed)
+                self.get_logger().warn(f'motor {motor_id} 재연결 후 명령 성공')
             
             # Log every 20th command to avoid spam
             if hasattr(self, '_log_counter'):
@@ -73,6 +84,18 @@ class PololuNode(Node):
         except Exception as e:
             self.get_logger().error(f'Error commanding motor {motor_id}: {e}')
     
+    def _reopen(self):
+        """공유 시리얼을 닫고 다시 연다(by-id 심볼릭 링크라 새 ttyACM을 따라간다)."""
+        try:
+            if Daisy.ser is not None:
+                Daisy.ser.close()
+        except Exception:
+            pass
+        Daisy.ser = serial.Serial(self.serial_port, baudrate=self.baudrate, timeout=1)
+        Daisy.ser.write(BAUD_SYNC)
+        for m in self.motors.values():
+            m._exit_safe_start()
+
     def destroy_node(self):
         """Clean shutdown - stop all motors"""
         self.get_logger().info('Stopping all motors...')

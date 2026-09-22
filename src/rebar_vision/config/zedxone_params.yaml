@@ -1,34 +1,35 @@
-# ZED X One 4K (mono) — 결속 미세보정(tool-cam) override
-# pipe_rover(jino123-koceti) 검증 설정 복제: top-level 섹션 구조 + HD1200.
-# ⚠️ grab_resolution: SVGA → INVALID RESOLUTION 실패. pipe_rover 검증값 'HD1200' 사용.
-# ⚠️ '/** ros__parameters' 래퍼 쓰지 말 것 — ZED override는 top-level 섹션을 직접 읽음
-#    (pipe_rover의 zed_side_params.yaml도 래퍼 없이 top-level 구조로 동작).
-
+# ZED X One (mono, zedxone4k) 우측 횡이동 판정용 override
+#
+# ⚠ **HD1200 필수. SVGA 금지.** ([[zedxone_coexistence]] 2026-06-30 검증)
+#   SVGA는 이 유닛에서 INVALID RESOLUTION → 반복 failed-open이 GMSL 버스를 교란해
+#   zedxmini가 CAMERA NOT DETECTED로 죽는다. clean open이면 stereo 2대와 공존 가능.
+#   (2026-08-13 재확인: SVGA/HD1080 모두 open 실패·Argus BadParameter로 segfault)
+#
+# ⚠ **top-level 섹션 구조로 쓸 것** — `/**: ros__parameters:` 래퍼를 쓰면 ZED override가
+#   못 읽는다(zedxmini용 override와 형식이 다르니 복사하지 말 것).
+#
+# 용도: 횡이동 직전 우측 주행가능 판정(RGB seg의 rebar_frac). depth 불필요.
 general:
-  camera_model: 'zedxone4k'
-  grab_resolution: 'HD1200'   # 1920x1200. pipe_rover 검증값 (SVGA는 INVALID RESOLUTION)
-  grab_frame_rate: 15
-  gpu_id: -1
-
-pos_tracking:
-  pos_tracking_enabled: false
-  publish_tf: false
-  publish_map_tf: false
-
+    grab_resolution: 'HD1200'
+    grab_frame_rate: 15
+    # ⚠ **해상도를 더 낮추려 하지 말 것** (2026-08-13 확인):
+    #   · grab은 HD1200이 하한 — SVGA/HD1080은 이 유닛에서 open 실패하고,
+    #     반복 재시도가 GMSL 버스를 교란해 zedxmini까지 죽인다.
+    #   · 발행은 이미 mono 기본값 `pub_resolution: CUSTOM` +
+    #     `pub_downscale_factor: 2.0`으로 **960×600**이다(실측 캡처로 확인).
+    #   · 더 줄여도 실익 없음 — seg가 내부에서 512×512로 리사이즈해 추론하므로
+    #     연산량은 입력 해상도와 무관하고, 검증한 임계 0.45의 근거만 흔들린다.
+    # ⚠ **`pub_frame_rate`는 mono 노드에 없다** (2026-08-13 확인).
+    #   common_stereo.yaml에만 있고 common_mono.yaml에는 없다. 실제 조회해도 빈 값 →
+    #   여기 써봐야 무효다. 예전에 넣어둔 `pub_frame_rate: 5.0`도 적용된 적이 없고,
+    #   구독이 붙으면 grab 그대로 **15Hz로 발행**한다(실측 14.975Hz).
+    #   → mono에서 발행량을 줄이는 레버는 `grab_frame_rate`뿐인데 그건 위 이유로
+    #     못 내린다. 대신 **구독을 여는 시간**을 줄인다(deck_edge `side_warmup_sec`).
+    # ✅ 다행히 구독자가 없으면 발행하지 않는다(실측: 유휴 시 Subscription count 0,
+    #   판정할 때만 열림). 즉 상시 부하는 grab+rectify뿐이다.
 depth:
-  depth_mode: 'NONE'          # 모노 → depth 비활성
-
-video:
-  auto_exposure_gain: true
-
-sensors:
-  sensors_image_sync: false
-  publish_imu_tf: false
-  imu:
-    imu_pubrate: 0
-
-mapping:
-  mapping_enabled: false
-
+    depth_mode: 'NONE'
+pos_tracking:
+    pos_tracking_enabled: false
 object_detection:
-  od_enabled: false
+    od_enabled: false

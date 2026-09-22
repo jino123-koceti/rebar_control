@@ -224,7 +224,16 @@ class NavigatorBase(Node):
             self.get_logger().error(f"모션 명령 처리 오류: {e}")
 
     def publish_status(self):
-        """현재 상태 발행"""
+        """현재 상태 발행 (5Hz 타이머).
+
+        ⚠ **`/control_mode`의 소유자는 이 노드 하나다.** 구독자가 7개(drive_controller,
+           joint_controller, sequence_controller, navigator, rebar_publisher,
+           tying_orchestrator, zenoh_client)이고 여기서 FSM 상태를 5Hz로 계속 덮어쓴다.
+           다른 노드가 같이 발행하면 last-write-wins로 모드가 초당 수회 뒤집혀
+           drive_controller가 "cmd_vel 변환 ↔ 정지"를 토글한다(주행 덜컥거림).
+           상위 노드는 `/rebar_motion_cmd`로 **요청**할 것 ('MOVE_*' /
+           'NAVIGATION_COMPLETE'). tying_orchestrator·rebar_drive_node가 그 경로를 쓴다.
+        """
         # Control mode 발행
         mode_msg = String()
         mode_msg.data = self.sm.current_state.id

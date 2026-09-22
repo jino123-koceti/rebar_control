@@ -1,0 +1,359 @@
+<title>제어기 프리즈 원인 분석</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-1: #fcfcfb;
+    --surface-2: #f3f3f1;
+    --border: #dedddaff;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #78766f;
+    --grid: #e6e5e1;
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    --accent-bg: #eef4fc;
+    --warn-bg: #fdf3e8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1: #1a1a19; --surface-2: #232322; --border: #3a3a38;
+      --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #8f8e85;
+      --grid: #2e2e2c; --series-1: #3987e5; --series-2: #d95926;
+      --accent-bg: #1f2733; --warn-bg: #2b2419;
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1: #1a1a19; --surface-2: #232322; --border: #3a3a38;
+    --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #8f8e85;
+    --grid: #2e2e2c; --series-1: #3987e5; --series-2: #d95926;
+    --accent-bg: #1f2733; --warn-bg: #2b2419;
+  }
+
+  .viz-root {
+    background: var(--surface-1); color: var(--text-primary);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR",
+                 "Malgun Gothic", Roboto, sans-serif;
+    line-height: 1.65; padding: 40px 24px 64px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 1.6rem; font-weight: 650; margin: 0 0 6px; letter-spacing: -.01em; }
+  h2 { font-size: 1.08rem; font-weight: 620; margin: 42px 0 12px;
+       padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+  .sub { color: var(--text-secondary); font-size: .92rem; margin: 0 0 4px; }
+  p { color: var(--text-secondary); font-size: .92rem; }
+  strong { color: var(--text-primary); font-weight: 620; }
+  code { font-size: .87em; background: var(--surface-2); padding: 1px 5px;
+         border-radius: 4px; color: var(--text-primary); }
+
+  .flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+          background: var(--surface-2); border: 1px solid var(--border);
+          border-radius: 10px; padding: 16px; margin: 18px 0; font-size: .87rem; }
+  .flow b { color: var(--text-primary); font-weight: 620; }
+  .flow i { color: var(--text-muted); font-style: normal; }
+
+  figure { margin: 18px 0 8px; }
+  .chartbox { background: var(--surface-1); border: 1px solid var(--border);
+              border-radius: 12px; padding: 16px 10px 8px; overflow-x: auto; }
+  svg { display: block; width: 100%; height: auto; min-width: 540px; }
+  figcaption { color: var(--text-muted); font-size: .82rem; margin-top: 10px; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 2px 0 10px 8px; }
+  .legend span { display: inline-flex; align-items: center; gap: 7px;
+                 font-size: .85rem; color: var(--text-secondary); }
+  .dot { width: 11px; height: 11px; border-radius: 50%; }
+
+  table { border-collapse: collapse; width: 100%; font-size: .87rem; margin-top: 8px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+  th { color: var(--text-muted); font-weight: 560; font-size: .79rem; }
+  td { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+  td.n { text-align: right; }
+  td strong { color: var(--text-primary); }
+
+  .note { border-radius: 8px; padding: 12px 16px; margin: 18px 0; font-size: .88rem;
+          border: 1px solid var(--border); }
+  .note p { margin: 0; }
+  .note.info { background: var(--accent-bg); border-left: 3px solid var(--series-1); }
+  .note.warn { background: var(--warn-bg); border-left: 3px solid var(--series-2); }
+
+  #tip { position: fixed; pointer-events: none; opacity: 0; transition: opacity .1s;
+         background: var(--surface-2); border: 1px solid var(--border);
+         border-radius: 8px; padding: 9px 12px; font-size: .82rem;
+         color: var(--text-primary); font-variant-numeric: tabular-nums;
+         box-shadow: 0 4px 14px rgba(0,0,0,.14); z-index: 20; white-space: nowrap; }
+</style>
+
+<div class="viz-root">
+<div class="wrap">
+
+  <h1>주행모터 고부하 시 제어기 정지 — 원인 분석</h1>
+  <p class="sub">철근 결속 로봇 (Jetson AGX Orin · RMD X4-10 주행모터) ·
+     측정 2026-08-14 / 08-18 · 프리즈 30회 실측</p>
+
+  <h2>현상</h2>
+  <p>주행 중 <strong>제어기(Jetson)가 순간적으로 완전 정지</strong>한다. 원격 접속이 끊기고
+     리모콘도 듣지 않으며, 전원을 강제로 내렸다 올려야 복구된다. 커널 로그·패닉·온도·자원
+     이상은 <strong>일절 남지 않는다</strong>.</p>
+  <p><strong>발생 조건이 특정됐다</strong> — 배근 간격이 넓어 궤도가 빠졌다 올라오는 등
+     주행모터에 <strong>고부하 과도</strong>가 걸리는 순간이다. 의도적으로 재현했을 때
+     <strong>3~4회 시도에 3~4회</strong> 발생했고, 정차 중에는 발생하지 않았다.</p>
+
+
+  <h2>고부하 구간의 전류 파형</h2>
+  <p>궤도가 빠졌다 올라오는 구간에서 실측한 주행모터 전류다. 이 구간의 토크 상한은
+     150%(16.0 A)로 설정돼 있었다.</p>
+
+  <div class="legend">
+    <span><i class="dot" style="background:var(--series-1);border-radius:2px;height:3px;width:13px"></i>좌 모터 (0x141)</span>
+    <span><i class="dot" style="background:var(--series-2);border-radius:2px;height:3px;width:13px"></i>우 모터 (0x142)</span>
+  </div>
+  <figure>
+    <div class="chartbox"><svg id="wave" viewBox="0 0 820 340" role="img"
+      aria-label="궤도 이탈 구간 좌우 주행모터 전류 시계열"></svg></div>
+    <figcaption>
+      2026-08-14 13:08:50부터 23초간. 초당 최대값으로 집계.
+      주행 속도는 전 구간 <strong>271~273 dps로 일정</strong>했다 —
+      속도는 유지된 채 <strong>부하만 반복적으로 치솟았다</strong>.
+    </figcaption>
+  </figure>
+
+  <div class="note info">
+    <p><strong>평상시 2.9 A로 달리다가 순간적으로 16 A까지, 약 5.5배로 치솟는다.</strong>
+    그것도 한 번이 아니라 <strong>수 초 간격으로 반복</strong>된다. 궤도가 철근에 걸렸다
+    풀리기를 되풀이하기 때문이다. 이 급변(dI/dt)이 가설이 지목하는 교란원이다.</p>
+  </div>
+
+  <div class="note warn">
+    <p>위 파형의 16 A는 <strong>토크 상한에 걸려 잘린 값</strong>이다. 같은 동작을
+    제한 없이 측정했을 때는 <strong>28.3 A</strong>까지 소모했다 — 실제 요구량은 그보다 크다.</p>
+  </div>
+
+  <h2>가설: 모터 전류 과도에 의한 전기적 결합</h2>
+  <div class="flow">
+    <b>부하 급변</b><i>→</i><b>전류 급변 dI/dt</b><i>→</i>
+    <b>L·(dI/dt) 전압 과도</b><i>→</i><b>공용 접지 전위 변동</b><i>→</i>
+    <b>제어기 정지</b>
+  </div>
+  <p>모터와 제어기가 <strong>전원·접지 계통을 공유</strong>하고 있어, 모터 전류가 급변하는
+     순간 배선 인덕턴스에서 발생한 전압 과도와 그라운드 바운스가 제어기 측으로 유입된다는
+     가설이다. 이 가설은 <strong>교란의 크기가 전류에 비례</strong>한다고 예측한다.</p>
+
+  <h2>검증: 전류-빈도 용량반응 관계</h2>
+  <p>모터 드라이버의 토크 상한(<code>0xA2</code> maxTorque)을 단계적으로 낮춰
+     피크 전류를 <strong>28.3 A → 8.9 A</strong>까지 3배 이상 줄이며 프리즈 빈도를 측정했다.</p>
+
+  <div class="legend">
+    <span><i class="dot" style="background:var(--series-1)"></i>전원 공유 (기존 구성)</span>
+    <span><i class="dot" style="background:var(--series-2)"></i>제어기 전원 분리</span>
+  </div>
+  <figure>
+    <div class="chartbox"><svg id="chart" viewBox="0 0 820 380" role="img"
+      aria-label="피크 전류에 따른 프리즈 발생 빈도"></svg></div>
+    <figcaption>
+      가로축 = 주행모터 피크 전류(토크 상한 설정에 따른 실측값),
+      세로축 = 프리즈 발생 빈도. 점 크기는 관측 시간에 비례.
+    </figcaption>
+  </figure>
+
+  <div class="note info">
+    <p><strong>빈도가 전류에 따라 단조 감소한다.</strong> 전류를 3배 줄이자 빈도가
+    약 2.5배 낮아졌다. 이는 <strong>교란 크기가 전류에 비례</strong>한다는 가설의 예측과
+    일치하며, 우연으로 보기 어려운 용량반응 관계다.</p>
+  </div>
+
+  <div class="note warn">
+    <p><strong>다만 전류 저감만으로는 근절되지 않았다.</strong> 8.9 A까지 낮춰도
+    시간당 1~1.6회로 계속 발생했다. 교란이 <strong>작아졌을 뿐 결합 경로는 그대로</strong>이기
+    때문이다. 또한 8.9 A에서는 궤도가 빠졌을 때 <strong>복귀에 필요한 토크가 부족</strong>해
+    주행성이 크게 저하됐다.</p>
+  </div>
+
+  <h2>대책: 제어기 전원 분리</h2>
+  <p>제어기 전원을 모터 전력계에서 분리(외부 어댑터 인가)한 뒤, 토크 상한을 오히려
+     <strong>120%(13.3 A)로 상향</strong>해 조건을 더 가혹하게 만들고 재시험했다.</p>
+
+  <table>
+    <thead><tr><th>구성</th><th class="n">피크 전류</th><th class="n">관측</th>
+      <th class="n">프리즈</th><th class="n">회/시간</th></tr></thead>
+    <tbody>
+      <tr><td>토크 무제한</td><td class="n">28.3 A</td><td class="n">1.0 h</td>
+          <td class="n">4</td><td class="n">4.00</td></tr>
+      <tr><td>토크 150%</td><td class="n">16.0 A</td><td class="n">3.0 h</td>
+          <td class="n">7</td><td class="n">2.33</td></tr>
+      <tr><td>토크 80%</td><td class="n">8.9 A</td><td class="n">9.2 h</td>
+          <td class="n">15</td><td class="n">1.62</td></tr>
+      <tr><td>토크 80% (재측정)</td><td class="n">8.9 A</td><td class="n">3.7 h</td>
+          <td class="n">4</td><td class="n">1.07</td></tr>
+      <tr><td><strong>전원 분리 + 토크 120%</strong></td><td class="n"><strong>13.3 A</strong></td>
+          <td class="n">1.4 h</td><td class="n"><strong>0</strong></td>
+          <td class="n"><strong>0.00</strong></td></tr>
+    </tbody>
+  </table>
+
+  <div class="note warn">
+    <p><strong>검증 진행 중 — 아직 확정 아님.</strong> 전원 분리 후 관측은 1.4시간(고부하 통과
+    48회)으로, 직전 빈도로 예측되는 기대 발생 수가 작아 <strong>통계적으로 결론짓기에는
+    표본이 부족</strong>하다. 또한 검증은 <strong>외부 어댑터를 이용한 임시 구성</strong>으로
+    수행되었으므로, 실차 적용에는 배터리 단자에서의 독립 인출과 스타 접지를 통한
+    정식 분리와 재검증이 필요하다.</p>
+  </div>
+
+  <h2>계측의 한계</h2>
+  <p>제어기 입력 전압과 모터 버스 전압을 각각 <strong>50 Hz · 10 Hz</strong>로 상시 기록했으나,
+     프리즈 직전까지 <strong>변동이 관측되지 않았다</strong>(각각 18.3~18.4 V, 26.9~27.4 V 평탄).
+     그러나 이 결과로 전원을 무죄로 볼 수 없다 — 두 계측 모두
+     <strong>20 ms보다 짧은 사건은 원리적으로 관측할 수 없기</strong> 때문이다.
+     본 가설이 상정하는 과도는 µs~ms 규모이며, 이를 직접 확인하려면 오실로스코프가 필요하다.</p>
+
+  <h2>배제된 원인</h2>
+  <table>
+    <thead><tr><th>검토 항목</th><th>결과</th></tr></thead>
+    <tbody>
+      <tr><td>CPU·메모리·저장장치·발열</td><td>프리즈 직전까지 정상 (7회 실측)</td></tr>
+      <tr><td>커널 소프트웨어 결함</td><td>사망 전 16분간 커널 출력 전무</td></tr>
+      <tr><td>GMSL 카메라 대수</td><td>3대→2대 감축 시 오히려 20초 만에 발생</td></tr>
+      <tr><td>제어기 전력모드</td><td>MAXN→50 W 제한, 변화 없음</td></tr>
+      <tr><td>주행 속도</td><td>0.25→0.125 m/s, 변화 없음</td></tr>
+      <tr><td>모터 자체 알람</td><td>프리즈 직전까지 오류 플래그 없음</td></tr>
+    </tbody>
+  </table>
+
+  <h2>결론 및 향후 조치</h2>
+  <p>제어기 정지는 <strong>주행모터의 전류 과도가 공용 전원·접지 계통을 통해 제어기로
+     결합</strong>되어 발생하는 것으로 판단된다. 전류 저감이 빈도를 낮추었다는 용량반응
+     관계가 이를 뒷받침한다. 다만 전류 저감은 주행 성능을 희생하는 완화책일 뿐이며,
+     <strong>결합 경로 차단이 근본 대책</strong>이다.</p>
+  <p><strong>조치 계획</strong> — ① 배터리 단자에서 제어기 전원을 독립 인출하고 접지를
+     배터리 음극에 직결(스타 결선) ② 제어기 공급단에 벌크 커패시터 적용
+     ③ 모터 동력선과 통신·센서 배선의 물리적 이격 ④ 정식 구성 후 동일 조건 재검증.</p>
+
+</div>
+</div>
+
+<div id="tip"></div>
+
+<script>
+
+// ── 전류 파형 ──────────────────────────────────────────────
+const WAVE = {"0x141": [{"t": 0, "a": 4.58, "s": 271}, {"t": 1, "a": 3.29, "s": 271}, {"t": 2, "a": 6.45, "s": 271}, {"t": 3, "a": 5.4, "s": 271}, {"t": 4, "a": 6.85, "s": 270}, {"t": 5, "a": 3.95, "s": 272}, {"t": 6, "a": 11.73, "s": 271}, {"t": 7, "a": 11.12, "s": 269}, {"t": 8, "a": 6.43, "s": 271}, {"t": 9, "a": 4.68, "s": 271}, {"t": 10, "a": 4.59, "s": 271}, {"t": 11, "a": 2.86, "s": 272}, {"t": 12, "a": 8.09, "s": 271}, {"t": 13, "a": 8.15, "s": 271}, {"t": 14, "a": 2.86, "s": 271}, {"t": 15, "a": 2.86, "s": 271}, {"t": 16, "a": 2.86, "s": 271}, {"t": 17, "a": 2.86, "s": 272}, {"t": 18, "a": 2.86, "s": 271}, {"t": 19, "a": 2.86, "s": 271}, {"t": 20, "a": 2.86, "s": 271}, {"t": 21, "a": 2.86, "s": 272}, {"t": 22, "a": 3.92, "s": 271}, {"t": 23, "a": 4.34, "s": 271}], "0x142": [{"t": 0, "a": 5.65, "s": 273}, {"t": 1, "a": 13.58, "s": 273}, {"t": 2, "a": 8.27, "s": 272}, {"t": 3, "a": 6.68, "s": 273}, {"t": 4, "a": 9.16, "s": 272}, {"t": 5, "a": 4.13, "s": 273}, {"t": 6, "a": 16.03, "s": 272}, {"t": 7, "a": 10.37, "s": 271}, {"t": 8, "a": 7.97, "s": 273}, {"t": 9, "a": 15.33, "s": 273}, {"t": 10, "a": 7.14, "s": 273}, {"t": 11, "a": 5.94, "s": 273}, {"t": 12, "a": 6.09, "s": 273}, {"t": 13, "a": 13.47, "s": 273}, {"t": 14, "a": 3.93, "s": 273}, {"t": 15, "a": 3.73, "s": 273}, {"t": 16, "a": 3.7, "s": 273}, {"t": 17, "a": 3.68, "s": 273}, {"t": 18, "a": 3.65, "s": 273}, {"t": 19, "a": 3.65, "s": 273}, {"t": 20, "a": 3.64, "s": 273}, {"t": 21, "a": 3.63, "s": 273}, {"t": 22, "a": 5.63, "s": 273}, {"t": 23, "a": 16.01, "s": 273}]};
+(function () {
+  const W = 820, H = 340, ML = 58, MR = 92, MT = 20, MB = 46;
+  const PW = W - ML - MR, PH = H - MT - MB, TMAX = 23, YMAX = 18;
+  const X = t => ML + (t / TMAX) * PW, Y = a => MT + PH - (a / YMAX) * PH;
+  const S = [{ k: '0x141', l: '좌 0x141', c: 'var(--series-1)' },
+             { k: '0x142', l: '우 0x142', c: 'var(--series-2)' }];
+  let s = '';
+  for (let a = 0; a <= YMAX; a += 3) {
+    s += `<line x1="${ML}" y1="${Y(a)}" x2="${ML + PW}" y2="${Y(a)}" stroke="var(--grid)" stroke-width="1"/>`;
+    s += `<text x="${ML - 10}" y="${Y(a) + 4}" text-anchor="end" font-size="11" fill="var(--text-muted)">${a}</text>`;
+  }
+  s += `<text x="${ML - 10}" y="${MT - 6}" text-anchor="end" font-size="11" fill="var(--text-muted)">A</text>`;
+  for (let t = 0; t <= TMAX; t += 4)
+    s += `<text x="${X(t)}" y="${MT + PH + 20}" text-anchor="middle" font-size="11" fill="var(--text-muted)">${t}</text>`;
+  s += `<text x="${ML + PW / 2}" y="${MT + PH + 40}" text-anchor="middle" font-size="11" fill="var(--text-muted)">경과 시간 (초)</text>`;
+  s += `<line x1="${ML}" y1="${Y(16.03)}" x2="${ML + PW}" y2="${Y(16.03)}" stroke="var(--text-muted)"
+         stroke-width="1.5" stroke-dasharray="5 4" opacity=".7"/>`;
+  s += `<text x="${ML + PW + 6}" y="${Y(16.03) - 6}" font-size="10.5" fill="var(--text-muted)">토크 상한 16.0 A</text>`;
+  s += `<line x1="${ML}" y1="${Y(2.9)}" x2="${ML + PW}" y2="${Y(2.9)}" stroke="var(--text-muted)"
+         stroke-width="1" stroke-dasharray="2 4" opacity=".6"/>`;
+  s += `<text x="${ML + PW + 6}" y="${Y(2.9) + 4}" font-size="10.5" fill="var(--text-muted)">평상시 2.9 A</text>`;
+  S.forEach(sr => {
+    const p = WAVE[sr.k];
+    s += `<path d="${p.map((q, i) => `${i ? 'L' : 'M'}${X(q.t).toFixed(1)},${Y(q.a).toFixed(1)}`).join('')}"
+           fill="none" stroke="${sr.c}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+  });
+  const pk = WAVE['0x142'].reduce((m, q) => (q.a > m.a ? q : m));
+  s += `<circle cx="${X(pk.t)}" cy="${Y(pk.a)}" r="5" fill="var(--series-2)" stroke="var(--surface-1)" stroke-width="2"/>`;
+  s += `<text x="${X(pk.t)}" y="${Y(pk.a) - 12}" text-anchor="middle" font-size="11.5"
+         font-weight="650" fill="var(--text-primary)">16.0 A</text>`;
+  s += `<line id="wcross" x1="0" y1="${MT}" x2="0" y2="${MT + PH}" stroke="var(--text-muted)" stroke-width="1" opacity="0"/>`;
+  S.forEach((_, i) => { s += `<circle id="wdot${i}" r="4.5" fill="${S[i].c}" stroke="var(--surface-1)" stroke-width="2" opacity="0"/>`; });
+  s += `<rect x="${ML}" y="${MT}" width="${PW}" height="${PH}" fill="transparent" id="whit"/>`;
+  const el = document.getElementById('wave');
+  el.innerHTML = s;
+  const tip = document.getElementById('tip');
+  const cross = document.getElementById('wcross');
+  const dots = S.map((_, i) => document.getElementById('wdot' + i));
+  document.getElementById('whit').addEventListener('pointermove', ev => {
+    const r = el.getBoundingClientRect(), px = (ev.clientX - r.left) * (W / r.width);
+    const t = Math.max(0, Math.min(TMAX, Math.round(((px - ML) / PW) * TMAX)));
+    cross.setAttribute('x1', X(t)); cross.setAttribute('x2', X(t)); cross.setAttribute('opacity', '.45');
+    let rows = '';
+    S.forEach((sr, i) => {
+      const q = WAVE[sr.k].find(z => z.t === t); if (!q) return;
+      dots[i].setAttribute('cx', X(t)); dots[i].setAttribute('cy', Y(q.a)); dots[i].setAttribute('opacity', '1');
+      rows += `<div style="color:var(--text-secondary)">${sr.l} <strong style="color:var(--text-primary)">${q.a.toFixed(2)} A</strong></div>`;
+    });
+    tip.innerHTML = `<div style="color:var(--text-muted)">경과 ${t}초</div>${rows}`;
+    tip.style.opacity = '1';
+    tip.style.left = Math.min(ev.clientX + 14, window.innerWidth - 190) + 'px';
+    tip.style.top = (ev.clientY - 12) + 'px';
+  });
+  document.getElementById('whit').addEventListener('pointerleave', () => {
+    tip.style.opacity = '0'; cross.setAttribute('opacity', '0');
+    dots.forEach(d => d.setAttribute('opacity', '0'));
+  });
+})();
+
+const PTS = [
+  { a: 28.3, r: 4.00, h: 1.0, n: 4,  lab: '무제한',      sep: false },
+  { a: 16.0, r: 2.33, h: 3.0, n: 7,  lab: '150%',        sep: false },
+  { a: 8.9,  r: 1.62, h: 9.2, n: 15, lab: '80%',         sep: false },
+  { a: 8.9,  r: 1.07, h: 3.7, n: 4,  lab: '80% 재측정',  sep: false },
+  { a: 13.3, r: 0.00, h: 1.4, n: 0,  lab: '전원 분리',   sep: true  },
+];
+
+const W = 820, H = 380, ML = 66, MR = 34, MT = 22, MB = 56;
+const PW = W - ML - MR, PH = H - MT - MB;
+const AMAX = 30, RMAX = 4.4;
+const X = a => ML + (a / AMAX) * PW;
+const Y = r => MT + PH - (r / RMAX) * PH;
+const R = h => 6 + Math.sqrt(h) * 3.2;
+
+let s = '';
+for (let r = 0; r <= 4; r++) {
+  s += `<line x1="${ML}" y1="${Y(r)}" x2="${ML + PW}" y2="${Y(r)}" stroke="var(--grid)" stroke-width="1"/>`;
+  s += `<text x="${ML - 10}" y="${Y(r) + 4}" text-anchor="end" font-size="11" fill="var(--text-muted)">${r}</text>`;
+}
+s += `<text x="${ML - 46}" y="${MT + PH / 2}" font-size="11" fill="var(--text-muted)"
+       transform="rotate(-90 ${ML - 46} ${MT + PH / 2})" text-anchor="middle">프리즈 (회/시간)</text>`;
+for (let a = 0; a <= AMAX; a += 5) {
+  s += `<text x="${X(a)}" y="${MT + PH + 20}" text-anchor="middle" font-size="11" fill="var(--text-muted)">${a}</text>`;
+}
+s += `<text x="${ML + PW / 2}" y="${MT + PH + 44}" text-anchor="middle" font-size="11"
+       fill="var(--text-muted)">주행모터 피크 전류 (A)</text>`;
+
+// 추세선 — 전원 공유 구성만
+const shared = PTS.filter(p => !p.sep).sort((x, y) => x.a - y.a);
+s += `<path d="${shared.map((p, i) => `${i ? 'L' : 'M'}${X(p.a).toFixed(1)},${Y(p.r).toFixed(1)}`).join('')}"
+       fill="none" stroke="var(--series-1)" stroke-width="2" opacity=".55" stroke-dasharray="6 4"/>`;
+
+PTS.forEach((p, i) => {
+  const c = p.sep ? 'var(--series-2)' : 'var(--series-1)';
+  s += `<circle class="pt" data-i="${i}" cx="${X(p.a)}" cy="${Y(p.r)}" r="${R(p.h)}"
+         fill="${c}" fill-opacity=".85" stroke="var(--surface-1)" stroke-width="2" style="cursor:pointer"/>`;
+  const dy = p.sep ? 26 : -R(p.h) - 9;
+  s += `<text x="${X(p.a)}" y="${Y(p.r) + dy}" text-anchor="middle" font-size="11.5"
+         font-weight="600" fill="${c}">${p.lab}</text>`;
+});
+
+const sep = PTS[4];
+s += `<text x="${X(sep.a)}" y="${Y(sep.r) + 44}" text-anchor="middle" font-size="10.5"
+       fill="var(--text-muted)">동일 전류대에서 0회</text>`;
+
+document.getElementById('chart').innerHTML = s;
+
+const tip = document.getElementById('tip');
+document.querySelectorAll('.pt').forEach(el => {
+  el.addEventListener('pointerenter', ev => {
+    const p = PTS[+el.dataset.i];
+    tip.innerHTML = `<div style="font-weight:620">${p.lab}</div>
+      <div style="color:var(--text-secondary)">피크 ${p.a} A · 관측 ${p.h} h</div>
+      <div style="color:var(--text-secondary)">프리즈 ${p.n}회 · ${p.r.toFixed(2)} 회/시간</div>`;
+    tip.style.opacity = '1';
+    tip.style.left = Math.min(ev.clientX + 14, window.innerWidth - 200) + 'px';
+    tip.style.top = (ev.clientY - 10) + 'px';
+  });
+  el.addEventListener('pointerleave', () => { tip.style.opacity = '0'; });
+});
+</script>

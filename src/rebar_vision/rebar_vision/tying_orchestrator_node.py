@@ -79,6 +79,19 @@ class TyingOrchestratorNode(Node):
         self.declare_parameter('detection_retry_count', 3)
         self.declare_parameter('detection_retry_delay', 1.0)
         # Yaw 자세 변경 파라미터 (홈 기준 오프셋)
+        # ★ [2026-09-08] 2층 배근 — 교차점의 **두 철근이 같은 층인지** 보고 거른다.
+        #   하단근 세로 × 상단근 가로는 탑뷰에서 교차점처럼 보이지만 실제가 아니다.
+        #   교차점 둘레를 링으로 훑어 갈래별 높이를 재고, 폭이 layer_gap_mm 이상이면 뺀다.
+        #   ⚠ 중심 depth 하나로는 못 가린다(위에 얹힌 철근만 보임).
+        #   ⚠ 층간이 층내 산포와 비슷하면 못 가린다 — RC 목업(40mm)은 실측 분리도
+        #     1.36σ에 그쳤다. 그런 곳에서는 켜도 소용없다.
+        #   ★ 현장 실측(2026-09-08): 하단근 바닥+30mm / 상단근 +180mm → 층간 150mm.
+        #     임계는 그 중간인 75mm (같은 층 spread≈0 / 층 혼합 spread≈150).
+        #   ⚠ 현장 미검증이므로 기본은 여전히 'off'. 켜기 전에
+        #     tools/vision_test/layer_check_probe.py 로 두 무리가 갈리는지 볼 것.
+        self.declare_parameter('layer_mode', 'off')        # 'off' | 'on'
+        self.declare_parameter('layer_gap_mm', 75.0)
+        self.declare_parameter('layer_on_unknown', 'accept')
         self.declare_parameter('yaw_right_cam_offset', -3.0)   # 홈 기준 -3°
         self.declare_parameter('yaw_left_cam_offset', 393.0)    # 홈 기준 +393° (최종 작업자세)
         self.declare_parameter('yaw_left_cam_approach_offset', 390.0)  # 홈 기준 +390° (접근자세)
@@ -363,8 +376,8 @@ class TyingOrchestratorNode(Node):
         if self.servo_mode:
             self._init_servo()
 
-        # === [Orbbec] 교차점 검출+호모그래피 결속 (orbbec_mode) ===
-        # 상단 Orbbec 1대로 전영역 검출 → 호모그래피로 로봇XY → 지그재그 직접결속
+        # === [Orbbec] 교차점 검출+CAD변환 결속 (orbbec_mode) ===
+        # 상단 Orbbec 1대로 전영역 검출 → CAD변환+자세오프셋으로 로봇XY → 지그재그 직접결속
         # (비주얼서보잉 대체). 기존 zedxmini/서보 흐름은 보존.
         self.declare_parameter('orbbec_mode', False)
         self.orbbec_mode = self.get_parameter('orbbec_mode').value
@@ -509,7 +522,7 @@ class TyingOrchestratorNode(Node):
                 self.get_logger().info('=' * 60)
                 self.flog(f"TYING_START: speed={speed_pct}% direction={self.tying_direction}")
                 if self.orbbec_mode:
-                    # [Orbbec] 지그재그 직접결속 (검출→호모그래피→결속, 서보 없음)
+                    # [Orbbec] 지그재그 직접결속 (검출→CAD변환→결속, 서보 없음)
                     self._orbbec_running = True
                     self._servo_abort = False
                     self._force_z = True
@@ -1525,22 +1538,27 @@ class TyingOrchestratorNode(Node):
             time.sleep(0.2)
 
     # ============================================
-    # [Orbbec] 교차점 검출+호모그래피 지그재그 결속 (비주얼서보잉 대체)
+    # [Orbbec] 교차점 검출+CAD변환 지그재그 결속 (비주얼서보잉 대체)
     # ============================================
     def _init_orbbec(self):
-        """Orbbec 로컬라이저(YOLO+호모그래피) 로드. 실패 시 orbbec_mode off."""
+        """Orbbec 로컬라이저(YOLO+CAD변환) 로드. 실패 시 orbbec_mode off.
+        CAD 강체변환+자세별 오프셋 사용 → depth 정합 필요(depth_registration:=true)."""
         try:
             from rebar_vision.orbbec_detector import OrbbecLocalizer
             self.orbbec = OrbbecLocalizer(
                 self,
                 model_path='/home/koceti/ros2_ws/src/rebar_vision/model/orbbec_crossing.pt',
-                homo_path='/home/koceti/ros2_ws/data/calibration/homography_orbbec.yaml',
                 color_topic='/camera/color/image_raw',
+                depth_topic='/camera/depth/image_raw',
+                info_topic='/camera/color/camera_info',
                 yrange={'r': (self.right_cam_y_min, self.right_cam_y_max),
                         'l': (self.left_cam_y_min, self.left_cam_y_max)},
                 x_min=0.0, x_max=self.max_stage_x_mm,
-                left_x_min=self.left_min_x_mm)
-            self.get_logger().info('  [orbbec] 로컬라이저 로드 ✅ (orbbec_mode ON)')
+                left_x_min=self.left_min_x_mm,
+                layer_mode=self.get_parameter('layer_mode').value,
+                layer_gap_mm=self.get_parameter('layer_gap_mm').value,
+                layer_on_unknown=self.get_parameter('layer_on_unknown').value)
+            self.get_logger().info('  [orbbec] 로컬라이저 로드 ✅ (orbbec_mode ON, CAD변환)')
         except Exception as e:
             self.get_logger().error(f'  [orbbec] 초기화 실패 → orbbec_mode OFF: {e}')
             self.orbbec_mode = False
@@ -1577,6 +1595,30 @@ class TyingOrchestratorNode(Node):
             time.sleep(0.2)
         self.current_pose_state = next_pose
 
+    @staticmethod
+    def _points_to_sets(points, cur_pose):
+        """사전지정 결속포인트 → {'r':[(x,y,u,v)], 'l':[...]} 형태.
+
+        ※ localize()는 여기에 (cls, conf)가 더 붙은 6튜플을 준다. 결속 시퀀스는
+          앞 4개만 쓰므로 소비부는 **인덱싱으로** 받아야 한다(언패킹 금지).
+
+        두 형식을 받는다:
+          · dict  {'r': [[x,y],...], 'l': [[x,y],...]}  ← 자세 분류 보존(권장)
+          · list  [[x,y],...]                          ← 전부 현재 자세로 (기존 호환)
+        u,v(픽셀)는 결속 시퀀스에서 안 쓰므로 0으로 채운다.
+        """
+        sets = {'r': [], 'l': []}
+        if isinstance(points, dict):
+            for p in ('r', 'l'):
+                for xy in points.get(p, []) or []:
+                    if len(xy) >= 2:
+                        sets[p].append((float(xy[0]), float(xy[1]), 0, 0))
+        else:
+            for xy in points or []:
+                if len(xy) >= 2:
+                    sets[cur_pose].append((float(xy[0]), float(xy[1]), 0, 0))
+        return sets
+
     def _run_orbbec_tying(self):
         """[Orbbec] WP 결속: 검출→자세별 분류→지그재그 결속. 별도 스레드.
         도착자세(current_pose_state)부터 처리, 첫세그 X max→0, 자세변경(x=0),
@@ -1592,14 +1634,29 @@ class TyingOrchestratorNode(Node):
                 self.flog('[ORBBEC] 미준비 중단'); return
             self._orbbec_setup_yaw()
             cur = self._pose_char(self.current_pose_state)
-            # base 정착 대기 + 버퍼클리어 → 주행 정지 직후 블러/위치오차 방지
-            self.get_logger().info(
-                f'[ORBBEC] base 정착 대기 {self.orbbec_settle_sec:.1f}s + 버퍼클리어')
-            self.flog(f'[ORBBEC] 정착대기 {self.orbbec_settle_sec:.1f}s')
-            time.sleep(self.orbbec_settle_sec)
-            self.orbbec.buf.clear()
-            time.sleep(0.3)                            # 신선 프레임 채우기
-            sets = self.orbbec.localize(cur)           # {'r':[(x,y,u,v)], 'l':[...]}
+            # 사전지정 결속포인트가 오면 **검출을 건너뛰고 그 좌표로 결속**한다.
+            # 비전 자율주행(rebar_drive_node)이 이미 검출한 교차점을 넘겨주는 경로.
+            # 왜 필요한가: 주행거리는 "도달범위 안 교차점 = 결속했다 → 그 열수×pitch 전진"
+            #   전제로 계산된다. 여기서 따로 검출하면 두 관측이 어긋나 결속 안 된 열을
+            #   건너뛸 수 있다(실측에서 같은 자리 재검출이 4→5열로 흔들림).
+            #   한 관측을 공유하면 관측이 틀려도 '이동거리와 결속대상'은 항상 일치한다.
+            pre = getattr(self, '_predefined_points', None)
+            if pre:
+                sets = self._points_to_sets(pre, cur)
+                self._predefined_points = []           # 1회성 — 다음 결속은 자체검출
+                self.get_logger().info(
+                    f'[ORBBEC] 사전지정 좌표 사용(검출 스킵): '
+                    f'우{len(sets["r"])} 좌{len(sets["l"])}')
+                self.flog(f'[ORBBEC] 사전지정 우{len(sets["r"])}좌{len(sets["l"])}')
+            else:
+                # base 정착 대기 + 버퍼클리어 → 주행 정지 직후 블러/위치오차 방지
+                self.get_logger().info(
+                    f'[ORBBEC] base 정착 대기 {self.orbbec_settle_sec:.1f}s + 버퍼클리어')
+                self.flog(f'[ORBBEC] 정착대기 {self.orbbec_settle_sec:.1f}s')
+                time.sleep(self.orbbec_settle_sec)
+                self.orbbec.buf.clear()
+                time.sleep(0.3)                        # 신선 프레임 채우기
+                sets = self.orbbec.localize(cur)       # {'r':[(x,y,u,v)], 'l':[...]}
             order = [cur, ('l' if cur == 'r' else 'r')]
             self.get_logger().info(
                 f'[ORBBEC] WP 결속 시작 (도착자세={cur}, 순서={order})')
@@ -1623,7 +1680,11 @@ class TyingOrchestratorNode(Node):
                     f'(X {"max→0" if first else "0→max"})')
                 self.flog(f'[ORBBEC] {P} {len(seg_sorted)}점 '
                           f'X{"내림" if first else "오름"}')
-                for (x, y, u, v) in seg_sorted:
+                # ⚠️ [2026-08-18] 튜플 길이에 의존하지 말 것.
+                #   localize()는 (x,y,u,v,cls,conf) 6개, _points_to_sets()는 (x,y,u,v) 4개를
+                #   준다. 결속 시퀀스는 앞 4개만 쓰므로 인덱싱으로 받는다.
+                for _c in seg_sorted:
+                    x, y, u, v = _c[0], _c[1], _c[2], _c[3]
                     if self._servo_abort:
                         break
                     x_cmd = x
@@ -2079,6 +2140,10 @@ class TyingOrchestratorNode(Node):
             'tying_progress': progress,
             'tying_message': self.tying_message,
             'tying_result': self.tying_result,
+            # 현재 스테이지 자세('right'/'left'/'unknown'). 결속이 끝나면 그 자세의
+            # 검출자세로 복귀하므로, 다음 검출을 하는 쪽(rebar_drive_node)이 이걸 보고
+            # 자세별 CAD 오프셋을 맞춰야 한다. (기존 소비자는 모르는 키라 무해)
+            'pose': self.current_pose_state,
         }
 
         msg = String()

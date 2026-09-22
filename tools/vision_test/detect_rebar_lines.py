@@ -2,7 +2,7 @@
 """
 철근 라인 검출 테스트 (OpenCV 기반)
 
-zed_front 카메라 이미지에서 가로/세로 배근 철근을 구분 검출합니다.
+전방 카메라(zedxmini2) 이미지에서 가로/세로 배근 철근을 구분 검출합니다.
 - 가로 철근 (horizontal): 주행 방향에 수직 → 카운팅으로 종방향 거리 보정 가능
 - 세로 철근 (vertical):   주행 방향에 평행 → 추종으로 횡방향 정렬 가능
 
@@ -453,8 +453,8 @@ def main():
     parser.add_argument('--image', '-i', type=str, default=None,
                         help='테스트할 이미지 파일 경로 (없으면 ROS2 토픽 사용)')
     parser.add_argument('--topic', '-t', type=str,
-                        default='/zed_back/zed_node/left/image_rect_color',
-                        help='ROS2 이미지 토픽 (default: zed_back, 전진용)')
+                        default='/zedxmini2/zed_node/left/image_rect_color',
+                        help='ROS2 이미지 토픽 (default: zedxmini2 = 전방 카메라)')
     parser.add_argument('--canny-low', type=int, default=30,
                         help='Canny edge 하한 (default: 30)')
     parser.add_argument('--canny-high', type=int, default=90,

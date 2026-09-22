@@ -105,13 +105,34 @@ def generate_launch_description():
         ),
 
         # EZI-IO Controller Node (리밋 센서)
+        # ★ respawn 필수 (2026-09-02). 이 노드는 DIO 복구가 오래 실패하면
+        #   **스스로 종료**한다 — FASTECH 라이브러리의 프로세스 전역상태가 꼬이면
+        #   같은 프로세스 안에서는 재연결로 복구가 안 되기 때문이다.
+        #   ⚠ respawn이 없으면 죽은 채 영영 안 돌아와 **좀비보다 나쁘다.**
+        #   배경: 제어기가 외부 전원이라 **장비 전원만 내려도 젯슨은 살아 있다.**
+        #   그래서 DIO만 꺼진 채 노드가 계속 붙으려다 상태가 꼬이는 일이 상시 일어난다.
         Node(
             package='rebar_base_control',
             executable='ezi_io_controller.py',
             name='ezi_io_controller',
             output='screen',
             parameters=[can_config],
-            emulate_tty=True
+            emulate_tty=True,
+            respawn=True,
+            respawn_delay=5.0
+        ),
+
+        # 범퍼 감시 노드 (하부 주행부 DIO 192.168.0.5, board_id=1)
+        # ⚠ 상부 리미트 보드(192.168.0.6, board_id=0)와 **다른 보드**다.
+        #   ezi_io_controller가 상부, 이 노드가 하부를 각각 따로 연결한다.
+        Node(
+            package='rebar_base_control',
+            executable='bumper_node.py',
+            name='bumper_node',
+            output='screen',
+            emulate_tty=True,
+            respawn=True,
+            respawn_delay=5.0
         ),
 
         # Authority Controller Node

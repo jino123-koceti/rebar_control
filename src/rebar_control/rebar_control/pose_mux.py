@@ -37,8 +37,12 @@ class PoseMux(Node):
         super().__init__('pose_mux')
 
         # Parameters
-        self.declare_parameter('front_odom_topic', '/zed_front/odom')
-        self.declare_parameter('back_odom_topic', '/zed_back/odom')
+        # [2026-08-06] 주행 카메라 교체: zed_front/zed_back(ZED X) → zedxmini2(물리 전방)/
+        #   zedxmini1(물리 후방). 슬롯은 '진행방향' 기준이고 진행방향 반대편 카메라를 쓴다
+        #   (전진→후방카메라 zedxmini1, 후진→전방카메라 zedxmini2). 실제 값은
+        #   control_system.launch.py에서 덮어쓴다.
+        self.declare_parameter('front_odom_topic', '/zedxmini1/zed_node/odom')
+        self.declare_parameter('back_odom_topic', '/zedxmini2/zed_node/odom')
         self.declare_parameter('output_topic', '/robot_pose')
         self.declare_parameter('direction_source', 'cmd_vel')  # cmd_vel | topic
         self.declare_parameter('direction_topic', '/travel_direction')  # used when direction_source == 'topic'

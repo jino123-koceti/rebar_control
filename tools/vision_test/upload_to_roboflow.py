@@ -33,10 +33,14 @@ DEFAULT_DIRS = [
 ]
 
 
-def collect(dirs, stride):
+def collect(dirs, stride, pattern="*"):
+    """폴더별 (경로, 선택된 파일들, 전체수). jpg/png 모두 지원."""
     files = []
     for d in dirs:
-        fs = sorted(glob.glob(os.path.join(d, "frame_*.jpg")))
+        fs = []
+        for ext in ("jpg", "jpeg", "png"):
+            fs += glob.glob(os.path.join(d, f"{pattern}.{ext}"))
+        fs = sorted(fs)
         picked = fs[::stride] if stride > 1 else fs
         files.append((d, picked, len(fs)))
     return files
@@ -50,6 +54,8 @@ def main():
     ap.add_argument("--project", required=True)
     ap.add_argument("--dirs", nargs="+", default=DEFAULT_DIRS)
     ap.add_argument("--stride", type=int, default=1)
+    ap.add_argument("--pattern", default="*",
+                    help="파일명 glob (확장자 제외). 기본 '*' = 폴더 내 전체")
     ap.add_argument("--batch", default="drive_frames")
     ap.add_argument("--split", default="train", choices=["train", "valid", "test"])
     ap.add_argument("--dry-run", action="store_true")
@@ -74,12 +80,12 @@ def main():
             print(f"프로젝트 목록 조회 실패: {e}")
         return
 
-    groups = collect(args.dirs, args.stride)
+    groups = collect(args.dirs, args.stride, args.pattern)
     total = sum(len(p) for _, p, _ in groups)
     print(f"업로드 대상 (stride={args.stride}):")
     for d, picked, n in groups:
-        tag = "전방" if "115833" in d else ("후방" if "125006" in d else "")
-        print(f"  {tag} {d}: {len(picked)}/{n}장")
+        # 폴더명이 그대로 Roboflow 태그가 됨 (front/back/left/right)
+        print(f"  [{os.path.basename(d)}] {d}: {len(picked)}/{n}장")
     print(f"  합계: {total}장 → project '{args.project}' (batch={args.batch})")
 
     if args.dry_run:

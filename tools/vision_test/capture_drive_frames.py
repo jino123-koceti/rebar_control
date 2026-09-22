@@ -12,15 +12,18 @@
 
 사용:
   # 1) 먼저 전면 카메라 실행 (별도 터미널)
+  #    [2026-08-06] 전방 카메라를 ZED X(zed_front) → ZED X Mini(zedxmini2)로 교체.
+  #    ⚠ odom을 쓰려면 depth_mode를 NONE 이외로 두고 pos_tracking_enabled:=true 필요.
   ros2 launch zed_wrapper zed_camera.launch.py \
-       camera_name:=zed_front camera_model:=zedx serial_number:=45320958
+       camera_name:=zedxmini2 camera_model:=zedxm serial_number:=54946194 \
+       pos_tracking_enabled:=true
 
   # 2) 캡처 시작 → 로봇 저속 전진 주행 → Ctrl-C 로 종료
   python3 tools/vision_test/capture_drive_frames.py --rate 5
 
 옵션:
-  --topic       이미지 토픽 (default: /zed_front/zed_node/left/image_rect_color)
-  --odom-topic  odom 토픽   (default: /zed_front/zed_node/odom)
+  --topic       이미지 토픽 (default: /zedxmini2/zed_node/left/image_rect_color)
+  --odom-topic  odom 토픽   (default: /zedxmini2/zed_node/odom)
   --rate        저장 주기 Hz (default: 5)
   --outdir      저장 폴더 (default: data/vision_test/drive_<타임스탬프>)
   --max-frames  최대 프레임 수 (default: 0=무제한)
@@ -119,8 +122,8 @@ class DriveCapture(Node):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--topic',
-                    default='/zed_front/zed_node/left/image_rect_color')
-    ap.add_argument('--odom-topic', default='/zed_front/zed_node/odom')
+                    default='/zedxmini2/zed_node/left/image_rect_color')
+    ap.add_argument('--odom-topic', default='/zedxmini2/zed_node/odom')
     ap.add_argument('--rate', type=float, default=5.0)
     ap.add_argument('--max-frames', type=int, default=0)
     stamp = time.strftime('%Y%m%d_%H%M%S')

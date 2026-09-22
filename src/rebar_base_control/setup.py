@@ -33,6 +33,7 @@ setup(
             'authority_controller = rebar_base_control.authority_controller:main',
             'navigator_base = rebar_base_control.navigator_base:main',
             'ezi_io_controller = rebar_base_control.ezi_io_controller:main',
+            'bumper_node = rebar_base_control.bumper_node:main',
             'sequence_controller = rebar_base_control.sequence_controller:main',
             'encoder_odom = rebar_base_control.encoder_odom:main',
             'homing_controller = rebar_base_control.homing_controller:main',

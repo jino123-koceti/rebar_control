@@ -1,0 +1,355 @@
+<title>횡이동 구동부 용량 검토</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-1:#fcfcfb; --surface-2:#f3f3f1; --border:#dedddaff;
+    --text-primary:#0b0b0b; --text-secondary:#52514e; --text-muted:#78766f;
+    --grid:#e6e5e1; --series-1:#2a78d6; --series-2:#eb6834;
+    --accent-bg:#eef4fc; --warn-bg:#fdf3e8; --over:#c05a2c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1:#1a1a19; --surface-2:#232322; --border:#3a3a38;
+      --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#8f8e85;
+      --grid:#2e2e2c; --series-1:#3987e5; --series-2:#d95926;
+      --accent-bg:#1f2733; --warn-bg:#2b2419; --over:#d95926;
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1:#1a1a19; --surface-2:#232322; --border:#3a3a38;
+    --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#8f8e85;
+    --grid:#2e2e2c; --series-1:#3987e5; --series-2:#d95926;
+    --accent-bg:#1f2733; --warn-bg:#2b2419; --over:#d95926;
+  }
+  .viz-root { background:var(--surface-1); color:var(--text-primary);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans KR","Malgun Gothic",Roboto,sans-serif;
+    line-height:1.65; padding:40px 24px 64px; }
+  .wrap { max-width:880px; margin:0 auto; }
+  h1 { font-size:1.6rem; font-weight:650; margin:0 0 6px; letter-spacing:-.01em; }
+  h2 { font-size:1.08rem; font-weight:620; margin:44px 0 12px;
+       padding-bottom:8px; border-bottom:1px solid var(--border); }
+  h3 { font-size:.96rem; font-weight:620; margin:26px 0 8px; }
+  .sub { color:var(--text-secondary); font-size:.92rem; margin:0 0 4px; }
+  p { color:var(--text-secondary); font-size:.92rem; }
+  strong { color:var(--text-primary); font-weight:620; }
+  code { font-size:.87em; background:var(--surface-2); padding:1px 5px;
+         border-radius:4px; color:var(--text-primary); }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(148px,1fr));
+           gap:12px; margin:24px 0 8px; }
+  .tile { background:var(--surface-2); border:1px solid var(--border);
+          border-radius:10px; padding:14px 16px; }
+  .tile .k { font-size:.74rem; color:var(--text-muted); margin-bottom:4px; }
+  .tile .v { font-size:1.5rem; font-weight:660; font-variant-numeric:tabular-nums; line-height:1.2; }
+  .tile .u { font-size:.8rem; font-weight:500; color:var(--text-secondary); margin-left:2px; }
+  figure { margin:18px 0 8px; }
+  .chartbox { background:var(--surface-1); border:1px solid var(--border);
+              border-radius:12px; padding:16px 10px 8px; overflow-x:auto; }
+  svg { display:block; width:100%; height:auto; min-width:520px; }
+  figcaption { color:var(--text-muted); font-size:.82rem; margin-top:10px; }
+  table { border-collapse:collapse; width:100%; font-size:.87rem; margin-top:8px; }
+  th,td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--border); }
+  th { color:var(--text-muted); font-weight:560; font-size:.79rem; }
+  td { color:var(--text-secondary); font-variant-numeric:tabular-nums; }
+  td.n { text-align:right; }
+  td strong { color:var(--text-primary); }
+  tr.hl td { background:var(--accent-bg); }
+  .note { border-radius:8px; padding:12px 16px; margin:18px 0; font-size:.88rem;
+          border:1px solid var(--border); }
+  .note p { margin:0; }
+  .note.info { background:var(--accent-bg); border-left:3px solid var(--series-1); }
+  .note.warn { background:var(--warn-bg); border-left:3px solid var(--series-2); }
+  .flow { display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+          background:var(--surface-2); border:1px solid var(--border);
+          border-radius:10px; padding:14px 16px; margin:16px 0; font-size:.87rem; }
+  .flow b { color:var(--text-primary); font-weight:620; }
+  .flow i { color:var(--text-muted); font-style:normal; }
+  #tip { position:fixed; pointer-events:none; opacity:0; transition:opacity .1s;
+         background:var(--surface-2); border:1px solid var(--border); border-radius:8px;
+         padding:9px 12px; font-size:.82rem; color:var(--text-primary);
+         font-variant-numeric:tabular-nums; box-shadow:0 4px 14px rgba(0,0,0,.14);
+         z-index:20; white-space:nowrap; }
+</style>
+
+<div class="viz-root">
+<div class="wrap">
+
+  <h1>횡이동 구동부 용량 검토</h1>
+  <p class="sub">현행 1축 구성의 실측 분석과 3차년도 장비 모터 수 산정 ·
+     RMD X4-36 (0x143) · 측정 2026-08-18</p>
+
+  <h2>요약</h2>
+  <div class="note warn">
+    <p><strong>현행 횡이동 모터는 최대 정격의 100%를 사용 중이며 설계 여유가 없다.</strong>
+    같은 설정에서 성공과 실패가 반복되는 원인이 여기에 있다. 3차년도 장비는 중량과
+    승강 높이가 모두 증가하여 소요 토크가 <strong>2.26배</strong>가 되므로,
+    <strong>모터 4개 분담</strong>이 필요하다.</p>
+  </div>
+
+  <div class="tiles">
+    <div class="tile"><div class="k">실측 피크</div><div class="v">30.5<span class="u">A</span></div></div>
+    <div class="tile"><div class="k">최대 정격 대비</div><div class="v">100<span class="u">%</span></div></div>
+    <div class="tile"><div class="k">3차년도 토크 배수</div><div class="v">2.26<span class="u">배</span></div></div>
+    <div class="tile"><div class="k">필요 모터 수</div><div class="v">4<span class="u">개</span></div></div>
+  </div>
+
+  <h2>1. 측정 방법</h2>
+  <p>횡이동은 위치 명령(<code>0xA4</code>)으로 제어되는데, 이 명령은 <strong>응답이 1회뿐</strong>이라
+     이동 중 전류가 피드백에 남지 않는다. 따라서 <code>0x9C</code>(Read Motor Status 2)를
+     고속 폴링하는 전용 프로브(<code>tools/diag/lateral_probe.py</code>)를 제작하여
+     초당 17~19 샘플로 파형을 확보했다.</p>
+  <p>측정값은 <strong>진폭(iq) 단위</strong>이며 실효값은 √2로 나눈 값이다.
+     이 해석은 교차검증으로 확인되었다 — 토크 제한을 해제했을 때 실측 피크가
+     데이터시트의 최대 상전류와 정확히 일치한다(30.5 ÷ √2 = 21.6 A rms vs 스펙 21.5 A rms).</p>
+
+  <h2>2. 전류 파형</h2>
+  <figure>
+    <div class="chartbox"><svg id="wave" viewBox="0 0 820 350" role="img"
+      aria-label="횡이동 1회전당 모터 전류 파형"></svg></div>
+    <figcaption>
+      2026-08-18 12:51:30부터 20초간, 횡이동 2회. 초당 최대값 집계.
+      1회전(70 mm 이동)마다 <strong>0.5 A → 30.5 A</strong>의 스파이크가 발생한다.
+    </figcaption>
+  </figure>
+
+  <table>
+    <thead><tr><th>구분</th><th class="n">실측(진폭)</th><th class="n">실효(rms)</th>
+      <th class="n">스펙</th><th class="n">대비</th></tr></thead>
+    <tbody>
+      <tr><td>정지 중</td><td class="n">0.5 A</td><td class="n">0.4 A</td><td class="n">—</td><td class="n">—</td></tr>
+      <tr><td>이동 중 평균</td><td class="n">7.7 A</td><td class="n">5.5 A</td>
+          <td class="n">연속 6.1 A</td><td class="n">90%</td></tr>
+      <tr><td>구간 실효값</td><td class="n">8.2 A</td><td class="n">5.8 A</td>
+          <td class="n">연속 6.1 A</td><td class="n">95%</td></tr>
+      <tr class="hl"><td><strong>피크</strong></td><td class="n"><strong>30.5 A</strong></td>
+          <td class="n"><strong>21.6 A</strong></td><td class="n">최대 21.5 A</td>
+          <td class="n"><strong>100%</strong></td></tr>
+    </tbody>
+  </table>
+
+  <div class="note warn">
+    <p><strong>피크가 드라이버 한계에 정확히 붙어 있다.</strong> 이는 모터가 낼 수 있는 힘을
+    전부 쓰고 있다는 뜻으로, <strong>부하가 조금만 증가해도 즉시 실패</strong>한다.</p>
+  </div>
+
+  <h2>3. 성공·실패가 갈리는 원인</h2>
+  <p>동일한 설정(속도·가감속·토크)에서 어떤 때는 철근을 넘고 어떤 때는 스톨이 발생하는
+     현상이 반복되었다. 원인은 <strong>설계 여유가 0%</strong>이기 때문이다.</p>
+  <div class="flow">
+    <b>여유 0%</b><i>→</i><b>미세한 부하 변동이 그대로 성패를 결정</b>
+  </div>
+  <p>접촉 지점의 수 mm 차이, 철근 지름 편차, 로봇 자세, 정지마찰 등은 정상적인 여유가
+     있으면 흡수되는 잡음이다. 실제로 토크 상한을 100%·150%·200%·255%로 조정하고
+     속도와 가감속을 함께 바꾸어도 일관된 개선이 없었다 —
+     <strong>부족한 것은 설정이 아니라 힘 자체</strong>이기 때문이다.</p>
+
+  <h2>4. 열적 · 전기적 한계</h2>
+  <p>모터가 과전류로 손상되는 경로는 <strong>영구자석 감자</strong>와
+     <strong>드라이버 소자 파괴</strong>이며, 데이터시트의 최대 상전류(21.5 A rms)가
+     이를 고려한 제조사 한계선이다. 현행 운용은 이 선을 정확히 밟고 있다.</p>
+  <p>발열은 <code>3·I²·R</code>(상저항 0.35 Ω)로 결정된다. 절연등급 F(권선 한계 155 °C)
+     기준으로 계산하면:</p>
+  <table>
+    <thead><tr><th>조건</th><th class="n">전류</th><th class="n">동손</th>
+      <th class="n">권선 온도상승률</th><th class="n">한계 도달</th></tr></thead>
+    <tbody>
+      <tr><td>정격 연속</td><td class="n">6.1 A rms</td><td class="n">39 W</td>
+          <td class="n">1.7 K/s</td><td class="n">—</td></tr>
+      <tr><td>구간 실효값</td><td class="n">8.2 A rms</td><td class="n">71 W</td>
+          <td class="n">3.1 K/s</td><td class="n">—</td></tr>
+      <tr class="hl"><td><strong>피크 유지</strong></td><td class="n"><strong>21.6 A rms</strong></td>
+          <td class="n"><strong>489 W</strong></td><td class="n"><strong>21.1 K/s</strong></td>
+          <td class="n"><strong>약 5초</strong></td></tr>
+    </tbody>
+  </table>
+  <div class="note warn">
+    <p><strong>미도달 상태로 버티면 약 5초 만에 절연 한계에 도달한다.</strong>
+    실제로 목표 미달 상태가 수십 초 지속되어 <strong>모터에서 발연이 발생</strong>했고,
+    드라이버에 스톨 알람이 래치되었다. 드라이버가 보고하는 온도는 기판 센서 값이므로
+    권선 온도를 반영하지 못한다 — 센서가 정상이어도 안전하다고 볼 수 없다.</p>
+  </div>
+
+  <h2>5. 3차년도 장비 하중 조건</h2>
+  <table>
+    <thead><tr><th>항목</th><th class="n">현행</th><th class="n">3차년도</th><th class="n">배수</th></tr></thead>
+    <tbody>
+      <tr><td>작업공간</td><td class="n">700 × 440</td><td class="n">750 × 520</td><td class="n">면적 ×1.27</td></tr>
+      <tr><td>장비 중량</td><td class="n">50 kg</td><td class="n">79 kg</td><td class="n">×1.58</td></tr>
+      <tr><td>횡이동 보폭</td><td class="n">70 mm</td><td class="n">100 mm</td><td class="n">×1.43</td></tr>
+      <tr><td>승강 높이</td><td class="n">70 mm</td><td class="n">100 mm</td><td class="n">×1.43</td></tr>
+      <tr class="hl"><td><strong>1회전당 일</strong> (m·g·h)</td><td class="n">34.3 J</td>
+          <td class="n"><strong>77.5 J</strong></td><td class="n"><strong>×2.26</strong></td></tr>
+    </tbody>
+  </table>
+  <p>기구는 <strong>평행 4절링크</strong>로, 좌우 크랭크가 동기 회전하며 플랫폼을 원 궤적으로
+     평행이동시킨다. 이 구조에서는 <strong>수평 이동량과 승강 높이가 크랭크 원에 의해 함께 결정</strong>되어
+     독립적으로 설계할 수 없다. 철근 간격이 100 mm 배수로 시공되므로 보폭 100 mm는 고정 조건이며,
+     따라서 승강 100 mm도 불가피하다.</p>
+  <p class="sub" style="margin-top:10px">
+     ※ 수평 이동은 중력에 대해 일을 하지 않으므로, 소요 토크를 결정하는 것은
+     <strong>중량 × 승강 높이</strong>이다.</p>
+
+  <h2>6. 모터 수 산정</h2>
+  <figure>
+    <div class="chartbox"><svg id="bars" viewBox="0 0 820 320" role="img"
+      aria-label="모터 수별 최대 정격 대비 사용률"></svg></div>
+    <figcaption>
+      3차년도 조건(토크 ×2.26)에서 모터 수에 따른 피크 전류 사용률.
+      설계 여유 기준선은 최대 정격의 70%.
+    </figcaption>
+  </figure>
+
+  <table>
+    <thead><tr><th>구성</th><th class="n">피크 (최대 대비)</th>
+      <th class="n">실효 (연속 대비)</th><th class="n">모터당 동손</th><th>판정</th></tr></thead>
+    <tbody>
+      <tr><td>현행 (1개, 현 하중)</td><td class="n">100%</td><td class="n">135%</td>
+          <td class="n">489 W</td><td>여유 없음</td></tr>
+      <tr><td>3차년도 · 2개</td><td class="n">113%</td><td class="n">128%</td>
+          <td class="n">569 W</td><td>스펙 초과 — 불가</td></tr>
+      <tr><td>3차년도 · 3개</td><td class="n">75%</td><td class="n">85%</td>
+          <td class="n">253 W</td><td>빠듯 — 권장하지 않음</td></tr>
+      <tr class="hl"><td><strong>3차년도 · 4개</strong></td><td class="n"><strong>57%</strong></td>
+          <td class="n"><strong>64%</strong></td><td class="n"><strong>142 W</strong></td>
+          <td><strong>권장</strong></td></tr>
+    </tbody>
+  </table>
+
+  <div class="note info">
+    <p><strong>3개가 아니라 4개를 권장하는 이유.</strong> 3개(75%)도 스펙 이내지만 여유가 25%에
+    불과하다. 현행 장비가 100%에서 성공·실패를 반복한 경험에 비추어, 철근 현장의 부하 편차를
+    흡수하기에 부족하다. 4개는 <strong>부하가 1.7배가 되어도 감당</strong>하며,
+    스톨 시 절연 한계 도달 시간도 5초에서 약 19초로 늘어난다.</p>
+  </div>
+
+  <h2>7. 설계 시 반영 사항</h2>
+  <h3>가. 다축 동기화</h3>
+  <p>4개가 미세하게 어긋나면 서로 맞버텨 합력은 그대로인데 전류만 증가한다.
+     동일 명령을 동시 전송하고, <strong>축 간 위치 편차가 임계를 넘으면 전체 정지</strong>하는
+     감시 로직이 필요하다.</p>
+
+  <h3>나. 미도달 보호</h3>
+  <p>4개 구성에서도 목표 미달은 발생한다. 다음 순서의 보호가 필요하다.</p>
+  <div class="flow">
+    <b>스톨 알람 감지</b><i>→</i><b>0x76 System Reset</b><i>→</i><b>출발 위치로 복귀</b>
+  </div>
+  <p>알람 해제는 <code>0x76</code>만 유효하며 <code>0x80</code>/<code>0x88</code>/<code>0x9B</code>
+     조합으로는 해제되지 않는다(실측 확인). <strong>복귀 시 토크를 차단해서는 안 된다</strong> —
+     들어 올려진 상태에서 출력을 끊으면 장비가 낙하한다.</p>
+
+  <h3>다. 전원 계통</h3>
+  <p>4축이 동시에 피크를 인출하면 순간 전류가 현행의 2배를 넘는다. 별건으로 확인된
+     <strong>모터 전류 과도의 제어기 결합 문제</strong>를 고려하여, 제어기 전원을 모터
+     전력계에서 분리하는 설계를 초기 단계에서 반영해야 한다.</p>
+
+  <h3>라. 계측</h3>
+  <p><code>0x9C</code> 폴링 기반 전류 감시를 4축으로 확장하면 축 간 편차와 발열을
+     동시에 감시할 수 있다.</p>
+
+  <h2>부록: 참조 사양 (RMD X4-36)</h2>
+  <table>
+    <tbody>
+      <tr><td>감속비</td><td class="n">36</td><td>입력 전압</td><td class="n">24 V</td></tr>
+      <tr><td>정격 토크</td><td class="n">10.5 N·m</td><td>최대 토크</td><td class="n">34 N·m</td></tr>
+      <tr><td>정격 상전류</td><td class="n">6.1 A(rms)</td><td>최대 상전류</td><td class="n">21.5 A(rms)</td></tr>
+      <tr><td>정격 속도</td><td class="n">83 RPM</td><td>토크 상수</td><td class="n">1.9 N·m/A</td></tr>
+      <tr><td>상저항</td><td class="n">0.35 Ω</td><td>절연등급</td><td class="n">F (155 °C)</td></tr>
+    </tbody>
+  </table>
+
+</div>
+</div>
+<div id="tip"></div>
+
+<script>
+const D = {"wave": [{"t": 0, "a": 3.32, "s": 58}, {"t": 1, "a": 20.23, "s": 70}, {"t": 2, "a": 30.5, "s": 89}, {"t": 3, "a": 14.71, "s": 76}, {"t": 4, "a": 3.85, "s": 68}, {"t": 5, "a": 2.26, "s": 27}, {"t": 6, "a": 0.46, "s": 0}, {"t": 7, "a": 0.85, "s": 0}, {"t": 8, "a": 1.04, "s": 0}, {"t": 9, "a": 2.33, "s": 37}, {"t": 10, "a": 3.65, "s": 70}, {"t": 11, "a": 30.44, "s": 77}, {"t": 12, "a": 16.97, "s": 81}, {"t": 13, "a": 4.04, "s": 74}, {"t": 14, "a": 2.92, "s": 51}, {"t": 15, "a": 1.72, "s": 1}, {"t": 16, "a": 0.18, "s": 0}, {"t": 17, "a": 0.23, "s": 0}, {"t": 18, "a": 0.3, "s": 0}, {"t": 19, "a": 0.33, "s": 0}, {"t": 20, "a": 0.39, "s": 0}], "bars": [{"n": 0, "peak": 100, "rms": 135, "cur": true}, {"n": 1, "peak": 226, "rms": 255}, {"n": 2, "peak": 113, "rms": 128}, {"n": 3, "peak": 75, "rms": 85}, {"n": 4, "peak": 57, "rms": 64}], "k": 2.26};
+
+/* ── 전류 파형 ───────────────────────────────────────── */
+(function () {
+  const W=820,H=350,ML=58,MR=96,MT=20,MB=46;
+  const PW=W-ML-MR,PH=H-MT-MB,TMAX=20,YMAX=36;
+  const X=t=>ML+(t/TMAX)*PW, Y=a=>MT+PH-(a/YMAX)*PH;
+  let s='';
+  s+=`<rect x="${ML}" y="${Y(YMAX)}" width="${PW}" height="${Y(8.63)-Y(YMAX)}"
+        fill="var(--series-2)" opacity=".055"/>`;
+  for(let a=0;a<=YMAX;a+=6){
+    s+=`<line x1="${ML}" y1="${Y(a)}" x2="${ML+PW}" y2="${Y(a)}" stroke="var(--grid)" stroke-width="1"/>`;
+    s+=`<text x="${ML-10}" y="${Y(a)+4}" text-anchor="end" font-size="11" fill="var(--text-muted)">${a}</text>`;
+  }
+  s+=`<text x="${ML-10}" y="${MT-6}" text-anchor="end" font-size="11" fill="var(--text-muted)">A</text>`;
+  for(let t=0;t<=TMAX;t+=5)
+    s+=`<text x="${X(t)}" y="${MT+PH+20}" text-anchor="middle" font-size="11" fill="var(--text-muted)">${t}</text>`;
+  s+=`<text x="${ML+PW/2}" y="${MT+PH+40}" text-anchor="middle" font-size="11" fill="var(--text-muted)">경과 시간 (초)</text>`;
+  s+=`<line x1="${ML}" y1="${Y(30.41)}" x2="${ML+PW}" y2="${Y(30.41)}" stroke="var(--text-muted)"
+        stroke-width="1.5" stroke-dasharray="5 4" opacity=".8"/>`;
+  s+=`<text x="${ML+PW+6}" y="${Y(30.41)-6}" font-size="10" fill="var(--text-muted)">최대 정격 30.4 A</text>`;
+  s+=`<text x="${ML+PW+6}" y="${Y(30.41)+8}" font-size="10" fill="var(--text-muted)">(21.5 A rms)</text>`;
+  s+=`<line x1="${ML}" y1="${Y(8.63)}" x2="${ML+PW}" y2="${Y(8.63)}" stroke="var(--over)"
+        stroke-width="1.4" stroke-dasharray="7 3" opacity=".9"/>`;
+  s+=`<text x="${ML+PW+6}" y="${Y(8.63)+4}" font-size="10" fill="var(--over)">연속 정격 8.6 A</text>`;
+  s+=`<text x="${ML+8}" y="${MT+14}" font-size="10" fill="var(--over)">↑ 연속 정격 초과 — 단시간만 허용</text>`;
+  const d=D.wave.map((p,i)=>`${i?'L':'M'}${X(p.t).toFixed(1)},${Y(p.a).toFixed(1)}`).join('');
+  s+=`<path d="${d}" fill="none" stroke="var(--series-1)" stroke-width="2"
+        stroke-linejoin="round" stroke-linecap="round"/>`;
+  const pk=D.wave.reduce((m,p)=>p.a>m.a?p:m);
+  s+=`<circle cx="${X(pk.t)}" cy="${Y(pk.a)}" r="5" fill="var(--series-1)"
+        stroke="var(--surface-1)" stroke-width="2"/>`;
+  s+=`<text x="${X(pk.t)}" y="${Y(pk.a)-12}" text-anchor="middle" font-size="11.5"
+        font-weight="650" fill="var(--text-primary)">30.5 A</text>`;
+  s+=`<line id="wc" x1="0" y1="${MT}" x2="0" y2="${MT+PH}" stroke="var(--text-muted)" stroke-width="1" opacity="0"/>`;
+  s+=`<circle id="wd" r="4.5" fill="var(--series-1)" stroke="var(--surface-1)" stroke-width="2" opacity="0"/>`;
+  s+=`<rect x="${ML}" y="${MT}" width="${PW}" height="${PH}" fill="transparent" id="wh"/>`;
+  const el=document.getElementById('wave'); el.innerHTML=s;
+  const tip=document.getElementById('tip'), c=document.getElementById('wc'), dt=document.getElementById('wd');
+  document.getElementById('wh').addEventListener('pointermove',ev=>{
+    const r=el.getBoundingClientRect(), px=(ev.clientX-r.left)*(W/r.width);
+    const t=Math.max(0,Math.min(TMAX,Math.round(((px-ML)/PW)*TMAX)));
+    const p=D.wave.find(q=>q.t===t); if(!p) return;
+    c.setAttribute('x1',X(t)); c.setAttribute('x2',X(t)); c.setAttribute('opacity','.45');
+    dt.setAttribute('cx',X(t)); dt.setAttribute('cy',Y(p.a)); dt.setAttribute('opacity','1');
+    tip.innerHTML=`<div style="color:var(--text-muted)">경과 ${t}초</div>
+      <div>전류 <strong>${p.a.toFixed(2)} A</strong> <span style="color:var(--text-muted)">(${(p.a/1.414).toFixed(2)} rms)</span></div>
+      <div style="color:var(--text-secondary)">속도 ${p.s} dps</div>`;
+    tip.style.opacity='1';
+    tip.style.left=Math.min(ev.clientX+14,window.innerWidth-200)+'px';
+    tip.style.top=(ev.clientY-12)+'px';
+  });
+  document.getElementById('wh').addEventListener('pointerleave',()=>{
+    tip.style.opacity='0'; c.setAttribute('opacity','0'); dt.setAttribute('opacity','0');
+  });
+})();
+
+/* ── 모터 수별 사용률 ─────────────────────────────────── */
+(function () {
+  const W=820,H=320,ML=58,MR=30,MT=26,MB=54;
+  const PW=W-ML-MR,PH=H-MT-MB,YMAX=130;
+  const rows=D.bars.filter(b=>b.n>=1);
+  const bw=PW/rows.length, iw=Math.min(96,bw*.5);
+  const Y=v=>MT+PH-(v/YMAX)*PH;
+  let s='';
+  for(let v=0;v<=YMAX;v+=25){
+    s+=`<line x1="${ML}" y1="${Y(v)}" x2="${ML+PW}" y2="${Y(v)}" stroke="var(--grid)" stroke-width="1"/>`;
+    s+=`<text x="${ML-10}" y="${Y(v)+4}" text-anchor="end" font-size="11" fill="var(--text-muted)">${v}%</text>`;
+  }
+  s+=`<line x1="${ML}" y1="${Y(100)}" x2="${ML+PW}" y2="${Y(100)}" stroke="var(--text-muted)"
+        stroke-width="1.5" stroke-dasharray="5 4"/>`;
+  s+=`<text x="${ML+PW-4}" y="${Y(100)-7}" text-anchor="end" font-size="10" fill="var(--text-muted)">스펙 한계 100%</text>`;
+  s+=`<line x1="${ML}" y1="${Y(70)}" x2="${ML+PW}" y2="${Y(70)}" stroke="var(--series-1)"
+        stroke-width="1.4" stroke-dasharray="7 3" opacity=".75"/>`;
+  s+=`<text x="${ML+PW-4}" y="${Y(70)-7}" text-anchor="end" font-size="10" fill="var(--series-1)">설계 여유 기준 70%</text>`;
+  rows.forEach((b,i)=>{
+    const cx=ML+bw*i+bw/2, v=Math.min(b.peak,YMAX);
+    const over=b.peak>100;
+    s+=`<rect x="${cx-iw/2}" y="${Y(v)}" width="${iw}" height="${MT+PH-Y(v)}"
+          rx="4" fill="${over?'var(--series-2)':'var(--series-1)'}" fill-opacity="${over?.8:.9}"/>`;
+    s+=`<text x="${cx}" y="${Y(v)-9}" text-anchor="middle" font-size="12.5" font-weight="650"
+          fill="var(--text-primary)">${b.peak}%</text>`;
+    s+=`<text x="${cx}" y="${MT+PH+20}" text-anchor="middle" font-size="11.5"
+          fill="var(--text-secondary)">${b.n}개</text>`;
+  });
+  s+=`<text x="${ML+PW/2}" y="${MT+PH+44}" text-anchor="middle" font-size="11"
+        fill="var(--text-muted)">횡이동 모터 수 (3차년도 조건, 토크 ×${D.k})</text>`;
+  document.getElementById('bars').innerHTML=s;
+})();
+</script>

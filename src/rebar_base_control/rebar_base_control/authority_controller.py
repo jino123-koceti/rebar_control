@@ -7,6 +7,8 @@ S10 (S19): Manual 모드 - 리모콘 제어 허용 (횡이동/yaw/시퀀스 등)
 S20: Auto 모드 - UI/Navigator 제어 + 리모콘 S17/S18로 UI 미션 시작/중단
   · S17 → START_MISSION (자율작업 시작)
   · S18 → CANCEL (중단)
+  · S21 → 호밍
+  · S23/S24 → 비전 자율주행 시작/정지 (rebar_drive_node가 직접 처리, 여기선 미처리)
 """
 
 import rclpy
@@ -138,6 +140,8 @@ class AuthorityController(Node):
           · S17 (buttons[2]) → START_MISSION repeat=ON (반복 자율결속, 시연용)
           · S18 (buttons[3]) → CANCEL (반복 중지 + 정지)
           · S21 (buttons[4]) → 호밍 시작 (/homing_cmd "START")
+          · S22 (buttons[5]) → 경로/모드 선택 modifier
+          · S23/S24 → **여기서 처리 안 함**. 비전 자율주행(rebar_drive_node) 전용
         manual 모드에선 무시 (횡이동/Z 등 기존 기능은 joint_controller가 처리).
         """
         if self.current_mode != 'auto':
@@ -153,7 +157,12 @@ class AuthorityController(Node):
 
         s17, s18, s21 = b(2), b(3), b(4)
         s22 = b(5)             # S22=경로/모드 선택 (ON유지=1회 실결속, OFF=무한전시)
-        s23, s24 = b(6), b(7)  # S23=일시중지, S24=재개
+        # S23/S24(buttons[6],[7])는 여기서 처리하지 않는다 —
+        # **비전 자율주행(rebar_drive_node) 전용**: S23=시작, S24=정지.
+        # 예전엔 S23=PAUSE / S24=RESUME이었으나 제거했다(2026-08-06). 그대로 뒀다면
+        # S24("정지")가 navigator에 RESUME을 쏴서 웨이포인트 주행을 되살리고,
+        # rebar_drive_node와 /cmd_vel을 동시에 발행하는 충돌이 났다.
+        # UI의 PAUSE_MISSION/RESUME_MISSION은 navigator에 그대로 남아있다.
 
         if pb(2) == 0 and s17 == 1:
             if s22 == 1:
@@ -174,12 +183,6 @@ class AuthorityController(Node):
         elif pb(4) == 0 and s21 == 1:
             self._publish_homing()
             self.get_logger().info("🏠 [리모콘 AUTO] S21 → 호밍 시작")
-        elif pb(6) == 0 and s23 == 1:
-            self._publish_mission('PAUSE')
-            self.get_logger().info("⏸️ [리모콘 AUTO] S23 → PAUSE (일시중지)")
-        elif pb(7) == 0 and s24 == 1:
-            self._publish_mission('RESUME')
-            self.get_logger().info("▶️ [리모콘 AUTO] S24 → RESUME (재개)")
 
     def _publish_mission(self, command, repeat=None, path=None):
         """UI와 동일한 /mission/command(JSON) 발행. repeat='ON'/'OFF', path=경로파일명 선택."""

@@ -2,7 +2,7 @@
 """
 AprilTag 검출 및 Pose 추정 테스트
 
-zed_front 카메라에서 AprilTag를 검출하고 위치/자세를 추정합니다.
+전방 카메라(zedxmini2)에서 AprilTag를 검출하고 위치/자세를 추정합니다.
 - 태그 ID, 거리, 위치(X,Y,Z), 회전(roll,pitch,yaw) 표시
 - 첫 검출 시 자동 저장 (이미지 + JSON)
 
@@ -11,7 +11,7 @@ zed_front 카메라에서 AprilTag를 검출하고 위치/자세를 추정합니
     python3 detect_apriltag.py
 
     # 다른 카메라
-    python3 detect_apriltag.py --topic /zed_back/zed_node/left/image_rect_color
+    python3 detect_apriltag.py --topic /zedxmini1/zed_node/left/image_rect_color  # 후방
 
     # 저장된 이미지로 테스트
     python3 detect_apriltag.py --image /path/to/image.png
@@ -361,8 +361,8 @@ def main():
     parser.add_argument('--image', '-i', type=str, default=None,
                         help='테스트 이미지 (없으면 ROS2 토픽)')
     parser.add_argument('--topic', '-t', type=str,
-                        default='/zed_back/zed_node/left/image_rect_color',
-                        help='ROS2 이미지 토픽 (default: zed_back, 후진용)')
+                        default='/zedxmini2/zed_node/left/image_rect_color',
+                        help='ROS2 이미지 토픽 (default: zedxmini2 = 전방 카메라)')
     parser.add_argument('--tag-size', type=float, default=0.19,
                         help='태그 전체 크기 m (default: 0.19)')
     parser.add_argument('--family', type=str, default='25h9',

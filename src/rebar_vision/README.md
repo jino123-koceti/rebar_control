@@ -100,6 +100,12 @@ ros2 topic echo /rebar/detection_image
 | Left (zedxmini1) | [-200, +100, 108] | 40 deg | 0 deg | -20 deg |
 | Right (zedxmini2) | [-200, -100, 108] | 40 deg | 0 deg | +20 deg |
 
+> ⚠️ **[2026-08-06]** zedxmini1/2를 좌/우 측면에서 **전방/후방**으로 물리 이동했다
+> (zedxmini2 = 전방, zedxmini1 = 후방). 위 Left/Right 외부파라미터와 아래 토픽 설명의
+> Left/Right 표기는 이전 장착 기준이다. 현재 이 두 카메라는 주행용
+> (`deck_edge_node`의 `front_topic`/`back_topic`)으로 쓰이고, 결속 교차점 검출은
+> Orbbec Gemini 2L이 담당한다. 결속용으로 복귀시키려면 재캘리브가 필요하다.
+
 ### Tying Orchestrator: `config/tying_orchestrator.yaml`
 
 | Parameter | Value | Description |

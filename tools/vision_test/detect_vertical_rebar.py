@@ -16,7 +16,7 @@
 
 사용법:
     python3 detect_vertical_rebar.py --image path/to/image.png
-    python3 detect_vertical_rebar.py  # ROS2 토픽 (zed_back)
+    python3 detect_vertical_rebar.py  # ROS2 토픽 (zedxmini2 = 전방)
 
 키 조작:
     q: 종료
@@ -711,8 +711,8 @@ def main():
     parser.add_argument('--image', '-i', type=str, default=None,
                         help='테스트 이미지 (없으면 ROS2 토픽)')
     parser.add_argument('--topic', '-t', type=str,
-                        default='/zed_back/zed_node/left/image_rect_color',
-                        help='ROS2 이미지 토픽 (default: zed_back)')
+                        default='/zedxmini2/zed_node/left/image_rect_color',
+                        help='ROS2 이미지 토픽 (default: zedxmini2 = 전방 카메라)')
     parser.add_argument('--canny-low', type=int, default=80)
     parser.add_argument('--canny-high', type=int, default=180)
     parser.add_argument('--hough-thresh', type=int, default=50)

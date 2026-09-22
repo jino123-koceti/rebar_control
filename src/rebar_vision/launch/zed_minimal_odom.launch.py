@@ -20,7 +20,7 @@ def generate_launch_description():
     # Launch arguments
     camera_name_arg = DeclareLaunchArgument(
         'camera_name',
-        description='Camera name (e.g., zed_front, zed_back)'
+        description='Camera name (e.g., zedxmini1, zedxmini2)'
     )
 
     serial_number_arg = DeclareLaunchArgument(

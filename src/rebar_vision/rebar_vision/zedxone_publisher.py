@@ -34,8 +34,14 @@ RES_MAP = {
 class ZedXOnePublisher(Node):
     def __init__(self):
         super().__init__('zedxone_publisher')
-        self.declare_parameter('serial_number', 313997679)
-        self.declare_parameter('resolution', 'SVGA')   # 저부하
+        # [2026-08-13] 우측 횡이동 판정용으로 **ZED XOne UHD(4K) SN 319647570** 장착.
+        #   이전 유닛(313997679)은 물리 제거됨 — 그 값이 남아 있어 CAMERA NOT DETECTED가 났다.
+        #   장치 확인: python3 -c "import pyzed.sl as sl; print(sl.CameraOne.get_device_list())"
+        self.declare_parameter('serial_number', 319647570)
+        # [2026-08-13] SVGA는 이 UHD 유닛에서 INVALID RESOLUTION으로 open 실패(설정 목록엔
+        #   있으나 실제 미지원). 4K/QHDPLUS는 불필요하게 큼 — 판정은 512로 다운스케일하므로
+        #   HD1080이면 충분하고 GMSL 부하도 낮다. fps 제약: HD1080은 60/30/15 가능.
+        self.declare_parameter('resolution', 'HD1080')
         self.declare_parameter('fps', 15)
         self.declare_parameter('frame_id', 'zedxone_left_camera_frame')
         self.declare_parameter('open_delay_sec', 25.0)  # 스테레오 안정 대기 후 open

@@ -57,8 +57,8 @@ graph TB
     RC -->|/cmd_vel| DC
 
     %% Pose Source Selection (Dual ZED)
-    ZED1 -->|/zed_front/odom| PM
-    ZED2 -->|/zed_back/odom| PM
+    ZED1 -->|/zedxmini2/zed_node/odom| PM
+    ZED2 -->|/zedxmini1/zed_node/odom| PM
     PM -->|/robot_pose| RC
     PM -.->|/robot_pose| RP
 
@@ -109,8 +109,8 @@ graph TB
 
 ```mermaid
 graph LR
-    ZF[ZED Front<br/>/zed_front/odom]
-    ZB[ZED Back<br/>/zed_back/odom]
+    ZF[ZED X Mini 전방<br/>/zedxmini2/zed_node/odom]
+    ZB[ZED X Mini 후방<br/>/zedxmini1/zed_node/odom]
     CV[/cmd_vel<br/>방향 신호]
 
     PM[pose_mux]

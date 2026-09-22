@@ -19,8 +19,8 @@ Jetson 플랫폼에서 Dual ZED X 카메라(전방/후방)를 활용한 VSLAM �
 | `/mission/waypoint_array` | WaypointArray | 전체 경로 배치 전송 |
 | `/mission/target_pose` | PoseStamped | 개별 웨이포인트 (하위호환) |
 | `/cmd_vel` | Twist | 주행 속도 명령 |
-| `/zed_front/odom` | Odometry | 전방 카메라 VSLAM |
-| `/zed_back/odom` | Odometry | 후방 카메라 VSLAM |
+| `/zedxmini2/zed_node/odom` | Odometry | 전방 카메라 VSLAM |
+| `/zedxmini1/zed_node/odom` | Odometry | 후방 카메라 VSLAM |
 
 ## 핵심 기능
 
@@ -53,9 +53,11 @@ float32[] max_speed      # 최대 속도 (m/s 또는 dps)
 
 ### 4. Dual 카메라 pose_mux
 
-`cmd_vel.linear.x` 부호에 따라 카메라 자동 선택:
-- **양수 (전진)**: `/zed_front/odom` 사용
-- **음수 (후진)**: `/zed_back/odom` 사용 (좌표 변환 적용)
+`cmd_vel.linear.x` 부호에 따라 카메라 자동 선택. 실제 배선은
+`control_system.launch.py`의 `front_odom_topic`/`back_odom_topic`이며,
+**진행방향의 반대편에 달린 카메라**의 VSLAM을 쓴다:
+- **양수 (전진)**: `front_odom_topic` = `/zedxmini1/zed_node/odom` (물리 후방 카메라, 좌표 변환 적용)
+- **음수 (후진)**: `back_odom_topic` = `/zedxmini2/zed_node/odom` (물리 전방 카메라)
 
 후방 카메라 좌표 변환:
 - Position: X → -X, Y → -Y

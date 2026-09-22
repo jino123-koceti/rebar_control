@@ -136,7 +136,7 @@ class RebarController(Node):
 
         # Lateral motion 파라미터
         self.lateral_tolerance = 0.005  # 5mm
-        self.lateral_speed_dps = 200.0  # degrees per second
+        self.lateral_speed_dps = 90.0  # dps. 수동(S17/S18)과 동일 ([[zed_argus_hang_lateral]])
         self.mm_per_rotation = 70.0  # 70mm = 360도 = 1회전 (HW 업그레이드 후, 기존 44mm)
         self.lateral_y_offset = 0.0  # 횡이동 누적 Y 오프셋 (m)
         self.paused = False  # 일시정지(S23) 플래그
@@ -975,8 +975,11 @@ class RebarController(Node):
             return
 
         if self.encoder_pose is None or self.target_pose is None:
-            # 엔코더 odometry 또는 목표가 없으면 정지
-            self.publish_cmd_vel(0.0, 0.0)
+            # 목표가 없다 = 미션을 안 들고 있다 → **cmd_vel을 아예 쏘지 않는다.**
+            # 0을 20Hz로 계속 쏘면 /cmd_vel(last-write-wins)을 점유해, 다른 주행 노드
+            # (비전 자율주행 rebar_drive_node)의 명령 사이사이에 0이 끼어든다.
+            # 실측: 지령 0.05m/s가 실제 4.3mm/s로 떨어졌다(0을 본 비율 ≈57%).
+            # 정지는 drive_controller의 cmd_vel 워치독(0.5s)이 알아서 처리한다.
             return
 
         # 결속 진행 중에는 주행 정지, TYING_COMPLETE 수신 시 다음 WP로 진행

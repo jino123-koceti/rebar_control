@@ -76,7 +76,7 @@ cat << 'EOF' | sudo tee /usr/local/bin/setup_can.sh
 # can2: 모터 제어 (1Mbps)
 if ip link show can2 > /dev/null 2>&1; then
     sudo ip link set can2 down 2>/dev/null
-    sudo ip link set can2 type can bitrate 1000000
+    sudo ip link set can2 type can bitrate 1000000 restart-ms 100  # restart-ms: BUS-OFF 자동복구 (2026-08-18)
     sudo ip link set can2 up
     echo "can2: 1Mbps 설정 완료"
 fi
@@ -84,7 +84,7 @@ fi
 # can3: 리모콘 (250kbps)
 if ip link show can3 > /dev/null 2>&1; then
     sudo ip link set can3 down 2>/dev/null
-    sudo ip link set can3 type can bitrate 250000
+    sudo ip link set can3 type can bitrate 250000 restart-ms 100  # restart-ms: BUS-OFF 자동복구 (2026-08-18)
     sudo ip link set can3 up
     echo "can3: 250kbps 설정 완료"
 fi

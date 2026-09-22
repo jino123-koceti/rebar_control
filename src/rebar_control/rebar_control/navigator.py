@@ -690,9 +690,9 @@ class Navigator(Node):
                 if 'max_speed' in wp:
                     max_speed = wp['max_speed']
                 else:
-                    # 기본값: differential=0.15m/s, lateral=200dps
+                    # 기본값: differential=0.15m/s, lateral=90dps
                     if motion_type == Waypoint.MOTION_LATERAL:
-                        max_speed = 200.0  # dps
+                        max_speed = 90.0  # dps (수동과 동일, [[zed_argus_hang_lateral]])
                     else:
                         max_speed = 0.15  # m/s
 
@@ -1076,13 +1076,24 @@ class Navigator(Node):
         if moved:
             self.stage_moving = True
             self._publish_stage_feedback('stage_moving')
-            # 이동 완료 체크 타이머 (이동 시간 추정 후 완료 처리)
-            self.create_timer(0.5, self._check_stage_move_complete_once)
+            # 이동 완료 체크 타이머 (1회성). ⚠️ create_timer는 반복 타이머라
+            # 콜백에서 반드시 파기해야 함. 기존 타이머 있으면 먼저 파기(누적 폭주 방지).
+            t = getattr(self, '_stage_move_timer', None)
+            if t is not None:
+                self.destroy_timer(t)
+            self._stage_move_timer = self.create_timer(
+                0.5, self._check_stage_move_complete_once)
 
     def _check_stage_move_complete_once(self):
-        """스테이지 이동 완료 체크 (1회성 타이머)"""
-        # 단동 구동은 명령 전송 후 모터가 알아서 이동 완료
-        # 간단한 타이머 기반 완료 처리 (추후 모터 피드백 기반으로 개선 가능)
+        """스테이지 이동 완료 체크 (1회성 — 콜백에서 타이머 파기)."""
+        # ⚠️ create_timer는 반복 타이머 → 반드시 파기해야 1회성.
+        # 미파기 시 0.5Hz로 무한 재발화(과거 [UPPER_BINDING]이동완료 296K줄 폭주 → 프리즈 공범).
+        t = getattr(self, '_stage_move_timer', None)
+        if t is not None:
+            t.cancel()
+            self.destroy_timer(t)
+            self._stage_move_timer = None
+        # 단동 구동은 명령 전송 후 모터가 알아서 이동 완료 (추후 모터 피드백 기반 개선 가능)
         self.stage_moving = False
         self._publish_stage_feedback('stage_move_complete')
         self.get_logger().info("[UPPER_BINDING] 이동 완료")

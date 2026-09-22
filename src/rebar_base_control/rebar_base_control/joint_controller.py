@@ -38,6 +38,16 @@ class JointController(Node):
         # Parameters - 횡이동 (0x143)
         self.declare_parameter('lateral_step_deg', 360.0)
         self.declare_parameter('lateral_max_speed', 200.0)
+        # ⚠️ [2026-08-18] 횡이동 미도달 보호. 0x143은 위치명령(0xA4)이라 목표에
+        #   도달할 때까지 **최대 토크로 계속 버틴다**. 0xB3 워치독도 안 걸려 있어
+        #   스스로 안 풀린다(스테이지·낙하 위험 때문에 못 건다).
+        #   실제로 이날 철근을 못 넘고 버티다 **모터에서 타는 냄새**가 났고,
+        #   드라이버에 스톨 알람(0x0002)이 래치됐다.
+        #   → 제한시간 내 미도달이면 **출발 위치로 되돌린다**(토크를 끊지 않는다.
+        #     0x80으로 힘을 빼면 들려 있던 기구가 낙하한다).
+        #   정상 1회전 소요 약 5.5초(80dps) → 기본 15초. ([[robot_freeze_safety]])
+        self.declare_parameter('lateral_timeout_sec', 8.0)   # 0=비활성
+        self.declare_parameter('lateral_return_speed', 60.0)  # 복귀 속도(dps)
         # Parameters - Yaw (0x147)
         self.declare_parameter('yaw_step_deg', 10.0)
         self.declare_parameter('yaw_max_speed', 134.0)
@@ -68,6 +78,8 @@ class JointController(Node):
 
         self.lateral_step = self.get_parameter('lateral_step_deg').value
         self.lateral_speed = self.get_parameter('lateral_max_speed').value
+        self.lateral_timeout = float(self.get_parameter('lateral_timeout_sec').value)
+        self.lateral_return_speed = float(self.get_parameter('lateral_return_speed').value)
         self.yaw_step = self.get_parameter('yaw_step_deg').value
         self.yaw_speed = self.get_parameter('yaw_max_speed').value
         self.command_interval = self.get_parameter('command_interval').value
@@ -157,6 +169,25 @@ class JointController(Node):
             Bool, '/emergency_stop', self._emergency_stop_callback, 10)
         self.emergency_stopped = False
 
+        # 범퍼 차단 수신 (bumper_node) — **자동 횡이동만** 막는다.
+        # 수동(리모콘 S17/S18)은 막지 않는다: 부딪힌 뒤 사람이 빼낼 수단은 남겨야 한다.
+        # ⚠ 부호↔방향 매핑: 2026-08-13 실측으로 **음수 회전 = 좌측**이 확정됐다
+        #   (rebar_drive_node `lateral_sign=-1` 주석 참조 — 그 전엔 반대로 알고 있었고,
+        #    그 탓에 "좌측 가능" 판정을 보면서 실제로는 우측으로 밀고 갔다).
+        #   기구를 손보면 `lateral_negative_is_left`로 뒤집고 눈으로 재확인할 것.
+        self.declare_parameter('bumper_block_enabled', True)
+        self.declare_parameter('bumper_block_timeout_sec', 1.5)
+        self.declare_parameter('lateral_negative_is_left', True)
+        self.bumper_block_enabled = self.get_parameter('bumper_block_enabled').value
+        self.bumper_block_timeout = float(
+            self.get_parameter('bumper_block_timeout_sec').value)
+        self.lateral_neg_is_left = bool(
+            self.get_parameter('lateral_negative_is_left').value)
+        self.bumper_block = None
+        self.last_bumper_block_time = None
+        self.create_subscription(
+            String, '/bumper_block', self._recv_bumper_block, 10)
+
         # 호밍 레퍼런스 수신 (homing_controller가 발행)
         self.homing_references = {}
         self.create_subscription(
@@ -179,6 +210,21 @@ class JointController(Node):
         # 360° 회전 명령 전송 후 settling time (모터가 움직이기 시작할 때까지 대기)
         self.auto_lateral_command_time = None  # 명령 전송 시간 (monotonic)
         self.auto_lateral_settling_time = 0.5  # 명령 전송 후 0.5초 동안 완료 체크 안함
+
+        # ── 횡이동 미도달 감시 (manual/auto 공통) ──────────────────
+        # 어느 경로로 보낸 명령이든 여기에 등록해서 하나의 워치독이 본다.
+        self._lat_watch_target = None    # 목표 0x92 멀티턴 각도
+        self._lat_watch_start = None     # 출발 0x92 각도 (복귀 지점)
+        self._lat_watch_t0 = None        # 명령 시각 (monotonic)
+        self._lat_watch_tag = ''         # 로그용 (MANUAL/AUTO)
+        self._lat_returning = False      # 복귀 명령 수행 중 (재귀 방지)
+        # 드라이버가 보고한 알람(0x9A errorState). 스톨=0x0002.
+        # ⚠ 스톨이 뜨면 드라이버가 **출력을 끊는다**(실측: 손으로 축이 돌아감).
+        #   그 상태에선 위치명령이 안 먹으므로 **0x76 리셋이 먼저**여야 한다.
+        #   따라서 타임아웃(15초)을 기다리면 늦다 — 알람 즉시 반응한다.
+        self._lat_alarm = 0
+        self._lat_recover_stage = None   # None | 'reset' | 'return'
+        self._lat_recover_t = 0.0
 
         # Manual 모드: 누적 추적 없음 (싱글턴 엔코더 기반)
 
@@ -454,6 +500,10 @@ class JointController(Node):
                 # Auto 모드 횡이동 완료 감지
                 self._check_lateral_completion()
 
+            elif msg.status == 0x9A:
+                # 드라이버가 보고한 알람. 스톨(0x0002)이면 출력이 이미 끊긴 상태다.
+                self._lat_alarm = int(msg.error_code)
+
         # 3축 스테이지 피드백 처리 (0x44=X, 0x45=Y, 0x46=Z, 0x47=Yaw)
         elif msg.motor_id == 0x44:  # 0x144 X축
             if msg.status == 0x92:
@@ -507,12 +557,16 @@ class JointController(Node):
             self._request_single_turn_encoder(0x143)  # 0x90 요청
             self._request_single_circle_angle(0x143)  # 0x94 요청
             self._request_output_angle(0x143)  # 0x92 요청
+            self._request_motor_status(0x143)  # 0x9A 요청 (스톨 알람 감시)
             # 3축 스테이지 (0x144~0x146) + Yaw (0x147)
             self._request_output_angle(0x144)  # X축 0x92 요청
             self._request_output_angle(0x145)  # Y축 0x92 요청
             self._request_output_angle(0x146)  # Z축 0x92 요청
             self._request_output_angle(0x147)  # Yaw 0x92 요청
             self.last_angle_request_time = current_time
+
+        # 횡이동 미도달 감시 — manual/auto 모두. 완료 감지보다 먼저 본다.
+        self._check_lateral_stall()
 
         # Auto 모드: 횡이동 완료 감지만 수행 (리모콘 입력 무시)
         if self.control_mode == 'auto':
@@ -623,6 +677,9 @@ class JointController(Node):
             self.lateral_speed,
             f'12시 정렬 + {direction}{self.lateral_step:.0f}° 횡이동'
         )
+        # 미도달 감시 등록 — 복귀 지점은 **명령 직전 위치**(nearest_home 아님).
+        # 12시 정렬 자체가 실패할 수도 있으므로 실제 출발점으로 되돌린다.
+        self._arm_lateral_watch(target_angle, current_angle, 'MANUAL')
 
         # 횡이동 방향/거리 발행 (rebar_publisher에서 position.y 업데이트용)
         turns = self.lateral_step / 360.0
@@ -716,6 +773,29 @@ class JointController(Node):
         request_msg.position = 0.0
         request_msg.velocity = 0.0
         request_msg.control_mode = 0x92
+        self.encoder_request_pub.publish(request_msg)
+
+    def _request_motor_status(self, motor_id):
+        """0x9A 상태 읽기 요청 — errorState(알람 비트)를 받기 위함."""
+        request_msg = JointControl()
+        request_msg.joint_id = motor_id
+        request_msg.position = 0.0
+        request_msg.velocity = 0.0
+        request_msg.control_mode = 0x9A
+        self.encoder_request_pub.publish(request_msg)
+
+    def _send_system_reset(self, motor_id):
+        """0x76 System Reset — 래치된 알람을 푸는 **유일한** 수단.
+
+        0x80/0x88/0x9B 조합으로는 안 풀리는 것을 실측 확인(2026-08-18).
+        드라이버가 재기동되지만 0x92 멀티턴 위치는 유지된다(실측).
+        재기동에 약 2~3초 걸리므로 그동안 명령을 보내면 안 된다.
+        """
+        request_msg = JointControl()
+        request_msg.joint_id = motor_id
+        request_msg.position = 0.0
+        request_msg.velocity = 0.0
+        request_msg.control_mode = 0x76
         self.encoder_request_pub.publish(request_msg)
 
     def _request_single_circle_angle(self, motor_id):
@@ -928,6 +1008,49 @@ class JointController(Node):
             f'{name}: 0x{joint_id:03X} {direction}{delta_deg:.1f}° @ {velocity:.0f} dps (REL)'
         )
 
+    def _recv_bumper_block(self, msg: String):
+        """범퍼 방향별 차단 수신 (bumper_node)."""
+        import json
+        try:
+            d = json.loads(msg.data)
+        except (ValueError, TypeError) as e:
+            self.get_logger().error(f'bumper_block 파싱 실패: {e}',
+                                    throttle_duration_sec=5.0)
+            return                                  # 직전 상태 유지 (fail-safe)
+        self.bumper_block = {k: bool(d.get(k, False))
+                             for k in ('forward', 'backward', 'left', 'right')}
+        self.bumper_block['reason'] = str(d.get('reason', ''))
+        self.last_bumper_block_time = time.monotonic()
+
+    def _lateral_bumper_blocked(self, rotation_deg):
+        """이 방향으로 횡이동해도 되는가. 막아야 하면 True.
+
+        신호가 stale이면 **직전 차단 상태를 유지**한다 — 범퍼를 못 읽는 채로
+        옆으로 미는 것보다 서 있는 편이 안전하고, 리모콘으로 빼낼 수 있다.
+        """
+        if not self.bumper_block_enabled or self.bumper_block is None:
+            return False                            # 노드 미실행 = 기존 동작 그대로
+
+        if (self.last_bumper_block_time is not None
+                and self.bumper_block_timeout > 0):
+            age = time.monotonic() - self.last_bumper_block_time
+            if age > self.bumper_block_timeout:
+                self.get_logger().error(
+                    f'⚠ bumper_block {age:.1f}s 끊김 → 마지막 차단상태 유지',
+                    throttle_duration_sec=5.0)
+
+        if rotation_deg == 0:
+            return False
+        neg = rotation_deg < 0
+        side = 'left' if (neg == self.lateral_neg_is_left) else 'right'
+        if self.bumper_block.get(side):
+            self.get_logger().warn(
+                f"🛑 범퍼: {'좌' if side == 'left' else '우'}측 횡이동 차단 "
+                f"({self.bumper_block.get('reason', '')})",
+                throttle_duration_sec=1.0)
+            return True
+        return False
+
     def _handle_auto_lateral_motion(self, msg: JointControl):
         """
         Auto 모드에서 횡이동 명령 처리 (12시 정렬 + N회전 일괄)
@@ -937,6 +1060,12 @@ class JointController(Node):
         Args:
             msg: JointControl 메시지 (position은 ±N*360° 회전 각도)
         """
+        # ★ 범퍼 게이트 — 그쪽에 이미 부딪혔으면 애초에 명령을 만들지 않는다.
+        #   진행 플래그를 세우기 **전에** 거부해야 상태가 어긋나지 않는다.
+        #   상위(rebar_drive_node)는 자체 타임아웃으로 실패 처리하고 재판정한다.
+        if self._lateral_bumper_blocked(msg.position):
+            return
+
         # 현재 0x92 멀티턴 각도 필요
         if self.current_angle_deg is None:
             self._request_output_angle(0x143)
@@ -972,6 +1101,7 @@ class JointController(Node):
         self.auto_lateral_in_progress = True
         self.auto_lateral_rotation_deg = rotation_deg  # 완료 시 발행용
         self.auto_lateral_start_angle = current_angle  # 회전 추적 시작
+        self._arm_lateral_watch(target_angle, current_angle, 'AUTO')
         self.auto_lateral_completed_turns = 0  # 발행 카운터 리셋
         # 명령 전송 시간 기록 (settling time용 - 모터가 움직이기 시작할 때까지 대기)
         self.auto_lateral_command_time = time.monotonic()
@@ -987,14 +1117,146 @@ class JointController(Node):
             f"{rotation_deg:+.0f}° → {target_angle:.1f}° ({turns:.0f}회전 일괄)"
         )
 
+        # ★ [2026-09-02] 자율 횡이동 속도를 **수동과 같은 상한**으로 조인다.
+        #   왜: 수동(S17/S18)은 lateral_max_speed=90dps인데 자율 상위노드들은
+        #   200dps를 보내고 있었다(운동에너지 4.9배). 200dps 첫 회전 3초 뒤
+        #   ZED 3대가 Argus 먹통으로 전멸했다([[zed_argus_hang_lateral]]).
+        #   상위 노드가 여럿(rebar_drive_node/navigator/rebar_controller)이라
+        #   각자 고쳐도 새는 곳이 생긴다 → **명령이 나가는 길목에서 한 번에** 막는다.
+        vel = msg.velocity
+        if vel > self.lateral_speed:
+            self.get_logger().warn(
+                f'⚠ [Auto] 횡이동 속도 제한: {vel:.0f} → {self.lateral_speed:.0f} dps '
+                f'(lateral_max_speed)')
+            vel = self.lateral_speed
+
         self._send_joint_command_abs(
             0x143,
             target_angle,
-            msg.velocity,
+            vel,
             f'[Auto] 12시 정렬 + {rotation_deg:+.0f}° 횡이동'
         )
 
         self.last_command_time = self.get_clock().now()
+
+    def _arm_lateral_watch(self, target_angle, start_angle, tag):
+        """횡이동 명령을 미도달 감시에 등록한다 (manual/auto 공통 진입점)."""
+        if self.lateral_timeout <= 0:
+            return
+        self._lat_watch_target = target_angle
+        self._lat_watch_start = start_angle
+        self._lat_watch_t0 = time.monotonic()
+        self._lat_watch_tag = tag
+
+    def _disarm_lateral_watch(self):
+        self._lat_watch_target = None
+        self._lat_watch_start = None
+        self._lat_watch_t0 = None
+        self._lat_returning = False
+        self._lat_recover_stage = None
+
+    def _check_lateral_stall(self):
+        """제한시간 내 목표 미도달이면 **출발 위치로 복귀**시킨다.
+
+        ⚠ 토크를 끊지 않는다(0x80/0x81 금지). 횡이동은 로봇을 들어 올리는
+          동작이라 힘을 빼면 그대로 낙하한다. 폐루프를 유지한 채 되돌려야
+          부하도 풀리고 안전하게 착지한다.
+        복귀 후에도 드라이버의 스톨 알람(0x0002)은 래치돼 남는다 —
+        해제는 `0x76 System Reset`이 필요하다(0x80/0x88/0x9B로는 안 풀림, 실측).
+        """
+        # ── 0) 복구 상태머신: 0x76 리셋 → 재기동 대기 → 복귀 명령 ──
+        if self._lat_recover_stage == 'reset':
+            if time.monotonic() - self._lat_recover_t < 3.0:
+                return                      # 드라이버 재기동 대기 (약 2~3초)
+            if self._lat_alarm & 0x0002:
+                self.get_logger().error(
+                    "🛑 [횡이동] 0x76 리셋 후에도 스톨 알람이 남아 있다. "
+                    "기구가 물렸을 수 있으니 사람이 확인할 것.")
+                fail = String(); fail.data = f"FAIL:{self._lat_watch_tag}:ALARM"
+                self.lateral_complete_pub.publish(fail)
+                self._lat_recover_stage = None
+                self._disarm_lateral_watch()
+                self.auto_lateral_in_progress = False
+                return
+            back = self._lat_watch_start
+            self.get_logger().warn(
+                f"↩️ [횡이동] 알람 해제됨 → 출발 위치 {back:.1f}° 로 복귀")
+            self._send_joint_command_abs(
+                0x143, back, self.lateral_return_speed, '스톨 복귀')
+            self._lat_watch_target = back
+            self._lat_watch_t0 = time.monotonic()
+            self._lat_returning = True
+            self._lat_recover_stage = 'return'
+            return
+
+        if self._lat_watch_t0 is None or self.lateral_timeout <= 0:
+            return
+
+        # ── 1) 스톨 알람 즉시 반응 (타임아웃보다 먼저 뜬다) ──
+        #   드라이버가 출력을 끊은 상태라 위치명령이 안 먹는다 → 리셋이 먼저.
+        if (self._lat_alarm & 0x0002) and self._lat_recover_stage is None:
+            self.get_logger().error(
+                f"⚠️ [{self._lat_watch_tag}] 횡이동 스톨 알람(0x{self._lat_alarm:04X}) "
+                f"— 목표 미도달. 0x76 리셋 후 출발 위치로 복귀한다.")
+            fail = String(); fail.data = f"FAIL:{self._lat_watch_tag}:STALL"
+            self.lateral_complete_pub.publish(fail)
+            self.auto_lateral_in_progress = False
+            self._send_system_reset(0x143)
+            self._lat_recover_stage = 'reset'
+            self._lat_recover_t = time.monotonic()
+            return
+
+        if self.current_angle_deg is None:
+            return
+
+        err = abs(self.current_angle_deg - self._lat_watch_target)
+        if err <= self.auto_lateral_complete_tol_deg:
+            self._disarm_lateral_watch()          # 정상 도달
+            return
+
+        if time.monotonic() - self._lat_watch_t0 < self.lateral_timeout:
+            return
+
+        if self._lat_returning:
+            # 복귀가 안 됐다. 십중팔구 그 사이 스톨이 떠서 **드라이버가 출력을 끊은** 것이다
+            # (실측 2026-08-18: 타임아웃 → 복귀명령 → 그 직후 스톨 → 복귀 0°도 못 감).
+            # 알람 비트가 안 보이더라도 리셋을 한 번은 시도한다. 포기는 그 다음이다.
+            if self._lat_recover_stage is None:
+                self.get_logger().error(
+                    f"⚠️ [{self._lat_watch_tag}] 복귀 미진행 "
+                    f"(현재 {self.current_angle_deg:.1f}°, 목표 {self._lat_watch_target:.1f}°) "
+                    f"— 출력이 끊긴 것으로 보고 0x76 리셋 후 재복귀한다.")
+                self._send_system_reset(0x143)
+                self._lat_recover_stage = 'reset'
+                self._lat_recover_t = time.monotonic()
+                return
+            self.get_logger().error(
+                f"🛑 [{self._lat_watch_tag}] 리셋 후 재복귀도 실패 "
+                f"(현재 {self.current_angle_deg:.1f}°). 기구가 물렸다 — 사람이 확인할 것.")
+            fail = String()
+            fail.data = f"FAIL:{self._lat_watch_tag}:STUCK"
+            self.lateral_complete_pub.publish(fail)
+            self._disarm_lateral_watch()
+            self.auto_lateral_in_progress = False
+            return
+
+        # 1차 미도달 → 출발 위치로 복귀
+        back = self._lat_watch_start
+        self.get_logger().error(
+            f"⚠️ [{self._lat_watch_tag}] 횡이동 미도달 {self.lateral_timeout:.0f}초 초과 "
+            f"(현재 {self.current_angle_deg:.1f}°, 목표 {self._lat_watch_target:.1f}°) "
+            f"→ 출발 위치 {back:.1f}° 로 복귀")
+        self._send_joint_command_abs(
+            0x143, back, self.lateral_return_speed, '미도달 복귀')
+        # 복귀도 같은 워치독으로 감시한다 (목표만 출발점으로 바꿔서 재무장)
+        self._lat_watch_target = back
+        self._lat_watch_t0 = time.monotonic()
+        self._lat_returning = True
+        # 상위 노드에 실패 통보 — 완료 신호를 기다리며 멈춰 있지 않도록
+        fail = String()
+        fail.data = f"FAIL:{self._lat_watch_tag}:TIMEOUT"
+        self.lateral_complete_pub.publish(fail)
+        self.auto_lateral_in_progress = False
 
     def _check_lateral_completion(self):
         """
@@ -1011,8 +1273,13 @@ class JointController(Node):
         if not self.auto_lateral_in_progress:
             return
 
-        if self.auto_lateral_target_encoder is None or self.current_encoder is None:
-            return
+        # ⚠ 여기에 `auto_lateral_target_encoder`/`current_encoder`(0x90) 가드를 두면 안 된다
+        #   (2026-09-15 실주행 ABORT 원인). 아래 실제 판정은 **0x92 멀티턴만** 쓰는데,
+        #   0x90 방식을 폐기하면서 가드만 남아 판정 자체가 실행되지 못했다.
+        #   `home_encoder`는 기구가 12시(0x94≈home_angle_94)에 있는 순간에만 설정되므로,
+        #   그 자리를 안 지나고 기동하면 None인 채로 남는다 → 자율 횡이동이 **매번 첫 회에
+        #   완료신호 없이 30s ABORT**. 실제로 rebar_drive가 그렇게 멈췄다.
+        #   0x90은 로깅/참고용이다.
 
         # Settling time 체크: 명령 전송 후 일정 시간 동안 완료 체크 안함
         # (모터가 움직이기 시작할 때까지 대기, 12시 위치에서 바로 완료 판정 방지)
@@ -1066,6 +1333,7 @@ class JointController(Node):
             self.auto_lateral_command_time = None
             self.auto_lateral_start_angle = None
             self.auto_lateral_completed_turns = 0
+            self._disarm_lateral_watch()
 
     def _check_home_alignment_completion(self):
         """

@@ -14,6 +14,7 @@ from std_msgs.msg import String
 import can
 import struct
 import threading
+import time
 import json
 
 # RMD-X4 모터 에러 코드 (데이터시트 기준)
@@ -51,6 +52,7 @@ class CANParser(Node):
         remote_interface = self.get_parameter('remote_can_interface').value
         motor_bitrate = self.get_parameter('motor_can_bitrate').value
         remote_bitrate = self.get_parameter('remote_can_bitrate').value
+        self._remote_iface, self._remote_bitrate = remote_interface, remote_bitrate
 
         # ROS2 Publishers
         self.motor_feedback_pub = self.create_publisher(
@@ -102,7 +104,8 @@ class CANParser(Node):
             )
             self.motor_thread.start()
 
-        if self.bus_remote:
+        # 시작 때 수신기가 없어도 스레드는 띄운다 → 나중에 꽂히면 재연결 루프가 잡는다.
+        if True:
             self.remote_thread = threading.Thread(
                 target=self._remote_receive_loop,
                 daemon=True
@@ -122,14 +125,41 @@ class CANParser(Node):
                 self.get_logger().error(f"모터 CAN 수신 오류: {e}")
 
     def _remote_receive_loop(self):
-        """리모콘 CAN 메시지 수신 루프 (CAN3)"""
+        """리모콘 CAN 메시지 수신 루프 (CAN3)
+
+        ★ 2026-09-22 수신 오류가 나면 1초 쉬고 버스를 **다시 연다.**
+          리모콘 수신기는 USB 허브 경유라, 허브가 EMI로 포트를 껐다 켜면(같은 날 트리거
+          USB에서 7회 실측) 장치는 can3로 다시 잡히는데 옛 소켓은 영원히 오류 → 예전엔
+          쉬지도 않고 오류 로그만 무한 반복하며 서비스 재시작 전까지 리모콘 먹통이었다.
+          (정지는 drive_controller 워치독 0.3s가 책임진다.)
+        """
         while self.running:
             try:
+                if self.bus_remote is None:
+                    raise OSError('버스 없음')
                 msg = self.bus_remote.recv(timeout=1.0)
                 if msg:
                     self._parse_remote_control(msg)
             except Exception as e:
-                self.get_logger().error(f"리모콘 CAN 수신 오류: {e}")
+                self.get_logger().error(f"리모콘 CAN 수신 오류: {e} → 1초 후 재연결",
+                                        throttle_duration_sec=5.0)
+                time.sleep(1.0)
+                self._reopen_remote()
+
+    def _reopen_remote(self):
+        try:
+            if self.bus_remote is not None:
+                self.bus_remote.shutdown()
+        except Exception:
+            pass
+        self.bus_remote = None
+        try:
+            self.bus_remote = can.Bus(self._remote_iface, bustype='socketcan',
+                                      bitrate=self._remote_bitrate)
+            self.get_logger().warn(f"✅ {self._remote_iface} 재연결 성공")
+        except Exception as e:
+            self.get_logger().error(f"{self._remote_iface} 재연결 실패: {e}",
+                                    throttle_duration_sec=5.0)
 
     def _parse_motor_feedback(self, can_msg):
         """
@@ -222,8 +252,17 @@ class CANParser(Node):
                 return
 
             # 0x94: Single-Circle Angle (0.01 deg/LSB, 0~360°)
+            #   ⚠ **DATA[4:8] uint32**다. 구형 문서의 DATA[6:8] uint16이 아니다
+            #     (2026-09-15 원시응답 실측). 이 펌웨어(V4.4)는 0x92와 같은 위치·폭으로
+            #     답한다:  0x94 → [94,00,00,00, 1C,08,00,00] = 0x081C = 20.76°
+            #     DATA[6:8]을 읽으면 **항상 0x0000 = 0.00°**가 나온다.
+            #   그래서 여태 `current_angle_94`가 0.00으로 고정돼 있었고,
+            #     · `_calibrate_home_position_once`의 12시 판정이 영원히 실패 →
+            #       `home_encoder`가 None으로 남았다(로그에 '🏠 Home encoder set' 0회)
+            #     · `_check_home_alignment_completion`(12시 정렬 대기)도 못 끝난다
+            #   같은 계열의 선례: 0x30(PID)도 index+float32로 형식이 달랐다(2026-09-14).
             if command_type == 0x94:
-                angle_raw = struct.unpack('<H', data[6:8])[0]  # uint16, 0.01°/LSB
+                angle_raw = struct.unpack('<I', data[4:8])[0]  # uint32, 0.01°/LSB
                 angle_deg = angle_raw * 0.01
 
                 feedback_msg = MotorFeedback()
@@ -241,6 +280,36 @@ class CANParser(Node):
                 if motor_id in [0x43, 0x44, 0x45, 0x46, 0x47]:
                     self.get_logger().debug(
                         f"[0x94 RX 0x2{motor_id:02X}] angle:{angle_deg:.2f}° raw:{angle_raw}"
+                    )
+                return
+
+            # ⚠️ [2026-08-18] 0x9A: Read Motor Status 1 — **모터가 보고한 알람**.
+            #   여태 error_code는 can_parser가 전류·온도로 자체 판정한 값이라
+            #   모터 실제 알람(스톨/과전류/과열)을 못 보고 있었다.
+            #   횡이동(0x143)이 철근을 못 넘고 버티면 드라이버가 스톨(0x0002)을 띄우고
+            #   **출력을 끊는데**, 상위는 그걸 몰라 완료 신호만 기다렸다.
+            #   응답: [0x9A, temp, MOStemp, brake, volt_lo, volt_hi, err_lo, err_hi]
+            #   status=0x9A로 실어 보내 자체판정 error_code와 구분한다.
+            if command_type == 0x9A:
+                temperature = struct.unpack('b', bytes([data[1]]))[0]
+                error_state = struct.unpack('<H', bytes(data[6:8]))[0]
+                voltage_v = struct.unpack('<H', bytes(data[4:6]))[0] / 10.0
+
+                feedback_msg = MotorFeedback()
+                feedback_msg.motor_id = motor_id
+                feedback_msg.current_speed = 0.0
+                feedback_msg.current_position = float(voltage_v)  # 버스 전압(V)
+                feedback_msg.current_current = 0
+                feedback_msg.temperature = temperature
+                feedback_msg.error_code = error_state   # ★ 모터가 보고한 알람 비트
+                feedback_msg.status = command_type
+                self.motor_feedback_pub.publish(feedback_msg)
+
+                if error_state:
+                    self.get_logger().warn(
+                        f"⚠️ 모터 0x{motor_id + 0x100:03X} 알람 0x{error_state:04X} "
+                        f"(temp {temperature}°C, bus {voltage_v:.1f}V)",
+                        throttle_duration_sec=2.0
                     )
                 return
 

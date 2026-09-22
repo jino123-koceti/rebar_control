@@ -1,5 +1,11 @@
 # 카메라 외부 파라미터 설정 (비전 기반 철근 교차점 검출)
 # 위치: mm (로봇 기준), 회전: degrees [pitch, roll, yaw]
+#
+# ⚠️ [2026-08-06] zedxmini1/2를 좌/우 측면 → 전방/후방으로 물리 이동
+#    (zedxmini2=전방, zedxmini1=후방). 아래 left_camera/right_camera 외부파라미터는
+#    이전 좌/우 장착 기준이라 현재 물리 배치와 맞지 않는다 (= 캘리브 무효).
+#    현재 rebar_detection_node는 full_system.launch.py에서 비활성(orbbec 검출로 전환)이라
+#    실사용 영향은 없음. 결속용 zedxmini 복귀 시 재캘리브 필수.
 
 rebar_detection_node:
   ros__parameters:

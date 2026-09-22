@@ -110,6 +110,30 @@ class EziIoController(Node):
         # 이전 상태 저장 (변화 감지용)
         self.previous_limits = {}
 
+        # ⚠️ [2026-08-19] 읽기 실패 시 **자동 재연결**.
+        #   사고: 12:16 연결이 끊긴 뒤 `Failed to read inputs`를 **27,538회** 찍으며
+        #   재연결을 한 번도 시도하지 않았다. 노드는 살아 있고 토픽도 등록돼 있어
+        #   겉보기엔 정상이었으나 **리미트 데이터가 전혀 발행되지 않았고**,
+        #   그 상태에서 호밍이 x_min을 향해 30초간 계속 이동해 **리미트를 뚫었다.**
+        #   보드는 내내 정상이었다(ping·TCP 2001 모두 응답).
+        #   → 연속 실패가 임계를 넘으면 연결을 닫고 다시 맺는다.
+        self._read_fail = 0
+        self._reconnect_after = 5        # 연속 실패 이 횟수 넘으면 재연결
+        self._reconnect_backoff = 1.0    # 재연결 최소 간격(초) — 폭주 방지
+        self._last_reconnect = 0.0
+        self._down_since = None          # 통신 두절이 시작된 시각
+        # ★ [2026-09-02] 일정 시간 복구 못 하면 **스스로 죽는다**.
+        #   실측: 보드는 멀쩡한데(새 프로세스로는 즉시 연결·읽기 성공) 이 프로세스
+        #   안에서는 FAS_Close→재연결로 복구가 안 됐다. FASTECH 라이브러리의
+        #   프로세스 전역 상태가 꼬이면 **프로세스를 새로 띄우는 것 말고 방법이 없다.**
+        #   그런데 노드는 살아 있어 launch가 되살리지도 않는다 →
+        #   **39시간을 좀비로 버티며 284만 회 읽기 실패**했다(2026-09-02 실측).
+        #   그동안 리미트 토픽이 전혀 안 나가 호밍이 계속 거부됐다.
+        #   장비 전원 OFF는 상시 상황이라 너무 짧으면 재시작만 반복한다 → 120초.
+        #   0이면 기능 끔(= 옛 동작, 무한 좀비).
+        self.declare_parameter('exit_after_down_sec', 120.0)
+        self._exit_after = float(self.get_parameter('exit_after_down_sec').value)
+
         ip_str_display = '.'.join(map(str, self.ip_address))
         self.get_logger().info(f'EZI-IO Controller started: {ip_str_display}')
         self.get_logger().info(f'Limit channels: {self.limit_channels}')
@@ -130,7 +154,8 @@ class EziIoController(Node):
             )
 
             if result == 0:
-                self.get_logger().error('Failed to connect to EZI-IO')
+                self.get_logger().error('Failed to connect to EZI-IO',
+                                        throttle_duration_sec=5.0)
                 return False
 
             ip_str = '.'.join(map(str, self.ip_address))
@@ -142,22 +167,72 @@ class EziIoController(Node):
             self.get_logger().error(f'EZI-IO connection error: {e}')
             return False
 
+    def _try_reconnect(self):
+        """읽기가 연속 실패하면 연결을 닫고 다시 맺는다.
+
+        ⚠ 재연결 폭주를 막으려고 최소 간격(_reconnect_backoff)을 둔다 —
+          보드가 완전히 죽은 경우 매 주기 접속을 시도하면 로그와 CPU만 낭비한다.
+        """
+        import time as _t
+        now = _t.time()
+        if now - self._last_reconnect < self._reconnect_backoff:
+            return
+        self._last_reconnect = now
+        self.get_logger().warn(
+            f'입력 읽기 {self._read_fail}회 연속 실패 → EZI-IO 재연결 시도')
+        try:
+            FAS_Close(self.board_id)                 # 남은 세션 정리 (실패해도 무시)
+        except Exception:
+            pass
+        self.connected = False
+        if self.connect_device():
+            self.get_logger().info('✅ EZI-IO 재연결 성공')
+            self._read_fail = 0
+            self._down_since = None
+        else:
+            if self._down_since is None:
+                self._down_since = now
+            down = now - self._down_since
+            self.get_logger().error(
+                f'❌ EZI-IO 재연결 실패 ({down:.0f}s 두절) — 다음 주기에 재시도',
+                throttle_duration_sec=5.0)
+            if self._exit_after > 0 and down > self._exit_after:
+                self.get_logger().fatal(
+                    f'🛑 {down:.0f}s 복구 실패 → **노드 종료.** 프로세스를 새로 '
+                    f'띄워야만 복구되는 경우가 있다(FASTECH 전역상태). launch가 되살린다.')
+                raise SystemExit(1)
+
     def read_inputs_callback(self):
         """입력 상태 읽기 및 발행"""
         if not _FASTECH_AVAILABLE:
             return
 
         if not self.connected:
-            if not self.connect_device():
-                return
+            # ⚠ [2026-09-02] 여기서 매 주기(20Hz) 무제한 재접속을 하고 있었다.
+            #   보드가 죽으면 30초에 600줄이 쌓여 **진짜 오류를 파묻는다**.
+            #   backoff를 가진 _try_reconnect로 일원화한다.
+            self._read_fail += 1
+            self._try_reconnect()
+            return
 
         try:
             # FAS_GetInput으로 입력 읽기 (모터 드라이버/IO 공용)
             status_result, input_status, latch_status = FAS_GetInput(self.board_id)
 
             if status_result != FMM_OK:
-                self.get_logger().warn(f'Failed to read inputs (error: {status_result})')
+                self._read_fail += 1
+                self.get_logger().warn(
+                    f'Failed to read inputs (error: {status_result}) '
+                    f'연속 {self._read_fail}회',
+                    throttle_duration_sec=2.0)
+                if self._read_fail >= self._reconnect_after:
+                    self._try_reconnect()
                 return
+
+            if self._read_fail:                      # 정상 복귀
+                self.get_logger().info(
+                    f'✅ 입력 읽기 복구됨 (실패 {self._read_fail}회 후)')
+                self._read_fail = 0
 
             # 리미트 센서 상태 발행
             for name, channel in self.limit_channels.items():
@@ -182,10 +257,11 @@ class EziIoController(Node):
             self.publish_diagnostics(input_status)
 
         except Exception as e:
-            self.get_logger().error(f'Error reading inputs: {e}')
-            # 재연결 시도
+            self.get_logger().error(f'Error reading inputs: {e}',
+                                    throttle_duration_sec=5.0)
             self.connected = False
-            self.connect_device()
+            self._read_fail += 1
+            self._try_reconnect()          # backoff 있는 경로로 일원화
 
     def publish_diagnostics(self, input_status):
         """진단 정보 발행"""

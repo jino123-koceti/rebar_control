@@ -51,8 +51,17 @@ def generate_launch_description():
             name='pose_mux',
             output='screen',
             parameters=[{
-                'front_odom_topic': '/zed_back/zed_node/odom',
-                'back_odom_topic': '/zed_front/zed_node/odom',
+                # [2026-08-06] 주행 카메라 교체: zed_front/zed_back(ZED X) → zedxmini1/2.
+                #   zedxmini2 = 물리 전방, zedxmini1 = 물리 후방 (시야 스냅샷으로 확인).
+                #   슬롯 이름은 '진행방향' 기준이고, 진행방향 반대편 카메라의 VSLAM을 쓴다
+                #   (기존 front_odom_topic=/zed_back 매핑과 동일한 규칙 유지).
+                #     전진(front 슬롯) → 물리 후방 카메라 zedxmini1
+                #     후진(back  슬롯) → 물리 전방 카메라 zedxmini2
+                # ⚠ zedxmini는 현재 depth_mode:=NONE + pos_tracking_enabled:=false 라
+                #   odom이 발행되지 않는다. 사용하려면 full_system.launch.py에서
+                #   depth_mode를 PERFORMANCE 이상 + pos_tracking_enabled:=true 로 올릴 것.
+                'front_odom_topic': '/zedxmini1/zed_node/odom',
+                'back_odom_topic': '/zedxmini2/zed_node/odom',
                 'output_topic': '/robot_pose',
                 'direction_source': 'topic',
                 'direction_topic': '/travel_direction',

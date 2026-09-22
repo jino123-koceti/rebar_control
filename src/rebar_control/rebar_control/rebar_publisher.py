@@ -23,6 +23,7 @@ from std_msgs.msg import String
 from geometry_msgs.msg import PoseStamped, Quaternion
 from rebar_base_interfaces.msg import IOStatus, MotorFeedback
 import json
+from collections import deque
 import math
 from datetime import datetime
 
@@ -102,6 +103,37 @@ class RebarPublisher(Node):
         self.lateral_y_offset = 0.0  # 횡이동 누적 오프셋 (mm)
         self.mm_per_rotation = 44.0  # 1회전 = 44mm (실측: 9회전=396mm)
 
+        # 자율결속 진행 이벤트 구독 (rebar_drive_node) → UI 전달
+        #   ⚠ 왜 링버퍼인가: UI는 이 상태를 10Hz로 폴링한다. "최신 한 줄"만 실으면
+        #     스텝완료→검출→결속생략→다음스텝처럼 100ms 안에 몰리는 구간에서
+        #     중간 이벤트가 통째로 사라진다. 최근 N개를 함께 실어 UI가 seq로
+        #     새 것만 골라 append하게 한다.
+        self.drive_event_sub = self.create_subscription(
+            String,
+            '/rebar_drive/event',
+            self.drive_event_callback,
+            50
+        )
+        self.drive_state_sub = self.create_subscription(
+            String,
+            '/rebar_drive/state',
+            self.drive_state_callback,
+            10
+        )
+        self.drive_events = deque(maxlen=self.DRIVE_EVENT_KEEP)
+        self.drive_state = ''
+        self.drive_message = ''
+
+        # 자율결속 실행기 상태 — UI가 "지금 자율작업이 도는지"를 알 유일한 근거.
+        # (지금까지 아무도 구독하지 않아 UI는 시작 여부조차 몰랐다)
+        self.auto_tying_sub = self.create_subscription(
+            String,
+            '/auto_tying/status',
+            self.auto_tying_callback,
+            10
+        )
+        self.auto_tying = None
+
         # 상태 저장
         self.control_mode = "idle"
         self.mission_status = "idle"
@@ -158,6 +190,30 @@ class RebarPublisher(Node):
 
         # Heading (degree)
         self.heading = math.degrees(self.position['theta'])
+
+    # UI로 함께 실어 보낼 최근 이벤트 수. UI 폴링(10Hz) 사이에 몰리는 이벤트를
+    # 놓치지 않을 만큼이면 충분하고, msgpack 크기도 이 정도면 부담 없다.
+    DRIVE_EVENT_KEEP = 20
+
+    def drive_event_callback(self, msg: String) -> None:
+        """rebar_drive 진행 이벤트 수신 → 링버퍼 적재."""
+        try:
+            ev = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            return
+        self.drive_events.append(ev)
+        self.drive_message = ev.get('text', '')
+
+    def auto_tying_callback(self, msg: String) -> None:
+        """자율결속 실행기 상태 {"running","direction","pid","state"}."""
+        try:
+            self.auto_tying = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    def drive_state_callback(self, msg: String) -> None:
+        """rebar_drive FSM 상태 문자열 (FWD_STEP / LATERAL_MOVE / ABORT ...)."""
+        self.drive_state = msg.data
 
     def lateral_complete_callback(self, msg: String) -> None:
         """횡이동 완료 시 position.y 오프셋 누적
@@ -311,6 +367,17 @@ class RebarPublisher(Node):
             # 결속 상태 필드 병합 (tying_orchestrator에서 수신)
             if self.tying_feedback:
                 status_data.update(self.tying_feedback)
+
+            # 자율결속 진행상황 (rebar_drive_node) — UI 로그창에 그대로 뿌릴 수 있게
+            #   drive_message : 최신 한 줄 (간단 표시용)
+            #   drive_events  : 최근 N개. UI는 마지막으로 표시한 seq보다 큰 것만 append
+            if self.auto_tying is not None:
+                status_data['auto_tying'] = self.auto_tying
+            if self.drive_state:
+                status_data['drive_state'] = self.drive_state
+            if self.drive_events:
+                status_data['drive_message'] = self.drive_message
+                status_data['drive_events'] = list(self.drive_events)
 
             # 작업영역 정보 포함 (navigator에서 수신)
             if self.work_area:
