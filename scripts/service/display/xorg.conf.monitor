@@ -1,0 +1,15 @@
+# 모니터가 연결된 부팅용 — NVIDIA 기본 설정 (select-xorg.sh 가 골라 씀)
+# 원본: /etc/X11/xorg.conf.bak(2026-08-03)에서 가짜 EDID(ConnectedMonitor/CustomEDID)만 뺐다.
+# 실제 모니터의 EDID를 그대로 쓴다.
+Section "Module"
+    Disable     "dri"
+    SubSection  "extmod"
+        Option  "omit xfree86-dga"
+    EndSubSection
+EndSection
+
+Section "Device"
+    Identifier  "Tegra0"
+    Driver      "nvidia"
+    Option      "AllowEmptyInitialConfiguration" "true"
+EndSection

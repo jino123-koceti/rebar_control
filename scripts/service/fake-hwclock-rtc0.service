@@ -1,0 +1,39 @@
+# /etc/systemd/system/fake-hwclock-rtc0.service
+#
+# RTC 드라이버가 뒤늦게 올라오며 시계를 1970으로 덮어쓰는 것을 되돌린다.
+#
+# 왜 (2026-09-22 실측, 17:30 부팅 dmesg):
+#   [ 4.2s ] tegra_rtc → rtc1 (항상 1970, 시스템 시계에 안 씀)
+#   [ ~5s  ] fake-hwclock load → 마지막 저장 시각으로 복원  ✔
+#   [11.3s ] nvvrs-pseq-rtc → rtc0  "setting system clock to 1970-01-01"  ✘ 덮어씀
+#   rtc0 는 백업전원이 없어 **1분만 꺼져도 1970** 으로 돌아간다. 드라이버가 모듈이라
+#   fake-hwclock 보다 늦게 올라오면서 복원한 시각을 1970 으로 되돌린다.
+#   → 1970 이면 Tailscale TLS 인증서 검증이 실패한다(오프라인 부팅 때 원격 불가),
+#     로그 시각도 전부 1970.
+#
+# 동작: rtc0 가 생길 때까지(최대 30초) 기다린 뒤 1초 더 두고 fake-hwclock load 를 다시 한다.
+#   fake-hwclock load 는 **저장된 시각이 현재보다 뒤일 때만** 시계를 옮긴다(되감지 않음).
+#   chrony 보다 먼저 끝나야 chrony 가 제대로 된 시각에서 출발한다(Before=chrony).
+#   저장은 fake-hwclock 기본 + /etc/cron.d/fake-hwclock-frequent(10분마다).
+#   fake-hwclock save 는 현재가 저장값보다 이를 때 저장을 거부한다 → 1970 이 덮어쓸 일 없음.
+#
+# 설치:
+#   sudo cp scripts/service/fake-hwclock-rtc0.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable fake-hwclock-rtc0
+#   확인(다음 부팅 후): journalctl -b -u fake-hwclock-rtc0
+#                        dmesg | grep "setting system clock"   ← 1970 이 찍혀도 정상(그 뒤에 되돌림)
+[Unit]
+Description=Re-apply fake-hwclock after rtc0 (nvvrs) resets the clock to 1970
+DefaultDependencies=no
+After=fake-hwclock.service
+Before=chrony.service time-sync.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for i in $(seq 60); do [ -e /sys/class/rtc/rtc0 ] && break; sleep 0.5; done; sleep 1; echo "before: $(date -Is)"; /sbin/fake-hwclock load; echo "after:  $(date -Is)"'
+
+[Install]
+WantedBy=sysinit.target

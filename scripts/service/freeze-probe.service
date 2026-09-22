@@ -1,0 +1,27 @@
+[Unit]
+Description=Freeze probe (system state that survives a hard watchdog reset)
+# robot-control 과 독립 — 프리즈/재시작/실패와 무관하게 "항상" 감시.
+#
+# 왜 temp-monitor 와 별개인가 (2026-08-13):
+#   temp-monitor 는 온도만 본다. 그런데 그날 프리즈는 온도가 원인이 아니었고
+#   (최대 58°C, throttle 0), 정작 원인 판별에 필요한 CPU/메모리/IO 지표가 없었다.
+#   특히 temp_monitor(2Hz, 매 줄 fsync)가 16:38:01에 멎은 반면 ROS 노드들은
+#   16:40:5x까지 살아 있었다 — fsync만 막혔다는 건 I/O 정체를 가리키는데,
+#   그걸 숫자로 남긴 게 없어 추정에서 멈췄다.
+#   → freeze_probe 는 fsync 소요(ms)와 루프 지연(ms)을 직접 계측한다.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=koceti
+ExecStartPre=-/bin/mkdir -p /var/log/robot_control
+ExecStart=/usr/bin/python3 /home/koceti/ros2_ws/tools/diag/freeze_probe.py --out /var/log/robot_control/freeze_probe.csv --hz 1
+# 죽으면 즉시 되살림. 매 레코드 fsync 라 하드 리셋에도 직전 1초까지 디스크에 남는다.
+Restart=always
+RestartSec=1
+# 감시자가 감시 대상 부하가 되면 안 된다. 우선순위는 낮추되 IO 는 정상으로 둔다
+# (IO 를 낮추면 정작 재려는 fsync 지연이 프로브 자신의 우선순위 탓인지 구분이 안 된다).
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

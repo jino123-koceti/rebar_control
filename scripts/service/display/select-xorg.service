@@ -1,0 +1,22 @@
+# /etc/systemd/system/select-xorg.service
+# 부팅 때 모니터 연결 여부로 X 설정(헤드리스 dummy / NVIDIA)을 고른다. 설명은 select-xorg.sh.
+#
+# 설치:
+#   sudo cp scripts/service/display/xorg.conf.headless scripts/service/display/xorg.conf.monitor /etc/X11/
+#   sudo cp scripts/service/display/select-xorg.sh /usr/local/sbin/
+#   sudo cp scripts/service/display/select-xorg.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable select-xorg
+# 확인(부팅 후): journalctl -b -u select-xorg
+# 되돌리기: sudo systemctl disable select-xorg && sudo cp /etc/X11/xorg.conf.headless /etc/X11/xorg.conf
+[Unit]
+Description=Pick Xorg config by monitor presence (headless dummy vs NVIDIA)
+After=systemd-udev-settle.service systemd-modules-load.service
+Before=display-manager.service gdm.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/select-xorg.sh
+TimeoutStartSec=30
+
+[Install]
+WantedBy=graphical.target

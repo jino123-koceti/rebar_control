@@ -1,0 +1,21 @@
+[Unit]
+Description=Motor status probe (RMD 0x9A: bus voltage + error flags, survives hard reset)
+# robot-control 과 독립 — 프리즈/재시작과 무관하게 항상 감시.
+# 목적(2026-08-14): 프리즈 순간 **모터 LED 점멸(알람)** 관측됨. 그런데
+#   /motor_feedback 의 error_code 는 can_parser 가 전류·온도로 자체 판정한 값이지
+#   모터가 보고한 알람이 아니다 → 실제 알람을 못 보고 있었다.
+# 그리고 0x9A 응답의 **버스 전압**은 volt_monitor(INA3221, Jetson 모듈 입력단)로는
+#   볼 수 없던 **상류 배터리 레일**이다. 저전압 새그 여부를 여기서 판별한다.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=koceti
+ExecStartPre=-/bin/mkdir -p /var/log/robot_control
+ExecStart=/usr/bin/python3 /home/koceti/ros2_ws/tools/diag/motor_status_probe.py --out /var/log/robot_control/motor_status.csv --hz 10
+Restart=always
+RestartSec=2
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

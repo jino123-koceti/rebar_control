@@ -1,0 +1,21 @@
+[Unit]
+Description=Motor torque-current probe (survives hard reset via fsync)
+# robot-control 과 독립 — 프리즈/재시작과 무관하게 "항상" 감시.
+# 목적: "모터 부하가 걸려 순간 토크가 높아질 때 죽는 것 같다"는 관측(2026-08-14) 검증.
+#   volt_monitor 가 보는 INA3221 은 **Jetson 모듈 입력**만이라 모터 서지가 안 잡힌다.
+#   그래서 CAN 피드백(/motor_feedback, 105Hz)의 토크 전류를 따로 남긴다.
+# ⚠ robot-control 이 떠야 /motor_feedback 이 나온다. 먼저 떠도 무해(구독만 대기).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=koceti
+ExecStartPre=-/bin/mkdir -p /var/log/robot_control
+# ROS 환경을 물려받아야 rclpy/메시지 임포트가 된다
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/koceti/ros2_ws/install/setup.bash && exec python3 /home/koceti/ros2_ws/tools/diag/motor_current_probe.py --out /var/log/robot_control/motor_current.csv --hz 20'
+Restart=always
+RestartSec=2
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
