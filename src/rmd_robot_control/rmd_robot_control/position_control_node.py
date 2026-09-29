@@ -189,16 +189,30 @@ class PositionControlNode(Node):
         self.drive_normal_since = None
 
         # 모터 전류 보호 시스템
+        #
+        # ★ 2026-09-29: **이름이 2차년도 배치였다.** 3차년도는 축이 한 칸씩 밀려 있어
+        #   0x145 를 'Yaw', 0x146 을 'X축' 으로 적어 두면 로그를 보고 엉뚱한 축을
+        #   의심하게 된다 (실제로 그렇게 오진했다). 실측 배치로 고쳤다:
+        #     0x141 우측주행 · 0x142 좌측주행 · 0x143/0x144 횡이동 2축
+        #     0x145 X · 0x146 Y · 0x147 Z(리프팅) · 0x148 Yaw
+        #   좌/우 주행 이름도 뒤바뀌어 있었다 (ID1=우측, ID2=좌측 — 2026-09-08 실측).
+        #
+        # ⚠ Yaw(0x148)는 결속 자세전환에 필요해 새로 등록했다. 이 표에 없는 ID 는
+        #   보호 로직이 조용히 건너뛰고(831줄) 다른 경로에선 KeyError 가 난다.
+        #   전류 임계는 아직 3차년도 실측이 없어 상부 4축을 같은 값으로 두었다.
+        # ⚠ speed_limit 은 motor_protection_state['speed_limited'] 가 True 일 때만
+        #   쓰이고 그 기능은 아직 비활성이다(940줄 주석). 값은 잠정치다.
         self.motor_current_limits = {
-            # X4-10 모터들 (주행, Z축, Yaw, Y축)
-            0x141: {'name': '좌측주행', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 100},
-            0x142: {'name': '우측주행', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 100},
-            0x144: {'name': 'Z축', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 75},
-            0x145: {'name': 'Yaw', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 67},
-            0x146: {'name': 'X축', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 200},
-            0x147: {'name': 'Y축', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 200},
-            # X4-36 모터 (횡이동)
-            0x143: {'name': '횡이동', 'rated': 6.1, 'warning': 8.0, 'danger': 12.0, 'emergency': 18.0, 'speed_limit': 100},
+            0x141: {'name': '우측주행', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 100},
+            0x142: {'name': '좌측주행', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 100},
+            # 횡이동 2축 (X4-36). 2차년도는 0x143 1축이었다.
+            0x143: {'name': '횡이동#1', 'rated': 6.1, 'warning': 8.0, 'danger': 12.0, 'emergency': 18.0, 'speed_limit': 100},
+            0x144: {'name': '횡이동#2', 'rated': 6.1, 'warning': 8.0, 'danger': 12.0, 'emergency': 18.0, 'speed_limit': 100},
+            # 상부 스테이지
+            0x145: {'name': 'X축', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 200},
+            0x146: {'name': 'Y축', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 200},
+            0x147: {'name': 'Z축(리프팅)', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 75},
+            0x148: {'name': 'Yaw', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 67},
         }
 
         # 전류 모니터링 상태

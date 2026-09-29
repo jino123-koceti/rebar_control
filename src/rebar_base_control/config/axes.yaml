@@ -1,0 +1,134 @@
+# 축 정의 단일 소스 (3차년도)
+#
+# 모터 ID·부호·감속비·리미트·브레이크를 **여기 한 곳에만** 둔다.
+# 코드에 0x14X 리터럴을 쓰면 tools/check/check_axis_literals.py 가 실패시킨다.
+#
+# 왜 이 파일이 필요한가: 2차년도는 0x14X 가 10개 파일에 흩어져 있었고, 3차년도에서
+# 축이 한 칸씩 밀리면서 주석과 실제가 어긋났다. `position_control_node` 주석의
+# 0x145=Yaw 를 믿고 엉뚱한 축을 의심한 일이 실제로 있었다.
+#
+# 표기: [확정] = 3차년도 실측 확인 / [잠정] = 근거 있으나 미검증 / [미확인]
+#
+# 2차년도 → 3차년도 ID 대응 (틀리기 쉬우니 남겨 둔다):
+#   횡이동 0x143(1축) → 0x143+0x144(2축) / X 0x144→0x145 / Y 0x145→0x146
+#   Z 0x146→0x147 / Yaw 0x147→0x148
+
+meta:
+  can_interface: can2          # [확정] 모터 버스 1 Mbps. 리모콘은 can3 250 kbps
+  remote_interface: can3       # [확정] 별도 PCAN. 이름 고정은 pcan-fix-names.service
+  protocol: RMD-X4             # 0xA2 속도 / 0xA4 위치 / 0xA9 힘제어위치 / 0x9A 상태
+
+# 주행부 — 하부체
+drive:
+  # [확정 2026-09-08] ID1=우측, ID2=좌측. 2차년도 코드 이름이 뒤바뀌어 있었다.
+  right:
+    can_id: 0x141
+    model: RMD-X4-36           # [확정] 2차년도 말에 양쪽 다 X4-36 으로 교체됨
+    gear: 36
+  left:
+    can_id: 0x142
+    model: RMD-X4-36
+    gear: 36
+  # [확정 2026-09-08 실측] 바퀴 1회전 = 183 mm → r = 29.12 mm
+  wheel_radius_m: 0.02912
+  wheel_base_m: 0.5
+  # [확정] 정격 498 dps(83 rpm) = 0.249 m/s. 이 위로 올리면 포화한다
+  max_linear_mps: 0.25
+  # [확정 2026-09-08] 선회 시 25~28Hz 기구 공진. 절반으로 낮추면 진동 33~61% 감소
+  max_angular_radps: 0.5
+  wheel_max_dps: 498.0
+  # [확정 2026-09-14] 0x43 가감속은 **모터축 기준**이다. 출력축 = 설정값 ÷ 감속비.
+  # ⚠ X4-36 은 0x43 이 ROM 에 남지 않아 **매 기동 재적용이 필수**다.
+  #   안 하면 0→최고속 14.9초. index 2=가속, index 3=감속 으로 따로 쓴다.
+  rom_accel: 1200
+  rom_decel: 1200
+  rom_accel_reapply_each_boot: true
+  # [잠정] 전류 임계. 3차년도 실측 없음 — 2차년도 프로젝트 기준값을 가져왔다
+  current:
+    rated_a: 7.8
+    warning_a: 9.0
+    danger_a: 12.0
+    emergency_a: 15.0
+  # [확정 2026-08-06] 모터측 통신두절 보호(0xB3). 젯슨 프리즈 시 SW 워치독은 같이 멈춘다.
+  # ⚠ 주행모터에만. 스테이지·Yaw 에는 절대 걸지 말 것 (유휴 시 명령이 끊겨 오작동)
+  motor_watchdog_ms: 500
+  # [잠정] 직진 드리프트 잔여 보정. 3차년도 재교정 필요
+  left_speed_scale: 1.0
+  right_speed_scale: 1.0
+
+# 횡이동 — 2축을 반대로 돌린다 (2차년도는 1축이었다)
+lateral:
+  axis_1:
+    can_id: 0x143
+    joint: joint_1
+    sign: +1                   # [확정] + 가 좌측
+  axis_2:
+    can_id: 0x144
+    joint: joint_2
+    sign: -1
+  model: RMD-X4-36
+  gear: 36
+  # [확정] 1회전 = 50 mm. 홈 기준은 0x61 (이 모터는 0x90 미지원)
+  mm_per_turn: 50.0
+  home_command: 0x61
+  home_file: tools/motor/lateral_home.json
+  # [확정] 결속 상태 12.13A 로 12/12 완주. 여유 1.7배
+  current:
+    rated_a: 6.1
+    warning_a: 8.0
+    danger_a: 12.0
+    emergency_a: 18.0
+  # [확정 2026-08-14] 0xA4(위치)에는 maxTorque 바이트가 없다 → 0xA9(힘제어위치)로 제한을 건다
+  torque_limit_pct: 100
+  position_command: 0xA9
+
+# 상부 스테이지
+stage:
+  x:
+    can_id: 0x145
+    joint: joint_3
+    limit_min: x_min           # [확정] ezi_io 상부 IN00
+    limit_max: x_max           # [확정] IN01
+    brake: true                # [확정] 재시작마다 잠긴다. 해제는 0x77 (휘발성)
+    # ⚠ [확정] 이 개체는 온도 필드가 0xEC(236°C) 고정 — 과열 보호를 믿을 수 없다
+    temp_sensor_faulty: true
+  y:
+    can_id: 0x146
+    joint: joint_4
+    limit_min: y_min           # [확정] IN04
+    limit_max: y_max           # [확정] IN06
+    brake: true
+  z:
+    can_id: 0x147
+    joint: joint_5
+    limit_min: z_min           # [확정] IN02
+    limit_max: z_max           # [확정] IN03
+    brake: true
+    # ⚠ 리프팅축. 브레이크를 풀면 자중으로 내려앉을 수 있다. 자동 해제 금지
+    gravity_load: true
+  yaw:
+    can_id: 0x148
+    joint: joint_6
+    limit_home: yaw_home       # [확정] IN05. 센서 1개뿐 (2차년도도 동일)
+    brake: false               # [미확인]
+    # [미확인] 2차년도 0x90 기준상수(home=17994, max=47594, 73.88 counts/deg)는
+    #   그 모터 개체 값이다. 3차년도 0x148 로 재측정해야 한다
+    encoder_ref: null
+  # [잠정] 상부 4축 공통 전류 임계. 3차년도 실측 없음
+  current:
+    rated_a: 7.8
+    warning_a: 9.0
+    danger_a: 12.0
+    emergency_a: 15.0
+  # [확정] 텔레옵 기본 속도. n/m 키로 5~100 조절
+  default_speed_dps: 50.0
+
+# 브레이크 정책
+brake:
+  release_command: 0x77
+  lock_command: 0x78
+  # [확정] 해제는 휘발성이다. 노드 재시작·전원 재투입하면 다시 잠긴다
+  volatile: true
+  # Z 는 낙하 위험이 있어 기동 시 자동 해제에서 제외한다
+  auto_release_on_start: [x, y]
+  never_auto_release: [z]
