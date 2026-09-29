@@ -302,6 +302,8 @@ axes:
 | **S1** `robot_control_gui` 삭제 | −1,276줄. python-can 개방 3→2 파일 |
 | **S1** `remote_bridge` 신규 (L1) | can3 소유자. 20Hz 발행, 4축 ±1.0 정규화 확인 |
 | **S1** `remote_teleop` 전환 (L3) | can3 직접 읽기 제거 → `/remote_control` 구독. 계층 위반 하나 해소 |
+| 설계 문서 정리 | 구버전 `YEAR3_MIGRATION_PLAN.md` 제거(단계 번호 R/S 충돌). 정본은 이 문서 + `FEATURE_INVENTORY` 둘 |
+| 브랜치 분리 | 3차년도는 신규 장비이므로 `feature/year3-new-equipment` 로 분리 (기존 `feature/year3-equipment` 는 `cfb4da6` 에 보존) |
 
 ### S1 에 남은 것
 
