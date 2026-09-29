@@ -13,9 +13,10 @@
   <depend>sensor_msgs</depend>
   <depend>trajectory_msgs</depend>
   <depend>control_msgs</depend>
+  <!-- L1 remote_bridge 의 /remote_control 을 구독한다 -->
+  <depend>rebar_base_interfaces</depend>
   <depend>joint_state_publisher</depend>
   
-  <exec_depend>python3-pyqt5</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

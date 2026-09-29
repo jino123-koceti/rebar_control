@@ -17,7 +17,6 @@ rmd_robot_control/
 │   ├── can_manager.py              # CAN communication manager
 │   ├── position_control_node.py    # Unified position/velocity control node
 │   ├── robot_control_node.py       # Legacy integrated control node
-│   ├── robot_control_gui.py        # PyQt5 GUI control interface
 │   └── motor_test.py               # Motor test node
 ├── config/
 │   └── robot_control.yaml

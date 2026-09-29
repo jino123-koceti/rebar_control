@@ -25,7 +25,6 @@ setup(
     entry_points={
         'console_scripts': [
             'position_control_node = rmd_robot_control.position_control_node:main',
-            'robot_control_gui = rmd_robot_control.robot_control_gui:main',
             'lateral_node = rmd_robot_control.lateral_node:main',
             'teleop_keyboard = rmd_robot_control.teleop_keyboard:main',
             'remote_teleop_node = rmd_robot_control.remote_teleop_node:main',

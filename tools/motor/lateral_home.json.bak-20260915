@@ -1,0 +1,14 @@
+{
+  "0x143": {
+    "home_angle": -100.01,
+    "sign": 1,
+    "name": "횡이동 #1",
+    "home_enc_single": 51000
+  },
+  "0x144": {
+    "home_angle": 142.72,
+    "sign": -1,
+    "name": "횡이동 #2",
+    "home_enc_single": 39539
+  }
+}

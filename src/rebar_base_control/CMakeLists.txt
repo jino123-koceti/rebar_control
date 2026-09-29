@@ -15,6 +15,8 @@ ament_python_install_package(${PROJECT_NAME})
 
 # Install Python executables
 install(PROGRAMS
+  # L1 하드웨어 계층 — can3 리모콘 소유자 (YEAR3_ARCHITECTURE.md §3)
+  rebar_base_control/remote_bridge.py
   rebar_base_control/can_parser.py
   rebar_base_control/can_sender.py
   rebar_base_control/drive_controller.py
@@ -25,6 +27,7 @@ install(PROGRAMS
   rebar_base_control/authority_controller.py
   rebar_base_control/navigator_base.py
   rebar_base_control/encoder_odom.py
+  rebar_base_control/homing_controller.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

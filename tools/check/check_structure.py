@@ -83,7 +83,9 @@ def rel(p):
 
 
 def r1_id_literals():
-    out = []
+    """파일 단위로 센다. 줄 번호를 키로 쓰면 한 줄만 고쳐도 '신규 위반' 이 되어
+    기준선이 쓸모없어진다 (2026-09-29 실제로 그렇게 됐다)."""
+    per_file = {}
     for p in py_files():
         r = rel(p)
         if any(a in r for a in R1_ALLOW):
@@ -97,8 +99,8 @@ def r1_id_literals():
                 # 주석 안의 설명은 봐준다 (문서화 목적)
                 code = line.split('#')[0]
                 if re.search(r'0x14[1-8]\b', code):
-                    out.append(f"{r}:{i}")
-    return out
+                    per_file[r] = per_file.get(r, 0) + 1
+    return [f"{f} ({n}건)" if False else f for f, n in sorted(per_file.items())]
 
 
 def r2_resource_owners():
@@ -114,7 +116,10 @@ def r2_resource_owners():
     out = []
     for name, files in sorted(hits.items()):
         if len(files) > 1:
-            out.append(f"{name}: " + ", ".join(sorted(files)))
+            # 쌍 단위로 낸다. 목록 문자열을 키로 쓰면 파일 하나가 바뀔 때
+            # 전체가 '신규' 로 잡혀 무엇이 늘었는지 안 보인다.
+            for f in sorted(files):
+                out.append(f"{name} ← {f}")
     return out
 
 
@@ -181,7 +186,8 @@ def r4_node_size():
             continue
         n = sum(1 for _ in open(p, encoding='utf-8', errors='replace'))
         if n > limit:
-            out.append(f"{rel(p)}: {n}줄 (상한 {limit})")
+            # 줄 수를 키에 넣으면 한 줄 고칠 때마다 신규 위반이 된다 → 파일만
+            out.append(f"{rel(p)} (상한 {limit})")
     return out
 
 
@@ -193,8 +199,26 @@ def r5_duplicates():
             if os.path.basename(p) in names:
                 found.append(rel(p))
         if len(found) > 1:
-            out.append(f"{group}: " + ", ".join(sorted(found)))
+            for f in sorted(found):
+                out.append(f"{group} ← {f}")
     return out
+
+
+def _r1_total():
+    """R1 은 파일 단위로 세므로 총 리터럴 건수를 따로 보여준다."""
+    total = 0
+    for p in py_files():
+        r = rel(p)
+        if any(al in r for al in R1_ALLOW):
+            continue
+        try:
+            src = open(p, encoding='utf-8', errors='replace').read()
+        except OSError:
+            continue
+        for line in src.splitlines():
+            if re.search(r'0x14[1-8]\b', line.split('#')[0]):
+                total += 1
+    return total
 
 
 CHECKS = [
@@ -225,8 +249,11 @@ def main():
         new = [v for v in cur if v not in known]
         gone = [v for v in known if v not in cur]
 
+        extra = ""
+        if name.startswith('R1'):
+            extra = f" / 리터럴 총 {_r1_total()}건"
         mark = "OK " if not new else "NG "
-        print(f"{mark}{name}: 위반 {len(cur)}건"
+        print(f"{mark}{name}: 위반 {len(cur)}건{extra}"
               + (f", 신규 {len(new)}건" if new else "")
               + (f", 해소 {len(gone)}건" if gone else ""))
         for v in new:

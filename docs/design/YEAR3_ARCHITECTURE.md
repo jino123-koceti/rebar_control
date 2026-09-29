@@ -70,6 +70,13 @@ L0 인터페이스     rebar_base_interfaces (메시지 정의만)
 | 카메라 | 외부 드라이버 | ZED wrapper · orbbec_camera |
 
 `motor_bridge` 는 검증된 `position_control_node` 를 **줄여서** 만든다. 새로 쓰지 않는다.
+축소는 S1 이 아니라 **S4** 에서 일어난다 — 이 파일의 부피는 주행 보호와 관절 처리이고,
+그건 L3(`drive_node`·`stage_node`)로 옮겨야 줄어든다. S1 은 "누가 버스를 여는가" 만 정리한다.
+
+⚠ **지금 can2 에 소유자가 둘이다.** `lateral_axes.py` 가 자기 소켓을 따로 연다
+(검사 R2 가 잡아냈다). 서로 다른 모터 ID 를 쓰고 있어 증상이 없지만 구조상 위반이다.
+횡이동은 3차년도에서 검증된 몇 개 안 되는 기능이라 회귀 위험이 있어, 이 항목만
+S1 에서 뒤로 미루고 S4 에서 `lateral_node` 를 L3 로 정리할 때 함께 처리한다.
 지금 이 파일에 들어 있는 것 중 **호밍·시퀀스·GUI 성격은 넣지 않는다** — 그게 2차년도가
 2,000줄로 부푼 경로다.
 
@@ -104,6 +111,7 @@ L0 인터페이스     rebar_base_interfaces (메시지 정의만)
 | `stage_node` | 상부 X/Y/Z/Yaw 축 동작. `/joint_cmd` → `/joint_control` | ≤500 | `joint_controller`(횡이동 제외) |
 | `lateral_node` | 횡이동 2축. `/lateral/step` | ≤300 | 3차년도 구현(동작 검증됨) |
 | `homing_node` | 원점복귀 시퀀스. 리미트 구독 + 축 명령 | ≤600 | `homing_controller` |
+| `remote_teleop` | 리모콘 입력(`/remote_control`) → 축 명령. CAN 을 모른다 | ≤300 | `iron_md_teleop_node` 조작 규칙 |
 
 **`stage_node` 와 `homing_node` 를 나누는 이유:** 호밍은 "축을 어떻게 움직이나" 가 아니라
 "어떤 순서로 원점을 찾나" 다. 2차년도도 `joint_controller` 에서 `homing_controller` 를
@@ -220,6 +228,7 @@ axes:
 | `lateral_motion` · `lateral_encoder_calibration` | 612 | entry point 없음. `lateral_node` 로 대체 |
 | `can_manager` 중 중복 경로 | — | `motor_bridge` 단일화 |
 | `path_generation` 웨이포인트 생성 | — | UI 재구현 시 제외 |
+| `teleop_keyboard` | 351 | 리모콘으로 대체. **리모콘 주행 검증 후에** 지운다 |
 | `rebar_control_old` 전체 | 3,948 | 참고만. 이식 완료 후 제거 |
 
 ---
@@ -231,10 +240,10 @@ axes:
 | 단계 | 내용 | 완료 판정 |
 |---|---|---|
 | **S0** | `axes.yaml` + 검사 스크립트 3종(R1·R2·R3) | 검사 전부 통과 |
-| **S1** | L1 소유자 정리 — `motor_bridge` 범위 확정, `remote_bridge` 분리 | can2·can3 소유자 각 1개 |
+| **S1** | L1 소유자 정리 — `remote_bridge` 분리, `robot_control_gui` 삭제, can3 직접 읽기 제거 | can3 소유자 1개, GUI 제거 |
 | **S2** | L2 `safety_node` + L1 최종 차단 + 0xB3 | 범퍼·STOP·비상정지로 실제 정지 |
 | **S3** | **L3 `homing_node`** — 첫 기능. 골격의 본보기 | Z 단독 → X → Y → Yaw → 전체 시퀀스 |
-| **S4** | L3 나머지 — `drive_node`·`stage_node` 분리, 텔레옵을 `/joint_cmd` 로 전환 | 기존 동작 재현 |
+| **S4** | L3 나머지 — `drive_node`·`stage_node` 분리, 텔레옵을 `/joint_cmd` 로 전환.<br>**`position_control_node` 의 실제 축소(1,960→600)가 여기서 일어난다** | 기존 동작 재현 |
 | **S5** | L4 `mode_arbiter` + `tying_sequence` | 수동/자율 전환, 결속 1회 |
 | **S6** | L5 인지 이식 — `crossing_detector`·`deck_edge`·`obstacle_detector` | 검출 좌표 정확도 |
 | **S7** | L4 [B] `rebar_drive` + `tying_orchestrator` | 단일 포인트 → 순회 |
@@ -246,19 +255,53 @@ axes:
 
 ---
 
-## 9. 지금 상태
+## 9. 지금 상태 (2026-09-29)
+
+### 끝난 것
+
+| 항목 | 내용 |
+|---|---|
+| `ezi_io_node` (L1) | 2보드 재작성, 극성 흡수, 16개 토픽. 실장비 확인 |
+| 리미트·범퍼 채널 매핑 | 상부 7개·하부 6개 실측 확정 |
+| 리모콘 프로토콜 | 프레임·비트 실측 확정. `0x00`=출력비활성(송신기 꺼짐/START 전), `0x62`=활성, `0x80`=비상정지 |
+| Yaw 0x148 등록 | `joint_6`. 재시작 후 7개 모터 초기화 확인 (`0x148: -427.2°`) |
+| `axes.yaml` | 축 정의 단일 소스 |
+| 검사 R1~R5 + 기준선 | 위반 314건 기록. 늘어날 때만 실패 |
+| **S1** `robot_control_gui` 삭제 | −1,276줄. python-can 개방 3→2 파일 |
+| **S1** `remote_bridge` 신규 (L1) | can3 소유자. 20Hz 발행, 4축 ±1.0 정규화 확인 |
+| **S1** `remote_teleop` 전환 (L3) | can3 직접 읽기 제거 → `/remote_control` 구독. 계층 위반 하나 해소 |
+
+### S1 에 남은 것
+
+| 항목 | 비고 |
+|---|---|
+| 리모콘 주행 실검증 | 신호 경로는 확인했다. 주행 검증은 보류 (2026-09-29 현장 판단) |
+| `teleop_keyboard` 삭제 | **리모콘 주행이 검증된 뒤에.** 지금은 검증된 유일한 수동 조작 수단이다 |
+| `lateral_axes` CAN 개방 정리 | S4 로 미룸 (횡이동 회귀 위험) |
+
+### S0 에 남은 것
+
+| 항목 | 비고 |
+|---|---|
+| `0x14X` 리터럴 290건 | **파일을 이식·수정하는 시점에 같이 처리한다.** 일괄 교체하면 이식 대상 파일(`can_sender` 20건, `homing_controller` 30여 건)을 두 번 고친다 |
+| R3 검사를 §5 계약 표와 대조 | 지금은 "짝 없는 토픽" 만 본다 |
+
+### 하드웨어 대기
 
 | 항목 | 상태 |
 |---|---|
-| `ezi_io_node` (L1) | **완료** — 2보드, 극성 흡수, 16개 토픽 |
-| 리미트·범퍼 채널 매핑 | **완료** — 상부 7개·하부 6개 실측 |
-| 리모콘 프로토콜 | **완료** — 프레임·비트 실측 확정 |
-| Yaw 0x148 등록 | **완료** — `joint_6` |
-| `position_control_node` | 동작하지만 1,946줄. S1 에서 `motor_bridge` 로 축소 |
-| `remote_teleop_node` | 임시 — can3 직접 읽기. S1 에서 `/remote_control` 구독으로 전환 |
-| 상부 스테이지 리미트 접촉 | **하드웨어 수정 대기** (2026-09-30 예정) |
+| 상부 스테이지가 리미트에 닿지 않음 | 하드웨어 담당자 수정 예정. **호밍(S3) 실검증의 선행 조건** |
+| ZED X 2대 | 캡처카드 배럴잭 전원 미연결로 미인식 |
+| 상부 EZIO 출력 8점 배선 | 미확인 (보류) |
+| `orbbec_crossing.pt` | 신규 모델 재학습 중 |
 
----
+### 작업 중 발견
+
+- **`homing_controller.py` 가 CMakeLists 설치 목록에 없었다.** 이 패키지는 `ament_cmake` +
+  `install(PROGRAMS)` 인데 `homing_controller` 는 `setup.py` entry point 에만 있어서
+  `ros2 run` 이 애초에 불가능했다. 설치 목록에 추가했다.
+- 2차년도 `ezi_io_node` 는 `/limit_sensors/yaw_min` 으로 발행하고 호밍·관절·송신 노드는
+  `yaw_home` 을 구독했다 — **yaw 리미트가 실제로 안 붙어 있었을 수 있다.**
 
 ## 10. 이 문서를 고칠 때
 
