@@ -9,7 +9,7 @@ import rclpy
 from rclpy.node import Node
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray, Float32, Int32
+from std_msgs.msg import Float64MultiArray, Float32, Int32, Empty
 from geometry_msgs.msg import Twist
 from std_srvs.srv import Trigger
 import struct
@@ -71,6 +71,8 @@ class PositionControlNode(Node):
         # 주행 모터 하드 차단(0x80) 임계 [A]. RMD-X4-36 피크 21.5A(rms) 를 넘기지 말 것.
         # 실측 참고: 전후진 최대 5.51A, 선회 최대 7.63A 이므로 18A 는 이미 2.4배 여유다.
         self.declare_parameter('drive_i_hard_a', 18.0)
+        # cmd_vel 이 이 시간 이상 끊기면 주행을 자동 정지한다. 0 이면 비활성.
+        self.declare_parameter('cmd_vel_timeout', 0.5)
         
         # 파라미터 가져오기
         self.can_interface = self.get_parameter('can_interface').value
@@ -90,6 +92,7 @@ class PositionControlNode(Node):
         self.wheel_max_dps = self.get_parameter('wheel_max_dps').value
         self.max_angular_vel = self.get_parameter('max_angular_vel').value
         self.drive_i_hard_a = float(self.get_parameter('drive_i_hard_a').value)
+        self.cmd_vel_timeout = float(self.get_parameter('cmd_vel_timeout').value)
         
         # CAN 매니저 및 프로토콜 초기화
         self.can_manager = CANManager(self.can_interface)
@@ -180,6 +183,8 @@ class PositionControlNode(Node):
         # `pr = self.drive_prot.get(motor_id)` 가 항상 None → 즉시 return 이었다.
         # 즉 주행 보호가 한 번도 동작한 적이 없다. 재초기화만 제거한다.
         self.drive_tripped = False    # 래치: 해제 전까지 cmd_vel 무시
+        self.last_cmd_vel_time = None # cmd_vel 워치독용 마지막 수신 시각
+        self.drive_cmd_active = False # 0 이 아닌 주행 명령이 살아 있는가
         self.drive_trip_reason = ""
         self.drive_normal_since = None
 
@@ -300,6 +305,12 @@ class PositionControlNode(Node):
             self.joint_speed_subscriptions.append(subscription)
         
         # 주행 모터(0x141, 0x142) 위치 제어 토픽 구독 (S20 모드용)
+        # 주행부 수동 해제: 0x80 으로 출력을 완전히 끊어 유지 토크를 놓는다.
+        # 정지 상태에서 구동계 탄성 예하중을 계속 붙잡고 3~4A 를 소모하는 일이
+        # 있어(2026-09-15 실측, 온도 51°C 까지 상승) 조작자가 즉시 풀 수 있게 한다.
+        self.drive_release_sub = self.create_subscription(
+            Empty, '/drive/release', self.drive_release_callback, 10)
+
         self.left_wheel_position_sub = self.create_subscription(
             Float64MultiArray,
             '/motor_0x141/position',
@@ -317,6 +328,9 @@ class PositionControlNode(Node):
         self.status_timer = self.create_timer(0.1, self.publish_status)  # 10Hz
         # self.motor_status_timer = self.create_timer(0.1, self.read_motor_status)  # 비활성화 (CAN 부하 감소)
         self.position_control_timer = self.create_timer(0.1, self.position_control_loop)  # 10Hz로 변경 (과부하 방지)
+        # cmd_vel 끊김 감시 (10Hz) 와 보호 래치 해제 구동 (2Hz)
+        self.drive_watchdog_timer = self.create_timer(0.1, self.drive_watchdog_tick)
+        self.drive_latch_timer = self.create_timer(0.5, self.drive_latch_tick)
         
         # 서비스 생성
         self.brake_release_service = self.create_service(
@@ -972,6 +986,53 @@ class PositionControlNode(Node):
             else:
                 self.drive_normal_since = None
 
+    def drive_release_callback(self, msg):
+        """주행 모터 출력 완전 차단 (0x80).
+
+        0xA2 speed=0 과 0x81 은 모터를 여자 상태로 남긴다 — 0x80 만이 0.00A 를
+        만든다 (2026-09-15 실측). 유지 토크가 사라지므로 경사에서는 밀릴 수 있다.
+        다음 cmd_vel 이 오면 모터가 다시 살아난다.
+        """
+        self.get_logger().warning("🔓 주행부 해제 요청 — 0x80 전송 (유지 토크 없어짐)")
+        self.drive_cmd_active = False
+        self.shutdown_drive_motors()
+
+    def drive_watchdog_tick(self):
+        """cmd_vel 이 끊기면 주행을 자동 정지한다.
+
+        0xA2 속도 명령을 받은 모터는 **그 속도를 계속 유지한다.** 따라서
+        cmd_vel 발행이 멈춰도(텔레옵 크래시, SSH 끊김, 네트워크 손실)
+        백엔드가 아무 조치를 안 하면 바퀴는 마지막 속도로 계속 돈다.
+        데드맨이 teleop_keyboard 쪽에만 있어 클라이언트가 죽으면 무방비였다
+        (2026-09-15 "주행이 안 멈춤" 의 원인).
+        """
+        if self.cmd_vel_timeout <= 0 or not self.drive_cmd_active:
+            return
+        if self.last_cmd_vel_time is None:
+            return
+        if time.time() - self.last_cmd_vel_time <= self.cmd_vel_timeout:
+            return
+        self.drive_cmd_active = False
+        self.get_logger().warning(
+            f"⚠️ cmd_vel 끊김 {self.cmd_vel_timeout:.1f}s 초과 — 주행 정지")
+        for mid in self.drive_prot:
+            self.send_speed_command(mid, 0)
+
+    def drive_latch_tick(self):
+        """보호 래치가 걸린 동안 속도 0 을 보내 해제 판정을 돌린다.
+
+        해제 조건은 drive_protect() 안에 있고, drive_protect() 는 0xA2 응답이
+        올 때만 호출된다. 그런데 cmd_vel_callback 은 래치가 걸리면 명령을
+        보내지 않으므로 — 명령이 없으면 응답이 없고, 응답이 없으면 해제
+        판정이 영영 실행되지 않는다. 교착이다.
+        (2026-09-15 실측: "cmd_vel 무시" 1,247회 후에도 미해제, 노드 재시작으로만 복구)
+        속도 0 은 이미 멈춘 모터에 무해하면서 필요한 응답을 만들어낸다.
+        """
+        if not self.drive_tripped:
+            return
+        for mid in self.drive_prot:
+            self.send_speed_command(mid, 0)
+
     def shutdown_drive_motors(self):
         """주행 모터 완전 차단. 0x80 만이 실제로 출력을 끊는다.
 
@@ -1489,6 +1550,9 @@ class PositionControlNode(Node):
                 f"주행 보호 작동 중 — cmd_vel 무시 ({self.drive_trip_reason}). "
                 f"전류가 정격 이하로 3초 유지되면 자동 해제됩니다.")
             return
+        self.last_cmd_vel_time = time.time()
+        self.drive_cmd_active = bool(msg.linear.x or msg.angular.z)
+
         # 로그: 수신한 cmd_vel
         self.get_logger().info(
             f'📥 [ROS2] /cmd_vel 수신: linear.x={msg.linear.x:.3f}, angular.z={msg.angular.z:.3f}'
