@@ -34,6 +34,13 @@ MOTOR_TEMP_WARNING = 70   # 경고
 MOTOR_TEMP_CRITICAL = 85  # 위험
 
 
+# 리모콘 아날로그 (0x1E4 DATA[0..3]) — 2026-09-29 실측
+#   DATA[0]=AN1, DATA[1]=AN2, DATA[2]=AN3, DATA[3]=AN4
+#   중립 128(0x80), 최대 250, 최소 6 → 진폭 ±122 대칭. + 가 중립보다 큰 쪽.
+NEUTRAL = 128
+SPAN = 122          # 127 로 나누면 끝까지 밀어도 ±0.96 밖에 안 나온다
+
+
 class CANParser(Node):
     """CAN 메시지를 ROS2 메시지로 변환하는 파서 노드"""
 
@@ -344,17 +351,17 @@ class CANParser(Node):
         """
         조이스틱 아날로그 데이터 파싱 (0x1E4)
 
-        데이터 포맷:
-        - Byte 0-1: AN1 (X축)
-        - Byte 2-3: AN2 (Y축)
-        - Byte 4-5: AN3 (전후진)
-        - Byte 6-7: AN4 (좌우회전)
+        2026-09-29 실측 (3차년도 수신기):
+        - Byte 0~3: 아날로그 4축, 각 1바이트. **중립 0x80(128)**, 범위 약 6~250
+        - Byte 4~7: 0x80 고정 (미배선 예비 채널)
+        기존 주석은 "Byte 0-1 = AN1" 처럼 16비트로 적혀 있었으나 실제는 1바이트씩이다
+        (코드는 원래도 1바이트씩 읽고 있었다).
         """
         if len(data) < 8:
             return
 
         try:
-            # 조이스틱 값 저장 (0-255 범위, 중립=127)
+            # 조이스틱 값 저장 (0~255, 중립=128 — 2026-09-29 실측)
             self.joystick_an1 = data[0]  # X축
             self.joystick_an2 = data[1]  # Y축
             self.joystick_an3 = data[2]  # 전후진
@@ -370,13 +377,25 @@ class CANParser(Node):
         """
         스위치 데이터 파싱 (0x2E4) - Iron-MD 프로토콜
 
-        Byte 0:
-        - Bit 7: Emergency_Stop_Active
-        - Bit 6: Emergency_Stop_Release
+        2026-09-29 실측으로 확인된 매핑 (2차년도와 동일 — 그대로 유효):
 
-        Byte 3:
-        - Bit 4: S19 (Manual 모드)
-        - Bit 5: S20 (Auto 모드)
+        Byte 0: 평상시 0x62 (bit1,5,6 = 1)
+        - Bit 7: Emergency_Stop_Active   — 누르면 0x80
+        - Bit 6: Emergency_Stop_Release  — 평상시 1
+        - Bit 0: **S16 = START / HORN (한 버튼 겸용)** — 평상시엔 경고음, 비상정지 상태에서는
+          복귀(START). 비상정지 해제 시 0x80 → 0x00 → 0x63(S16 누름) → 0x62 로 지나간다.
+        - Bit 2: S13,  Bit 3: S14 — 3차년도 미사용이라 파싱하지 않는다. 필요해지면 여기서 읽으면 된다
+          (기존 코드는 이 둘을 Byte 1 의 bit5/bit6 에서 읽었는데 Byte 1 은 항상 0x00 이다)
+
+        Byte 3: 토글 스위치 8개, 비트 하나씩. 중립이면 해당 비트 0.
+        - Bit 0: S23   Bit 1: S24   Bit 2: S21   Bit 3: S22
+        - Bit 4: S19   Bit 5: S20   Bit 6: S17   Bit 7: S18
+
+        Byte 4 는 하위 4비트 롤링 카운터(0x40~0x4F)이고, Byte 1/2 용도는 미확인이다.
+
+        **비상정지 해제 과정이 0x80 → 0x00 → 0x63 → 0x62 순서로 지나간다.**
+        Bit 7 만 보면 0x00 구간(실측 1.6~2.0초)에서 정지가 풀린 것으로 읽힌다.
+        그래서 Release(bit6) 가 0 인 동안을 정지로 판정한다 — 0x80 과 0x00 을 모두 덮는다.
         """
         if len(data) < 8:
             return
@@ -387,8 +406,9 @@ class CANParser(Node):
             emergency_stop_release = (byte0 >> 6) & 0x01
             emergency_stop_active = (byte0 >> 7) & 0x01
 
-            # 비상정지 상태: Active=1이면 비상정지, Release=1이면 해제
-            emergency_stop = (emergency_stop_active == 1)
+            # Release 가 0 인 동안을 정지로 본다 (Active 만 보면 해제 과정의
+            # 0x00 구간에서 정지가 잠깐 풀린다 — 2026-09-29 실측)
+            emergency_stop = (emergency_stop_active == 1) or (emergency_stop_release == 0)
 
             # Byte 3: S19/S20 모드 스위치
             byte3 = data[3]
@@ -402,26 +422,25 @@ class CANParser(Node):
             remote_msg.emergency_stop = emergency_stop
 
             # 조이스틱 값 포함 (이전에 저장한 값 사용)
-            an1 = getattr(self, 'joystick_an1', 127)
-            an2 = getattr(self, 'joystick_an2', 127)
-            an3 = getattr(self, 'joystick_an3', 127)
-            an4 = getattr(self, 'joystick_an4', 127)
+            an1 = getattr(self, 'joystick_an1', NEUTRAL)
+            an2 = getattr(self, 'joystick_an2', NEUTRAL)
+            an3 = getattr(self, 'joystick_an3', NEUTRAL)
+            an4 = getattr(self, 'joystick_an4', NEUTRAL)
 
-            # float32 배열로 변환 (-1.0 ~ 1.0 범위로 정규화)
-            remote_msg.joysticks = [
-                float((an1 - 127) / 127.0),
-                float((an2 - 127) / 127.0),
-                float((an3 - 127) / 127.0),
-                float((an4 - 127) / 127.0)
-            ]
+            # float32 배열로 변환 (-1.0 ~ 1.0). 실측 진폭 ±122 로 나누고 안전하게 자른다.
+            # 중립은 127 이 아니라 128(0x80) 이다 — 127 로 두면 중립에서도 값이 치우친다.
+            def _norm(v):
+                return float(max(-1.0, min(1.0, (v - NEUTRAL) / float(SPAN))))
 
-            # 기타 스위치들 (Byte 1, 2)
-            byte1 = data[1]
-            byte2 = data[2]
-            s13 = (byte1 >> 5) & 0x01
-            s14 = (byte1 >> 6) & 0x01
+            remote_msg.joysticks = [_norm(an1), _norm(an2), _norm(an3), _norm(an4)]
 
-            # 버튼 재매핑: S17/S18이 byte3 상위 비트(0x40, 0x80)로 들어옴
+            # S13/S14 는 3차년도에서 미사용이라 파싱하지 않는다.
+            # (기존 코드는 Byte 1 의 bit5/bit6 에서 읽었지만 Byte 1 은 항상 0x00 이고,
+            #  실제로 움직이는 건 Byte 0 의 bit2/bit3 이다 — 2026-09-29 실측)
+            s13 = 0
+            s14 = 0
+
+            # S17/S18 은 byte3 상위 비트(0x40, 0x80)
             s17 = (byte3 >> 6) & 0x01
             s18 = (byte3 >> 7) & 0x01
 
