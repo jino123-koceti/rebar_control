@@ -9,13 +9,16 @@
    w / s      전진 / 후진
    a / d      좌선회 / 우선회 (제자리)
    q / e      좌측 횡이동 / 우측 횡이동 (1회전 = 50mm)
-   space      즉시 정지
+   ↑ / ↓      X축 전진 / 후진   (0x145)   ← 누르고 있는 동안만
+   ← / →      Y축 후진 / 전진   (0x146)   ← 누르고 있는 동안만
+   space      즉시 정지(주행+XY)  f   주행부 해제 (0x80, 유지 토크 없어짐)
    z / x      선속도 -/+        c / v   각속도 -/+
-   ?          도움말            Ctrl+C  종료
+   n / m      XY 속도 -/+       ?   도움말        Ctrl+C  종료
 
 키를 떼면 정지한다 (누르고 있는 동안만 주행). 터미널 포커스가 이 창에 있어야 한다.
 """
 
+import os
 import sys
 import select
 import termios
@@ -26,7 +29,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Int32, String
+from std_msgs.msg import Int32, String, Empty, Float32
 
 HELP = __doc__
 
@@ -43,6 +46,63 @@ IDLE_STOP_SEC = 0.3      # 이 시간 동안 주행키 입력이 없으면 정�
 # 그러면 q/e 가 영구히 "진행 중"으로 무시된다 (2026-09-08 실제 발생).
 LAT_TIMEOUT_SEC = 25.0
 
+# --- XY 축 (상부체) ---------------------------------------------------------
+# position_control_node 의 motor_ids = [0x143,0x144,0x145,0x146,0x147] 이고
+# joint_names = [joint_1..joint_5] 로 인덱스가 1:1 대응한다. 따라서
+#   /joint_3/speed -> 0x145 (X축),  /joint_4/speed -> 0x146 (Y축)
+# 주의: position_control_node.py 의 이름 주석(0x145=Yaw, 0x146=X)은 2차년도
+# 기준이라 3차년도 배치와 다르다. 실물 기준은 0x145=X, 0x146=Y 다.
+XY_STEP = 5.0            # n/m 로 조절하는 단위 [dps]
+XY_MIN, XY_MAX = 5.0, 100.0
+XY_IDLE_STOP_SEC = 0.3   # 이 시간 동안 방향키 입력이 없으면 XY 정지 (데드맨)
+
+# --- 키 입력 파싱 -----------------------------------------------------------
+# 방향키는 ESC [ A/B/C/D 3바이트로 온다. 예전 구현은 sys.stdin.read(1) 로 한
+# 바이트씩 읽고 그 사이에 select() 로 뒷바이트를 기다렸는데, 이게 동작하지
+# 않는다: select() 는 커널 fd 를 보는데 sys.stdin.read(1) 은 파이썬 텍스트
+# 버퍼를 거치면서 3바이트를 한꺼번에 버퍼로 당겨온다. 그러면 커널 버퍼가 비어
+# select() 가 실패하고 ESC 단독으로 오인식되며, 남은 '[' 와 'A' 는 나중에
+# 정체불명 키로 따로 들어와 버려진다.
+# 2026-09-22 실측: 33Hz 자동반복에서 방향키 인식률 0/60 (전량 유실).
+# w/a/s/d 는 단일 바이트라 이 경로를 안 타서 멀쩡했고, 그래서 "주행은 되는데
+# XY 만 멈췄다 갔다" 하는 비대칭이 나왔다.
+# → 커널에서 os.read 로 한 번에 다 꺼내 쓰고 버퍼를 직접 파싱한다.
+ESC_MAP = {'A': 'UP', 'B': 'DOWN', 'C': 'RIGHT', 'D': 'LEFT'}
+ESC_WAIT_SEC = 0.05     # 미완성 ESC 꼬리를 이만큼 기다린 뒤 단독 ESC 로 확정
+
+
+def parse_keys(buf):
+    """buf 에서 키를 최대한 뽑아내고, 미완성 이스케이프 꼬리는 남겨 돌려준다."""
+    keys, i = [], 0
+    while i < len(buf):
+        ch = buf[i]
+        if ch != '\x1b':
+            keys.append(ch)
+            i += 1
+            continue
+        if i + 1 >= len(buf):
+            break                       # ESC 만 도착 → 뒷바이트를 더 기다린다
+        if buf[i + 1] != '[':
+            keys.append('\x1b')
+            i += 1
+            continue
+        if i + 2 >= len(buf):
+            break                       # ESC [ 까지만 → 더 기다린다
+        keys.append(ESC_MAP.get(buf[i + 2], '\x1b'))
+        i += 3
+    return keys, buf[i:]
+
+
+def dedupe_repeats(keys):
+    """한 번에 읽어온 묶음 안의 연속 중복은 자동반복이므로 하나로 접는다.
+    누르고 있으면 33Hz 로 들어오는데 on_key 가 매번 발행하면 CAN 이 과하다.
+    유지는 tick() 의 10Hz 재송신이 담당하므로 접어도 끊기지 않는다."""
+    out = []
+    for k in keys:
+        if not out or out[-1] != k:
+            out.append(k)
+    return out
+
 
 class TeleopKeyboard(Node):
     def __init__(self):
@@ -52,12 +112,34 @@ class TeleopKeyboard(Node):
         self.lin = float(self.get_parameter('linear_vel').value)
         self.ang = float(self.get_parameter('angular_vel').value)
 
+        # XY 축: 토픽과 부호를 파라미터로 빼둔다. 실물에서 방향이 반대면
+        # x_sign / y_sign 만 -1 로 바꾸면 되고 코드는 건드릴 필요가 없다.
+        # 2026-09-22: 20 dps 는 체감상 너무 느려 50 으로 올렸다.
+        # n/m 키로 실행 중 5~100 dps 범위에서 조절 가능하고,
+        # 기동 시 --ros-args -p xy_speed_dps:=<값> 으로도 덮을 수 있다.
+        self.declare_parameter('xy_speed_dps', 50.0)
+        self.declare_parameter('x_topic', '/joint_3/speed')   # 0x145
+        self.declare_parameter('y_topic', '/joint_4/speed')   # 0x146
+        self.declare_parameter('x_sign', 1)
+        self.declare_parameter('y_sign', 1)
+        self.xy_speed = float(self.get_parameter('xy_speed_dps').value)
+        self.x_sign = int(self.get_parameter('x_sign').value)
+        self.y_sign = int(self.get_parameter('y_sign').value)
+        x_topic = self.get_parameter('x_topic').value
+        y_topic = self.get_parameter('y_topic').value
+
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.x_pub = self.create_publisher(Float32, x_topic, 10)
+        self.y_pub = self.create_publisher(Float32, y_topic, 10)
         self.lat_pub = self.create_publisher(Int32, '/lateral/step', 10)
+        self.rel_pub = self.create_publisher(Empty, '/drive/release', 10)
         self.create_subscription(String, '/lateral/complete', self.on_lat_done, 10)
         self.create_subscription(String, '/lateral/state', self.on_lat_state, 10)
 
         self.cur = (0.0, 0.0)     # (linear, angular)
+        self.xy = (0.0, 0.0)      # (x_dps, y_dps)
+        self.last_xy_key = 0.0
+        self.xy_warned_nosub = False
         self.last_drive_key = 0.0
         self.lat_state = ""
         self.lat_busy = False
@@ -86,6 +168,22 @@ class TeleopKeyboard(Node):
             print(f"\r  ⚠️ 횡이동 응답 없음 {LAT_TIMEOUT_SEC:.0f}s — 래치 해제. "
                   f"lateral_node 가 떠 있는지 확인하세요" + " " * 10)
             self.print_status()
+        # XY 데드맨: 방향키가 끊기면 즉시 0 을 보낸다.
+        # 0xA2 속도 명령은 다음 명령이 올 때까지 계속 도므로 반드시 필요하다.
+        with self._lock:
+            x, y = self.xy
+            if (x or y) and time.time() - self.last_xy_key > XY_IDLE_STOP_SEC:
+                self.xy = (0.0, 0.0)
+                x, y = 0.0, 0.0
+                stop_xy = True
+            else:
+                stop_xy = False
+        if stop_xy:
+            self.publish_xy(0.0, 0.0)
+            self.print_status()
+        elif x or y:
+            self.publish_xy(x, y)   # 유실 대비 주기 재송신
+
         with self._lock:
             lin, ang = self.cur
             if (lin or ang) and time.time() - self.last_drive_key > IDLE_STOP_SEC:
@@ -102,11 +200,17 @@ class TeleopKeyboard(Node):
         t.angular.z = float(ang)
         self.cmd_pub.publish(t)
 
+    def publish_xy(self, x_dps, y_dps):
+        self.x_pub.publish(Float32(data=float(x_dps)))
+        self.y_pub.publish(Float32(data=float(y_dps)))
+
     def print_status(self):
         lin, ang = self.cur
+        x, y = self.xy
         sys.stdout.write(
             f"\r  주행 lin={lin:+.2f} ang={ang:+.2f} | "
-            f"설정 {self.lin:.2f} m/s, {self.ang:.2f} rad/s"
+            f"XY x={x:+.0f} y={y:+.0f} dps | "
+            f"설정 {self.lin:.2f} m/s, {self.ang:.2f} rad/s, XY {self.xy_speed:.0f} dps"
             f"{' | 횡이동 중' if self.lat_busy else ''}   ")
         sys.stdout.flush()
 
@@ -120,11 +224,48 @@ class TeleopKeyboard(Node):
                 self.last_drive_key = time.time()
             self.print_status()
             return True
+        # 방향키 → XY 축 (누르고 있는 동안만, 데드맨은 tick 에서)
+        xy_keys = {'UP': (1, 0), 'DOWN': (-1, 0), 'RIGHT': (0, 1), 'LEFT': (0, -1)}
+        if k in xy_keys:
+            if self.x_pub.get_subscription_count() == 0:
+                if not self.xy_warned_nosub:
+                    self.xy_warned_nosub = True
+                    print("\r  ✗ XY 구독자 없음 — position_control_node 가 안 떠 있습니다"
+                          + " " * 15)
+                return True
+            self.xy_warned_nosub = False
+            sx, sy = xy_keys[k]
+            with self._lock:
+                self.xy = (sx * self.x_sign * self.xy_speed,
+                           sy * self.y_sign * self.xy_speed)
+                self.last_xy_key = time.time()
+                x, y = self.xy
+            self.publish_xy(x, y)
+            self.print_status()
+            return True
+        if k in ('n', 'm'):
+            self.xy_speed = max(XY_MIN, min(XY_MAX,
+                self.xy_speed + (XY_STEP if k == 'm' else -XY_STEP)))
+            self.print_status()
+            return True
         if k == ' ':
             with self._lock:
                 self.cur = (0.0, 0.0)
+                self.xy = (0.0, 0.0)
             self.publish(0.0, 0.0)
-            print("\r  정지" + " " * 50)
+            self.publish_xy(0.0, 0.0)
+            print("\r  정지 (주행 + XY)" + " " * 40)
+            return True
+        if k == 'f':
+            # 주행부 출력 완전 해제 (0x80). 정지 상태에서 구동계 예하중을 계속
+            # 붙잡고 3~4A 를 쓰는 일이 있어 즉시 놓을 수단을 둔다.
+            with self._lock:
+                self.cur = (0.0, 0.0)
+                self.xy = (0.0, 0.0)
+            self.publish(0.0, 0.0)
+            self.publish_xy(0.0, 0.0)
+            self.rel_pub.publish(Empty())
+            print("\r  🔓 주행부 해제 (0x80) — 유지 토크 없어짐, 경사 주의" + " " * 10)
             return True
         if k in ('q', 'e'):
             if self.lat_busy:
@@ -167,10 +308,27 @@ def main(args=None):
     node.print_status()
     try:
         tty.setcbreak(sys.stdin.fileno())
-        while rclpy.ok():
-            if select.select([sys.stdin], [], [], 0.05)[0]:
-                k = sys.stdin.read(1)
+        fd = sys.stdin.fileno()
+        pending = ''       # 아직 완성되지 않은 이스케이프 꼬리
+        last_read = 0.0
+        stop = False
+        while rclpy.ok() and not stop:
+            if select.select([fd], [], [], 0.05)[0]:
+                # os.read 로 커널 버퍼를 통째로 비운다. sys.stdin.read(1) 을
+                # 쓰면 파이썬 버퍼에 고여 select() 가 뒷바이트를 못 본다.
+                chunk = os.read(fd, 4096).decode('utf-8', 'ignore')
+                if not chunk:
+                    break
+                pending += chunk
+                last_read = time.time()
+            keys, pending = parse_keys(pending)
+            # 꼬리가 제때 안 채워지면 단독 ESC 로 확정하고 흘려보낸다
+            if pending and time.time() - last_read > ESC_WAIT_SEC:
+                keys.extend(list(pending))
+                pending = ''
+            for k in dedupe_repeats(keys):
                 if k == '\x03':          # Ctrl+C
+                    stop = True
                     break
                 node.on_key(k)
     except KeyboardInterrupt:
@@ -179,6 +337,7 @@ def main(args=None):
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
         try:
             node.publish(0.0, 0.0)
+            node.publish_xy(0.0, 0.0)
             time.sleep(0.2)
         except Exception:
             pass
