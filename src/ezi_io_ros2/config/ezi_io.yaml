@@ -47,10 +47,24 @@ ezi_io_lower:
     proximity_front_channel: 4   # IN04: 전방 근접센서 (바닥 비춤)
     proximity_rear_channel: 3    # IN03: 후방 근접센서 (바닥 비춤)
 
-    # 범퍼 센서 (충돌 감지)
-    bumper_front_channel: 8      # IN08: 전방 범퍼
-    bumper_rear_channel: 10      # IN10: 후방 범퍼
-    bumper_left_channel: 11      # IN11: 좌측 범퍼
-    bumper_right_channel: 9      # IN09: 우측 범퍼
+    # 범퍼 센서 (충돌 감지) — 2026-09-22 실측 (하나씩 눌러 확인)
+    # 주의: 접점 극성이 섞여 있다. 전방/후방은 NO(눌리면 ON),
+    #       좌측/우측은 NC(평상시 ON, 눌리면 OFF). 채널만 보고 ON=충돌로 판정하면 안 된다.
+    # 이전 값(8/10/11/9)은 실배선과 전부 달랐다.
+    bumper_front_channel: 7      # IN07: 전방 범퍼  NO (눌림 = ON)
+    bumper_rear_channel: 5       # IN05: 후방 범퍼  NO (눌림 = ON)
+    bumper_left_channel: 13      # IN13: 좌측 범퍼  NC (눌림 = OFF)
+    bumper_right_channel: 10     # IN10: 우측 범퍼  NC (눌림 = OFF)
+    bumper_front_normally_closed: false
+    bumper_rear_normally_closed: false
+    bumper_left_normally_closed: true
+    bumper_right_normally_closed: true
 
-    # IN00~IN02, IN05~IN07, IN12~IN15: 미사용
+    # 조작 스위치 — 2026-09-22 실측. 평상시 둘 다 OFF 였으므로 NO(눌림 = ON)로 판단
+    start_switch_rear_channel: 0   # IN00: 후방 START 스위치
+    stop_switch_channel: 1         # IN01: STOP 스위치
+    # 주의: STOP 이 NO 면 선이 끊겨도 "안 눌림"으로 보인다 (보통 비상정지는 NC 로 배선)
+
+    # IN02: 평상시 ON — 용도 미확인
+    # 근접센서 IN03/IN04 는 미검증 (위 값은 이전 설정 그대로)
+    # 그 외 채널: 미사용
