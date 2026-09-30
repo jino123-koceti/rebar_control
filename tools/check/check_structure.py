@@ -48,6 +48,21 @@ R2_RESOURCES = {
 # 참고 정보로만 출력한다.
 R2_INFO = {'시리얼 포트': r'serial\.Serial\s*\('}
 
+# R3 — 계약(YEAR3_ARCHITECTURE.md §5)에는 있으나 **아직 발행자를 이식하지 않은** 토픽.
+# 이유를 적어두지 않으면 나중에 "왜 허용했는지" 를 알 수 없다.
+R3_PLANNED = {
+    '/deck_edge_block': 'deck_edge 노드 이식 전 (S6)',
+    '/obstacle_pause': 'obstacle_detector 이식 전 (S6)',
+    '/drive/release': '키보드 텔레옵 제거로 발행자가 없어졌다 — 리모콘 버튼 배정 미정',
+    '/sequence_cmd': 'tying_sequence 이식 전 (S5)',
+    '/control_mode_request': 'mode_arbiter 이식 전 (S5)',
+    '/encoder_odom/reset': '외부(UI)에서 부르는 토픽 — 발행자가 저장소에 없다',
+    '/gripper/command': '외부에서 부르는 토픽',
+    '/gripper/position': '외부에서 부르는 토픽',
+    '/rebar/recorder/trigger': '데이터 수집 도구에서 부른다',
+    '/robot_pose': 'pose_mux·ZED 연동 전 (S8)',
+}
+
 # R4 — 아키텍처 문서 §4 의 규모 상한
 R4_LIMITS = {
     'motor_bridge': 600, 'position_control_node': 600, 'remote_bridge': 200,
@@ -171,6 +186,8 @@ def r3_topic_contract():
         if t.startswith(('/tf', '/clock', '/parameter_events', '/zed', '/camera')):
             continue
         if any(pat.match(t) for pat in pub_pat):   # 동적 발행에 해당
+            continue
+        if t in R3_PLANNED:                        # 계약에 있고 이식 전 (이유는 R3_PLANNED)
             continue
         srcs = ", ".join(sorted(next(v for k, v in sub.items() if norm(k) == t)))
         out.append(f"구독만 있고 발행이 없음: {t}  ({srcs})")

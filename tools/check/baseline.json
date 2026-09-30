@@ -17,8 +17,7 @@
   "src/rmd_robot_control/rmd_robot_control/lateral_axes.py",
   "src/rmd_robot_control/rmd_robot_control/lateral_node.py",
   "src/rmd_robot_control/rmd_robot_control/position_control_node.py",
-  "src/rmd_robot_control/rmd_robot_control/remote_teleop_node.py",
-  "src/rmd_robot_control/rmd_robot_control/teleop_keyboard.py"
+  "src/rmd_robot_control/rmd_robot_control/remote_teleop_node.py"
  ],
  "R2 자원 소유자": [
   "CAN (SocketCAN raw) ← src/rebar_base_control/rebar_base_control/remote_bridge.py",
@@ -30,16 +29,9 @@
   "EZIO (Plus-E) ← src/rebar_base_control/rebar_base_control/ezi_io_controller.py"
  ],
  "R3 토픽 계약": [
-  "구독만 있고 발행이 없음: /control_mode_request  (src/rebar_base_control/rebar_base_control/authority_controller.py)",
-  "구독만 있고 발행이 없음: /encoder_odom/reset  (src/rebar_base_control/rebar_base_control/encoder_odom.py)",
-  "구독만 있고 발행이 없음: /gripper/command  (src/seengrip_ros2/seengrip_ros2/seengrip_node.py)",
-  "구독만 있고 발행이 없음: /gripper/position  (src/seengrip_ros2/seengrip_ros2/seengrip_node.py)",
   "구독만 있고 발행이 없음: /joint_trajectory  (src/rmd_robot_control/rmd_robot_control/position_control_node.py)",
   "구독만 있고 발행이 없음: /motor_0x141/position  (src/rmd_robot_control/rmd_robot_control/position_control_node.py)",
-  "구독만 있고 발행이 없음: /motor_0x142/position  (src/rmd_robot_control/rmd_robot_control/position_control_node.py)",
-  "구독만 있고 발행이 없음: /rebar/recorder/trigger  (src/rebar_vision/rebar_vision/dual_camera_recorder_node.py)",
-  "구독만 있고 발행이 없음: /robot_pose  (src/rebar_base_control/rebar_base_control/drive_controller.py, src/rebar_control/rebar_control/performance_test.py, src/rebar_control/rebar_control/rebar_controller.py)",
-  "구독만 있고 발행이 없음: /sequence_cmd  (src/rebar_base_control/rebar_base_control/sequence_controller.py)"
+  "구독만 있고 발행이 없음: /motor_0x142/position  (src/rmd_robot_control/rmd_robot_control/position_control_node.py)"
  ],
  "R4 노드 크기": [
   "src/rebar_base_control/rebar_base_control/drive_controller.py (상한 400)",

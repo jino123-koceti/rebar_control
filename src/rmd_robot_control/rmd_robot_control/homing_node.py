@@ -41,6 +41,7 @@
 """
 
 import json
+import os
 import time
 from enum import Enum
 
@@ -58,15 +59,39 @@ class Phase(Enum):
     FAILED = 'failed'
 
 
-# 축 정의 — config/axes.yaml 과 같은 내용. 파라미터로 덮을 수 있다.
+# 축 정의 — **모터 ID 는 config/axes.yaml 에서 읽는다.** 코드에 0x14X 를 쓰지 않는다
+# (tools/check 의 R1). 2차년도는 ID 가 10개 파일에 흩어져 있어 3차년도로 넘어올 때
+# 주석과 실제가 어긋났다.
 #   joint: 명령 토픽 번호,  home_limit: 원점 리미트,  far_limit: 반대쪽(안전 확인용)
 #   dir: 원점 방향 부호 (실측으로 확정해야 한다 — 기본값은 미검증)
 AXES = {
-    'x':   dict(joint=3, motor='0x145', home_limit='x_min', far_limit='x_max', dir=-1),
-    'y':   dict(joint=4, motor='0x146', home_limit='y_min', far_limit='y_max', dir=-1),
-    'z':   dict(joint=5, motor='0x147', home_limit='z_min', far_limit='z_max', dir=+1),
-    'yaw': dict(joint=6, motor='0x148', home_limit='yaw_home', far_limit=None, dir=-1),
+    'x':   dict(joint=3, home_limit='x_min', far_limit='x_max', dir=-1),
+    'y':   dict(joint=4, home_limit='y_min', far_limit='y_max', dir=-1),
+    'z':   dict(joint=5, home_limit='z_min', far_limit='z_max', dir=+1),
+    'yaw': dict(joint=6, home_limit='yaw_home', far_limit=None, dir=-1),
 }
+
+
+def load_axis_motor_ids():
+    """axes.yaml 의 stage 항목에서 축별 CAN ID 를 읽는다.
+
+    못 읽으면 위치 토픽만 못 구독한다(레퍼런스 기록이 비게 된다). 호밍 자체는
+    리미트로 동작하므로 진행은 가능하다 — 그래서 실패해도 죽이지 않는다.
+    """
+    try:
+        import yaml
+        from ament_index_python.packages import get_package_share_directory
+        p = os.path.join(get_package_share_directory('rebar_base_control'),
+                         'config', 'axes.yaml')
+        stage = (yaml.safe_load(open(p, encoding='utf-8')) or {}).get('stage', {})
+        out = {}
+        for name in AXES:
+            cid = (stage.get(name) or {}).get('can_id')
+            if cid is not None:
+                out[name] = f"0x{int(cid):03X}".lower().replace('0X', '0x')
+        return out
+    except Exception:
+        return {}
 LIMITS = ('x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max', 'yaw_home')
 ALL_ORDER = ('z', 'x', 'y', 'yaw')      # 2차년도와 같은 순서 (Z 를 먼저 안전 위치로)
 
@@ -103,8 +128,12 @@ class HomingNode(Node):
         for n in LIMITS:
             self.create_subscription(Bool, f'/limit_sensors/{n}',
                                      lambda m, k=n: self._on_limit(k, m), 10)
-        for name, cfg in AXES.items():
-            self.create_subscription(Float64, f"/motor_{cfg['motor']}_position",
+        motor_ids = load_axis_motor_ids()
+        if not motor_ids:
+            self.get_logger().warning(
+                "axes.yaml 에서 축 CAN ID 를 읽지 못했습니다 — 위치 레퍼런스는 기록되지 않습니다")
+        for name, mid in motor_ids.items():
+            self.create_subscription(Float64, f"/motor_{mid}_position",
                                      lambda m, k=name: self.pos.__setitem__(k, m.data), 10)
         self.create_subscription(String, '/homing_cmd', self._on_cmd, 10)
 
