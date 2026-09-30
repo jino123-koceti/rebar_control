@@ -55,7 +55,9 @@ class RemoteTeleop(Node):
         self.declare_parameter('xy_max_dps', 50.0)
         self.declare_parameter('z_dps', 50.0)
         self.declare_parameter('deadzone', 0.08)
-        self.declare_parameter('publish_rate', 20.0)
+        # /remote_control 을 받는 즉시 처리한다. 타이머는 **끊김 감시용**이다
+        # (타이머 발행만 쓰면 브릿지 지연에 또 50ms 가 얹힌다 — 2026-09-30 실측)
+        self.declare_parameter('watchdog_rate', 20.0)
         # /remote_control 이 이 시간 이상 끊기면 정지한다 (브릿지 사망·노드 분리)
         self.declare_parameter('remote_timeout', 0.5)
         self.declare_parameter('lateral_timeout', 25.0)
@@ -85,8 +87,11 @@ class RemoteTeleop(Node):
         self.lat_started = 0.0
         self._warned = set()
         self._last_note = None
+        self._pub_state = {}        # 토픽별 (마지막 발행값, 시각)
 
-        self.timer = self.create_timer(1.0 / float(g('publish_rate').value), self.tick)
+        # 타이머는 **감시만** 한다. tick() 을 여기서도 부르면 콜백과 합쳐 56 Hz 로
+        # 이중 발행되어 백엔드 큐를 밀어낸다 (2026-09-30 실측).
+        self.timer = self.create_timer(1.0 / float(g('watchdog_rate').value), self.watchdog)
         self.get_logger().info(
             f"리모콘 텔레옵 시작 — /remote_control 구독, "
             f"주행 {self.max_lin} m/s · {self.max_ang} rad/s, XY {self.xy_max} dps, Z {self.z_dps} dps")
@@ -96,11 +101,36 @@ class RemoteTeleop(Node):
     def _on_remote(self, msg):
         self.remote = msg
         self.last_remote = time.time()
+        self.tick()          # 받는 즉시 반영 — 타이머를 기다리지 않는다
 
     def _on_lat_done(self, msg):
         self.lat_busy = False
         self.lat_started = 0.0
         self.get_logger().info(f"횡이동 완료: {msg.data}")
+
+    def _pub_if_changed(self, pub, key, value, eps, refresh=0.1):
+        """값이 바뀔 때만(또는 refresh 주기마다) 발행한다.
+
+        ⚠ 2026-09-30 실측: 모든 토픽을 36Hz 로 계속 쏘면 position_control_node 의
+        단일 스레드 실행기에서 cmd_vel 콜백이 자리를 차지해 **상부 축 콜백이 3.2Hz 로
+        굶었다**(주행은 36.6Hz). 그래서 상부 X/Y 만 조작이 0.3초 늦게 반응했다.
+        제어값은 바뀔 때만 보내면 충분하고, 유지 구간은 낮은 주기로 새로 고친다.
+        (cmd_vel 은 백엔드 워치독이 0.5초로 보고 있어 새로 고침이 필요하다)
+        """
+        now = time.time()
+        prev = self._pub_state.get(key)
+        if prev is not None and abs(prev[0] - value) <= eps and now - prev[1] < refresh:
+            return False
+        self._pub_state[key] = (value, now)
+        if isinstance(value, float) and pub is self.cmd_pub:
+            return True          # cmd_vel 은 호출부에서 Twist 로 만든다
+        pub.publish(Float32(data=float(value)))
+        return True
+
+    def watchdog(self):
+        """리모콘이 끊겼을 때만 개입한다. 평소 발행은 _on_remote 가 한다."""
+        if self.remote is None or time.time() - self.last_remote > self.remote_timeout:
+            self._stop("/remote_control 끊김")
 
     # ---- 주기 처리 ----------------------------------------------------------
     def _dead(self, v):
@@ -126,18 +156,25 @@ class RemoteTeleop(Node):
         btn = {n: bool(v) for n, v in zip(BUTTON_ORDER, list(r.buttons) + [0] * 8)}
 
         # 주행 — AN3− 가 전진이므로 부호를 뒤집는다
-        t = Twist()
-        t.linear.x = float(-an3 * self.max_lin)
-        t.angular.z = float(an4 * self.max_ang)         # AN4+ = CCW
-        self.cmd_pub.publish(t)
+        lin = float(-an3 * self.max_lin)
+        ang = float(an4 * self.max_ang)                 # AN4+ = CCW
+        now = time.time()
+        prev = self._pub_state.get('cmd_vel')
+        if (prev is None or abs(prev[0][0] - lin) > 0.004 or abs(prev[0][1] - ang) > 0.008
+                or now - prev[1] > 0.1):
+            self._pub_state['cmd_vel'] = ((lin, ang), now)
+            t = Twist()
+            t.linear.x = lin
+            t.angular.z = ang
+            self.cmd_pub.publish(t)
 
         # 상부 X/Y
-        self.x_pub.publish(Float32(data=float(an1 * self.xy_max)))
-        self.y_pub.publish(Float32(data=float(an2 * self.xy_max)))
+        self._pub_if_changed(self.x_pub, 'x', float(an1 * self.xy_max), 0.5)
+        self._pub_if_changed(self.y_pub, 'y', float(an2 * self.xy_max), 0.5)
 
         # Z축 — 누르고 있는 동안만. 둘 다 눌리면 정지
         z = 0.0 if btn['S13'] == btn['S14'] else (self.z_dps if btn['S13'] else -self.z_dps)
-        self.z_pub.publish(Float32(data=float(z)))
+        self._pub_if_changed(self.z_pub, 'z', float(z), 0.5)
 
         # 횡이동 — 누른 순간에만, 완료까지 래치
         if self.lat_busy and self.lat_started and \
@@ -166,13 +203,15 @@ class RemoteTeleop(Node):
                 self.get_logger().warning(f"{name}: {why}")
 
         self.prev = btn
-        self._note(f"Remote  주행 {t.linear.x:+.2f}/{t.angular.z:+.2f}  "
+        self._note(f"Remote  주행 {lin:+.2f}/{ang:+.2f}  "
                    f"XY {an1*self.xy_max:+.0f}/{an2*self.xy_max:+.0f}  Z {z:+.0f}")
 
     def _stop(self, reason):
+        # 정지는 변화 기반을 거치지 않고 항상 보낸다 — 늦거나 빠지면 안 된다
         self.cmd_pub.publish(Twist())
         for pub in (self.x_pub, self.y_pub, self.z_pub):
             pub.publish(Float32(data=0.0))
+        self._pub_state.clear()
         self._note(f"정지 — {reason}")
 
     def _note(self, msg):

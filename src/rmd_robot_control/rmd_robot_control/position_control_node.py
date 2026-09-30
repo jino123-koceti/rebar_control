@@ -239,11 +239,14 @@ class PositionControlNode(Node):
         )
         
         # CMD_VEL 토픽 추가
+        # ⚠ 큐 깊이 1. 2026-09-30 실측: 깊이 10 이면 들어오는 36Hz 를 19Hz 로 처리하면서
+        #   밀린 10개(≈280ms)를 순서대로 처리해 조작이 그만큼 늦게 반응했다.
+        #   제어 명령은 **최신값만** 의미가 있으므로 오래된 것은 버리는 게 맞다.
         self.cmd_vel_subscription = self.create_subscription(
             Twist,
             'cmd_vel',
             self.cmd_vel_callback,
-            10
+            1
         )
         
         self.joint_state_publisher = self.create_publisher(
@@ -314,7 +317,7 @@ class PositionControlNode(Node):
                 Float32,
                 topic_name,
                 lambda msg, idx=i: self.single_joint_speed_callback(msg, idx),
-                10
+                1      # 최신 속도만 쓴다 (위 cmd_vel 주석 참고)
             )
             self.joint_speed_subscriptions.append(subscription)
         
@@ -629,24 +632,50 @@ class PositionControlNode(Node):
         self.send_position_command(motor_id, target_position, custom_speed)
     
     def single_joint_speed_callback(self, msg: Float32, joint_index: int):
-        """단일 관절 속도 명령 콜백 (0x144, 0x145용)"""
+        """단일 관절 속도 명령 콜백.
+
+        ⚠ 2026-09-30: 여기서 메시지마다 INFO 2줄(journald + 파일)을 쓰고 있었다.
+        그 탓에 이 콜백 처리량이 **19 Hz** 로 묶여, 56 Hz 로 들어오는 명령이 큐에 밀려
+        리모콘 입력이 체감상 느렸다 (실측 입력→구동 179 ms, 놓음→정지 252 ms).
+        → 값이 실제로 바뀔 때만 로그를 남긴다. 유지 구간(같은 값 반복)은 조용히 보낸다.
+        """
         if joint_index >= len(self.motor_ids):
             return
         
         motor_id = self.motor_ids[joint_index]
         speed_dps = msg.data  # degree per second
+
+        # 값이 바뀔 때만 로그 (연속 같은 값은 초당 수십 번 들어온다)
+        if not hasattr(self, '_last_joint_speed'):
+            self._last_joint_speed = {}
+        changed = abs(self._last_joint_speed.get(motor_id, 0.0) - speed_dps) > 0.5
+        self._last_joint_speed[motor_id] = speed_dps
+        if changed:
+            self.get_logger().info(
+                f'📥 [ROS2] /joint_{joint_index+1}/speed 수신: {speed_dps:.1f} dps (motor 0x{motor_id:03X})'
+            )
         
-        # 로그: 수신한 속도 명령
-        self.get_logger().info(
-            f'📥 [ROS2] /joint_{joint_index+1}/speed 수신: {speed_dps:.1f} dps (motor 0x{motor_id:03X})'
-        )
-        
+        # 같은 값이면 굳이 다시 보내지 않는다.
+        # 0xA2 를 받은 모터는 **그 속도를 계속 유지**하므로 매 메시지마다 재송신할
+        # 이유가 없다. 다만 완전히 끊으면 모터측 워치독·진단이 불리해서 10Hz 로 새로 고친다.
+        now = time.time()
+        if not hasattr(self, '_last_speed_sent'):
+            self._last_speed_sent = {}
+        prev_val, prev_t = self._last_speed_sent.get(motor_id, (None, 0.0))
+        # 갱신 주기 30ms (약 33Hz). 100ms 로 두면 모터 피드백(0xA2 응답)도 그만큼만 와서
+        # 램프·실제속도를 관측할 수 없고, 제어 상태 추정이 늦는다.
+        # 송신 간격이 2ms 이므로 이 정도 빈도는 버스에 부담이 없다.
+        if prev_val is not None and abs(prev_val - speed_dps) <= 0.5 and now - prev_t < 0.03:
+            return
+        self._last_speed_sent[motor_id] = (speed_dps, now)
+
         # 속도 명령 전송 (0xA2)
         speed_control = int(speed_dps * 100)  # 0.01 dps/LSB
         
-        self.get_logger().info(
-            f'CAN2: 0x{motor_id:03X} 속도 명령: {speed_dps:.1f} dps (제어값={speed_control})'
-        )
+        if changed:
+            self.get_logger().info(
+                f'CAN2: 0x{motor_id:03X} 속도 명령: {speed_dps:.1f} dps (제어값={speed_control})'
+            )
         
         self.send_speed_command_single(motor_id, speed_control)
     
@@ -1566,11 +1595,18 @@ class PositionControlNode(Node):
             return
         self.last_cmd_vel_time = time.time()
         self.drive_cmd_active = bool(msg.linear.x or msg.angular.z)
+        if self.drive_cmd_active:
+            # 다음 정지 전이를 다시 찍을 수 있게 래치를 푼다
+            self._drive_stop_logged = False
 
         # 로그: 수신한 cmd_vel
-        self.get_logger().info(
-            f'📥 [ROS2] /cmd_vel 수신: linear.x={msg.linear.x:.3f}, angular.z={msg.angular.z:.3f}'
-        )
+        # 값이 바뀔 때만 로그 (같은 명령이 초당 수십 번 들어온다 — 로그가 처리량을 깎는다)
+        _cv = (round(msg.linear.x, 3), round(msg.angular.z, 3))
+        if getattr(self, '_last_cmd_vel_log', None) != _cv:
+            self._last_cmd_vel_log = _cv
+            self.get_logger().info(
+                f'📥 [ROS2] /cmd_vel 수신: linear.x={msg.linear.x:.3f}, angular.z={msg.angular.z:.3f}'
+            )
         
         # 선속도와 각속도 제한
         linear_vel = max(-self.max_linear_vel, min(self.max_linear_vel, msg.linear.x))
@@ -1579,7 +1615,9 @@ class PositionControlNode(Node):
         # 정지 명령 확인
         if abs(linear_vel) < 0.001 and abs(angular_vel) < 0.001:
             # 속도 0 명령으로 정지 (0xA2)
-            self.get_logger().info(f"Motors 0x141, 0x142 stopped")
+            if not getattr(self, '_drive_stop_logged', False):
+                self._drive_stop_logged = True
+                self.get_logger().info("주행 모터 정지")
             self.debug_logger.debug(f"STOP command: 0x141, 0x142 (speed=0)")
             
             # 0x141 속도 0

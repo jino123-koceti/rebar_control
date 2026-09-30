@@ -35,7 +35,13 @@ class CANManager:
         self.callbacks = {}
         self._lock = threading.Lock()
         self._last_send_time = 0.0  # 마지막 전송 시간 추적
-        self._min_send_interval = 0.01  # 최소 전송 간격 (10ms)
+        # 최소 전송 간격. 전역 락 안에서 sleep 하므로 이 값이 **전체 송신 상한**이 된다.
+        # ⚠ 2026-09-30 실측: 10ms 였고, 그래서 초당 100프레임이 상한이었다.
+        #   모터 5대에 명령을 내리면 각 19Hz 로 떨어지고, 새 명령이 앞선 송신들 뒤에
+        #   줄을 서서 **리모콘 입력이 300ms 늦게 반응**했다.
+        #   1 Mbps 에서 8바이트 프레임은 약 130µs 다. 2ms 면 초당 500프레임(버스의 약 6%)
+        #   으로 여유가 크다. 실측 시 bus-error 0 을 확인하고 내렸다.
+        self._min_send_interval = 0.002  # 2ms (초당 최대 500프레임)
 
     def connect(self) -> bool:
         """CAN 인터페이스 연결"""

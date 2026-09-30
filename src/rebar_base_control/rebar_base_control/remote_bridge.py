@@ -70,7 +70,10 @@ class RemoteBridge(Node):
         super().__init__('remote_bridge')
 
         self.declare_parameter('can_interface', 'can3')
-        self.declare_parameter('publish_rate', 20.0)
+        # 프레임을 받는 즉시 발행한다 (0x2E4 는 60ms 주기). 타이머는 **끊김 감시용**이다.
+        # 타이머로만 발행하면 수신 60ms + 타이머 50ms 로 입력 지연이 쌓인다
+        # (2026-09-30 실측: 조작이 느리다는 체감의 원인).
+        self.declare_parameter('watchdog_rate', 20.0)
         # 이 시간 동안 프레임이 없으면 통신 끊김으로 본다 (수신기·버스 단절)
         self.declare_parameter('frame_timeout', 0.3)
 
@@ -85,6 +88,7 @@ class RemoteBridge(Node):
         self.sw3 = 0x00
         self.last_frame = 0.0
         self.hb_count = 0
+        self.drained = 0      # 버려진(오래된) 프레임 수 — 지연 진단용
         self.sock = None
         self._warned_stale = False
 
@@ -93,7 +97,7 @@ class RemoteBridge(Node):
         self.rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
         self.rx_thread.start()
         self.timer = self.create_timer(
-            1.0 / float(self.get_parameter('publish_rate').value), self.publish_tick)
+            1.0 / float(self.get_parameter('watchdog_rate').value), self.publish_tick)
         self.get_logger().info(f"리모콘 브릿지 시작 — {self.iface} → /remote_control")
 
     # ---- CAN ---------------------------------------------------------------
@@ -132,18 +136,44 @@ class RemoteBridge(Node):
                 time.sleep(RECONNECT_SEC)
                 self._open()
                 continue
-            cid, dlc = struct.unpack("=IB3x", frame[:8])
-            cid &= socket.CAN_EFF_MASK
-            data = frame[8:8 + dlc]
-            with self._lock:
-                if cid == CAN_ID_ANALOG and len(data) >= 4:
-                    self.analog = list(data[:4])
-                    self.last_frame = time.time()
-                elif cid == CAN_ID_SWITCH and len(data) >= 4:
-                    self.sw0, self.sw3 = data[0], data[3]
-                    self.last_frame = time.time()
-                elif cid == CAN_ID_HEARTBEAT:
-                    self.hb_count += 1
+            # ★ 밀린 프레임을 모두 비우고 **가장 최신 것만** 쓴다.
+            # 2026-09-30 실측: 이걸 안 하면 수신 버퍼에 쌓인 프레임을 오래된 순서대로
+            # 처리하게 되어, 버스에 프레임이 뜬 시각과 /remote_control 발행 사이가
+            # **242 ms** 벌어졌다 (전체 지연 405 ms 중 최대 구간).
+            # 제어 입력은 최신값만 의미가 있으므로 중간 프레임은 버리는 게 맞다.
+            frames = [frame]
+            try:
+                self.sock.settimeout(0.0)
+                while True:
+                    frames.append(self.sock.recv(16))
+            except (BlockingIOError, socket.timeout, OSError):
+                pass
+            finally:
+                try:
+                    self.sock.settimeout(0.2)
+                except OSError:
+                    pass
+            if len(frames) > 1:
+                self.drained += len(frames) - 1
+
+            fresh = False
+            for frame in frames:
+                cid, dlc = struct.unpack("=IB3x", frame[:8])
+                cid &= socket.CAN_EFF_MASK
+                data = frame[8:8 + dlc]
+                with self._lock:
+                    if cid == CAN_ID_ANALOG and len(data) >= 4:
+                        self.analog = list(data[:4])
+                        self.last_frame = time.time()
+                    elif cid == CAN_ID_SWITCH and len(data) >= 4:
+                        self.sw0, self.sw3 = data[0], data[3]
+                        self.last_frame = time.time()
+                        fresh = True
+                    elif cid == CAN_ID_HEARTBEAT:
+                        self.hb_count += 1
+            if fresh:
+                # 비운 프레임 중 마지막 상태로 한 번만 발행한다
+                self.publish_tick()
 
     # ---- 발행 --------------------------------------------------------------
     @staticmethod
