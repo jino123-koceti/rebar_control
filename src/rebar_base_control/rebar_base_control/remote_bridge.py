@@ -89,6 +89,12 @@ class RemoteBridge(Node):
         self.last_frame = 0.0
         self.hb_count = 0
         self.drained = 0      # 버려진(오래된) 프레임 수 — 지연 진단용
+        # 공백 진단: 수신·발행이 이 시간 이상 끊기면 경고를 남긴다.
+        # 2026-09-30 실측: 스틱을 놓은 뒤 명령이 960ms 끊긴 구간이 있었는데 어느 단계에서
+        # 멈춘 것인지 밖에서는 구분할 수 없었다 → 각 노드가 스스로 남기게 한다.
+        self._gap_warn_sec = 0.15
+        self._last_rx_log = 0.0
+        self._last_pub_log = 0.0
         self.sock = None
         self._warned_stale = False
 
@@ -171,6 +177,13 @@ class RemoteBridge(Node):
                         fresh = True
                     elif cid == CAN_ID_HEARTBEAT:
                         self.hb_count += 1
+            now = time.time()
+            if self._last_rx_log and now - self._last_rx_log > self._gap_warn_sec:
+                self.get_logger().warning(
+                    f"수신 공백 {(now - self._last_rx_log)*1000:.0f}ms "
+                    f"(버린 프레임 누적 {self.drained})")
+            self._last_rx_log = now
+
             if fresh:
                 # 비운 프레임 중 마지막 상태로 한 번만 발행한다
                 self.publish_tick()
@@ -220,6 +233,10 @@ class RemoteBridge(Node):
         msg.buttons = [1 if flags[n] else 0 for n in BUTTON_ORDER]
         msg.an_command = 1 if bool(sw0 >> BIT_S16 & 1) else 0   # S16 START/HORN
         self.pub.publish(msg)
+        now2 = time.time()
+        if self._last_pub_log and now2 - self._last_pub_log > self._gap_warn_sec:
+            self.get_logger().warning(f"발행 공백 {(now2 - self._last_pub_log)*1000:.0f}ms")
+        self._last_pub_log = now2
 
     def destroy_node(self):
         self.running = False

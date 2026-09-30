@@ -1,0 +1,29 @@
+# 3차년도 장비 시리얼 장치 이름 고정
+#
+# 왜 필요한가: 그리퍼(RS485)와 Pololu 트리거가 **둘 다 /dev/ttyUSB0 을 기본값으로**
+# 쓰도록 코드에 적혀 있다 (pololu_node, seengrip_node, modbus_controller).
+# 꽂는 순서에 따라 누가 ttyUSB0 이 될지 달라지므로, 엉뚱한 장치에 명령이 갈 수 있다.
+#
+# 설치:
+#   sudo cp 99-rebar-serial.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# 확인:
+#   ls -l /dev/seengrip_gripper /dev/pololu_trigger
+#
+# ⚠ 사용자가 dialout 그룹에 있어야 포트를 열 수 있다 (2026-09-30 확인: koceti 가 없었다):
+#   sudo usermod -aG dialout koceti      # 재로그인 후 적용
+
+# ── 그리퍼 (Seengrip, Modbus RTU) ─────────────────────────────────────────
+# FTDI FT232R, 시리얼 B000OTDG — 2026-09-30 실측으로 그리퍼임을 확인
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", \
+  ATTRS{serial}=="B000OTDG", SYMLINK+="seengrip_gripper", GROUP="dialout", MODE="0660"
+
+# 같은 모델을 또 쓰게 되면 시리얼로 구분해야 한다. 시리얼 확인:
+#   udevadm info -a -n /dev/ttyUSB0 | grep ATTRS{serial}
+
+# ── Pololu 트리거 ─────────────────────────────────────────────────────────
+# Pololu 벤더 ID 0x1ffb. 모델별 PID 가 달라 벤더만 본다.
+# ⚠ 2026-09-30 현재 장비에 연결되어 있지 않아 **미검증 규칙**이다.
+#   연결한 뒤 `udevadm info -a -n /dev/ttyACM0` 로 실제 값을 확인하고 필요하면 좁힐 것.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1ffb", \
+  SYMLINK+="pololu_trigger", GROUP="dialout", MODE="0660"

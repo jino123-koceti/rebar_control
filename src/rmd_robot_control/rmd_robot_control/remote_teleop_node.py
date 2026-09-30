@@ -88,6 +88,9 @@ class RemoteTeleop(Node):
         self._warned = set()
         self._last_note = None
         self._pub_state = {}        # 토픽별 (마지막 발행값, 시각)
+        # 공백 진단 (remote_bridge 와 같은 목적)
+        self._gap_warn_sec = 0.15
+        self._last_rx_log = 0.0
 
         # 타이머는 **감시만** 한다. tick() 을 여기서도 부르면 콜백과 합쳐 56 Hz 로
         # 이중 발행되어 백엔드 큐를 밀어낸다 (2026-09-30 실측).
@@ -100,7 +103,12 @@ class RemoteTeleop(Node):
     # ---- 수신 --------------------------------------------------------------
     def _on_remote(self, msg):
         self.remote = msg
-        self.last_remote = time.time()
+        now = time.time()
+        if self._last_rx_log and now - self._last_rx_log > self._gap_warn_sec:
+            self.get_logger().warning(
+                f"/remote_control 수신 공백 {(now - self._last_rx_log)*1000:.0f}ms")
+        self._last_rx_log = now
+        self.last_remote = now
         self.tick()          # 받는 즉시 반영 — 타이머를 기다리지 않는다
 
     def _on_lat_done(self, msg):

@@ -10,6 +10,7 @@ from rclpy.node import Node
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray, Float32, Int32, Empty
+from rebar_base_interfaces.msg import SafetyState
 from geometry_msgs.msg import Twist
 from std_srvs.srv import Trigger
 import struct
@@ -73,6 +74,24 @@ class PositionControlNode(Node):
         self.declare_parameter('drive_i_hard_a', 18.0)
         # cmd_vel 이 이 시간 이상 끊기면 주행을 자동 정지한다. 0 이면 비활성.
         self.declare_parameter('cmd_vel_timeout', 0.5)
+        # 관절(상부 축) 속도 명령이 끊겼을 때 자동 정지하는 시간.
+        # 주행에는 워치독이 있었지만 **관절에는 없었다** — 0xA2 는 마지막 속도를
+        # 계속 유지하므로, 명령이 끊기면 축이 그대로 돌아간다.
+        # 2026-09-30 실측: 스틱을 놓은 뒤 명령이 960ms 끊긴 구간에서 X축이 50dps 로
+        # 계속 돌았다(실제속도 확인). 원인 규명과 별개로 보호가 필요하다.
+        self.declare_parameter('joint_speed_timeout', 0.3)
+        # L2(safety_node)의 판정을 받아 **여기서 최종 차단**한다.
+        # 상위에서 막으면 "무엇이 명령했든" 을 보장할 수 없다 (아키텍처 §2 규칙 4).
+        # /safety/state 가 이 시간 이상 안 오면 안전 노드가 죽은 것으로 보고 정지한다.
+        # ⚠ 기본값 0 = 비활성. 안전 노드를 띄우지 않은 상태에서 갑자기 모든 명령이
+        #   막히면 그게 더 위험하므로, 도입은 명시적으로 켠다.
+        self.declare_parameter('safety_timeout', 0.0)
+        # ⚠ 모터측 통신두절 보호 (RMD 0xB3). **주행모터에만** 건다.
+        #   젯슨이 하드프리즈하면 SW 워치독도 같이 멈춰 무용지물이다 — 모터가 이 시간 안에
+        #   명령을 못 받으면 스스로 출력을 끊는다. 2차년도 2026-08-06 도입 근거와 같다.
+        #   정상 주행 중엔 0xA2·폴링이 하트비트가 되어 걸리지 않는다.
+        #   스테이지·Yaw 에는 절대 걸지 말 것 — 유휴 시 명령이 끊겨 오작동한다.
+        self.declare_parameter('drive_motor_watchdog_ms', 500)   # 0 = 비활성
         
         # 파라미터 가져오기
         self.can_interface = self.get_parameter('can_interface').value
@@ -93,6 +112,13 @@ class PositionControlNode(Node):
         self.max_angular_vel = self.get_parameter('max_angular_vel').value
         self.drive_i_hard_a = float(self.get_parameter('drive_i_hard_a').value)
         self.cmd_vel_timeout = float(self.get_parameter('cmd_vel_timeout').value)
+        self.joint_speed_timeout = float(self.get_parameter('joint_speed_timeout').value)
+        # 관절별 마지막 속도 명령: {motor_id: (speed_dps, 시각)}
+        self.joint_speed_active = {}
+        self.safety_timeout = float(self.get_parameter('safety_timeout').value)
+        self.safety = None          # 마지막 SafetyState
+        self.safety_time = 0.0
+        self._safety_blocked_logged = None
         
         # CAN 매니저 및 프로토콜 초기화
         self.can_manager = CANManager(self.can_interface)
@@ -187,6 +213,10 @@ class PositionControlNode(Node):
         self.drive_cmd_active = False # 0 이 아닌 주행 명령이 살아 있는가
         self.drive_trip_reason = ""
         self.drive_normal_since = None
+
+        # 모터 ID → 축 이름. 안전 차단에서 "x+" 같은 방향 표기와 맞추기 위한 것이다.
+        # axes.yaml 과 같은 배치 (3차년도 실측).
+        self.AXIS_BY_MOTOR = {0x145: 'x', 0x146: 'y', 0x147: 'z', 0x148: 'yaw'}
 
         # 모터 전류 보호 시스템
         #
@@ -327,6 +357,8 @@ class PositionControlNode(Node):
         # 있어(2026-09-15 실측, 온도 51°C 까지 상승) 조작자가 즉시 풀 수 있게 한다.
         self.drive_release_sub = self.create_subscription(
             Empty, '/drive/release', self.drive_release_callback, 10)
+        self.safety_sub = self.create_subscription(
+            SafetyState, '/safety/state', self._on_safety, 1)
 
         self.left_wheel_position_sub = self.create_subscription(
             Float64MultiArray,
@@ -347,6 +379,7 @@ class PositionControlNode(Node):
         self.position_control_timer = self.create_timer(0.1, self.position_control_loop)  # 10Hz로 변경 (과부하 방지)
         # cmd_vel 끊김 감시 (10Hz) 와 보호 래치 해제 구동 (2Hz)
         self.drive_watchdog_timer = self.create_timer(0.1, self.drive_watchdog_tick)
+        self.joint_watchdog_timer = self.create_timer(0.05, self.joint_watchdog_tick)
         self.drive_latch_timer = self.create_timer(0.5, self.drive_latch_tick)
         
         # 서비스 생성
@@ -407,6 +440,7 @@ class PositionControlNode(Node):
 
             # 모터 활성화 (자동 브레이크 해제 비활성화 - GUI에서 수동 제어)
             # self.enable_motors()  # GUI에서 수동으로 브레이크 해제하므로 주석 처리
+            self._arm_drive_motor_watchdog()
             self.get_logger().info("✅ 통합 노드 초기화 완료 (7개 모터)")
         else:
             self.get_logger().error(f"❌ CAN {self.can_interface} 연결 실패")
@@ -645,6 +679,13 @@ class PositionControlNode(Node):
         motor_id = self.motor_ids[joint_index]
         speed_dps = msg.data  # degree per second
 
+        # ── 안전 차단 ────────────────────────────────────────────────────────
+        stop_reason = self._safety_full_stop()
+        if stop_reason is not None:
+            speed_dps = 0.0
+        else:
+            speed_dps = self._safety_clamp_axis(motor_id, speed_dps)
+
         # 값이 바뀔 때만 로그 (연속 같은 값은 초당 수십 번 들어온다)
         if not hasattr(self, '_last_joint_speed'):
             self._last_joint_speed = {}
@@ -668,6 +709,11 @@ class PositionControlNode(Node):
         if prev_val is not None and abs(prev_val - speed_dps) <= 0.5 and now - prev_t < 0.03:
             return
         self._last_speed_sent[motor_id] = (speed_dps, now)
+        # 워치독용: 0 이 아닌 명령이 살아 있는 축을 기록한다
+        if abs(speed_dps) > 0.5:
+            self.joint_speed_active[motor_id] = now
+        else:
+            self.joint_speed_active.pop(motor_id, None)
 
         # 속도 명령 전송 (0xA2)
         speed_control = int(speed_dps * 100)  # 0.01 dps/LSB
@@ -1029,6 +1075,65 @@ class PositionControlNode(Node):
             else:
                 self.drive_normal_since = None
 
+    def _on_safety(self, msg):
+        self.safety = msg
+        self.safety_time = time.time()
+
+    def _safety_active(self):
+        """안전 차단을 적용할 상태인가. (safety_timeout 0 이면 비활성)"""
+        if self.safety_timeout <= 0:
+            return False
+        if self.safety is None:
+            return True             # 켜뒀는데 아직 못 받았다 → 안전측으로 막는다
+        return True
+
+    def _safety_full_stop(self):
+        """전체 정지 사유가 있는가 — 비상정지·STOP·입력두절·안전노드 두절."""
+        if not self._safety_active():
+            return None
+        if self.safety is None:
+            return "안전 상태 수신 전"
+        if time.time() - self.safety_time > self.safety_timeout:
+            return f"/safety/state 두절 {self.safety_timeout:.1f}s 초과"
+        s = self.safety
+        if s.estop:
+            return "비상정지"
+        if s.stop_switch:
+            return "STOP 스위치"
+        if s.inputs_stale:
+            return "안전 입력 두절"
+        return None
+
+    def _safety_clamp_drive(self, linear_vel, angular_vel):
+        """방향별 차단을 적용한다. 부딪힌 방향만 막고 반대는 열어 둔다."""
+        if not self._safety_active() or self.safety is None:
+            return linear_vel, angular_vel
+        s = self.safety
+        if linear_vel > 0 and s.block_forward:
+            linear_vel = 0.0
+        if linear_vel < 0 and s.block_backward:
+            linear_vel = 0.0
+        if angular_vel > 0 and s.block_left:
+            angular_vel = 0.0
+        if angular_vel < 0 and s.block_right:
+            angular_vel = 0.0
+        return linear_vel, angular_vel
+
+    def _safety_clamp_axis(self, motor_id, speed_dps):
+        """리미트에 닿은 축의 그 방향만 막는다 (반대 방향은 빠져나올 수 있게 열어 둔다)."""
+        if not self._safety_active() or self.safety is None or abs(speed_dps) < 0.01:
+            return speed_dps
+        axis = self.AXIS_BY_MOTOR.get(motor_id)
+        if axis is None:
+            return speed_dps
+        want = f"{axis}{'+' if speed_dps > 0 else '-'}"
+        if want in self.safety.blocked_axes:
+            if self._safety_blocked_logged != want:
+                self._safety_blocked_logged = want
+                self.get_logger().warning(f"안전 차단 — {want} 방향 (리미트)")
+            return 0.0
+        return speed_dps
+
     def drive_release_callback(self, msg):
         """주행 모터 출력 완전 차단 (0x80).
 
@@ -1039,6 +1144,31 @@ class PositionControlNode(Node):
         self.get_logger().warning("🔓 주행부 해제 요청 — 0x80 전송 (유지 토크 없어짐)")
         self.drive_cmd_active = False
         self.shutdown_drive_motors()
+
+    def joint_watchdog_tick(self):
+        """관절 속도 명령이 끊기면 해당 축을 정지한다.
+
+        0xA2 를 받은 모터는 그 속도를 계속 유지한다. 그래서 상위 노드가 죽거나
+        발행이 끊기면 축이 계속 돌아간다. 주행에는 워치독이 있었는데 관절에는 없었다.
+        2026-09-30 실측: 스틱을 놓은 뒤 명령이 960ms 끊긴 구간에서 X축이 50dps 로
+        계속 돌았다.
+
+        0 명령은 기록하지 않으므로(joint_speed_active 에서 제거) 정지 상태에서는
+        아무 것도 하지 않는다.
+        """
+        if self.joint_speed_timeout <= 0 or not self.joint_speed_active:
+            return
+        now = time.time()
+        for motor_id, last in list(self.joint_speed_active.items()):
+            if now - last <= self.joint_speed_timeout:
+                continue
+            name = self.motor_current_limits.get(motor_id, {}).get('name', f'0x{motor_id:03X}')
+            self.get_logger().warning(
+                f"⚠️ {name}(0x{motor_id:03X}) 속도 명령 끊김 "
+                f"{self.joint_speed_timeout:.2f}s 초과 — 정지")
+            self.joint_speed_active.pop(motor_id, None)
+            self._last_speed_sent[motor_id] = (0.0, now)
+            self.send_speed_command_single(motor_id, 0)
 
     def drive_watchdog_tick(self):
         """cmd_vel 이 끊기면 주행을 자동 정지한다.
@@ -1612,6 +1742,25 @@ class PositionControlNode(Node):
         linear_vel = max(-self.max_linear_vel, min(self.max_linear_vel, msg.linear.x))
         angular_vel = max(-self.max_angular_vel, min(self.max_angular_vel, msg.angular.z))
 
+        # ── 안전 차단 (L2 판정을 모터 직전에서 적용) ──────────────────────────
+        stop_reason = self._safety_full_stop()
+        if stop_reason is not None:
+            if self._safety_blocked_logged != stop_reason:
+                self._safety_blocked_logged = stop_reason
+                self.get_logger().warning(f"안전 정지 — {stop_reason} (주행 명령 무시)")
+            linear_vel = 0.0
+            angular_vel = 0.0
+        else:
+            before = (linear_vel, angular_vel)
+            linear_vel, angular_vel = self._safety_clamp_drive(linear_vel, angular_vel)
+            if (linear_vel, angular_vel) != before:
+                if self._safety_blocked_logged != 'dir':
+                    self._safety_blocked_logged = 'dir'
+                    self.get_logger().warning(
+                        f"안전 차단 — 방향 차단 적용 ({self.safety.reason})")
+            elif self._safety_blocked_logged is not None:
+                self._safety_blocked_logged = None
+
         # 정지 명령 확인
         if abs(linear_vel) < 0.001 and abs(angular_vel) < 0.001:
             # 속도 0 명령으로 정지 (0xA2)
@@ -1704,6 +1853,31 @@ class PositionControlNode(Node):
         elif not success:
             self.get_logger().warning(f"❌ 모터 0x{motor_id:03X} 속도 명령 전송 실패")
     
+    def _arm_drive_motor_watchdog(self):
+        """주행모터 통신두절 보호 무장 (RMD 0xB3).
+
+        프레임: data[0]=0xB3, data[4:8]=uint32 ms (LE). 0 이면 비활성.
+        모터가 그 시간 안에 어떤 명령도 받지 못하면 스스로 출력을 끊는다. 젯슨이
+        프리즈해도 모터 내부 타이머는 독립이라 폭주를 막는다 (2차년도 실측 근거).
+
+        ⚠ 주행모터(0x141/0x142)에만. 스테이지·Yaw 는 유휴 시 명령이 끊기는 것이 정상이라
+          걸면 오작동한다.
+        """
+        ms = int(self.get_parameter('drive_motor_watchdog_ms').value)
+        if ms <= 0:
+            self.get_logger().info("모터측 통신두절 보호(0xB3) 비활성")
+            return
+        t = ms & 0xFFFFFFFF
+        data = bytes([0xB3, 0x00, 0x00, 0x00,
+                      t & 0xFF, (t >> 8) & 0xFF, (t >> 16) & 0xFF, (t >> 24) & 0xFF])
+        for motor_id in (self.left_motor_id, self.right_motor_id):
+            if self.can_manager.send_frame(motor_id, data):
+                self.get_logger().info(
+                    f"🛡️ 주행모터 0x{motor_id:03X} 통신두절 보호 무장: {ms}ms (0xB3)")
+            else:
+                self.get_logger().error(
+                    f"❌ 0x{motor_id:03X} 통신두절 보호(0xB3) 무장 실패")
+
     def send_speed_command_single(self, motor_id: int, speed_control: int):
         """단일 모터 속도 명령 전송 (0xA2 - Speed Control Command)"""
         data = bytearray(8)

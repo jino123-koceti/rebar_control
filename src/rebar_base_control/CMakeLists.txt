@@ -17,6 +17,8 @@ ament_python_install_package(${PROJECT_NAME})
 install(PROGRAMS
   # L1 하드웨어 계층 — can3 리모콘 소유자 (YEAR3_ARCHITECTURE.md §3)
   rebar_base_control/remote_bridge.py
+  # L2 안전 판정 (차단은 L1 이 한다)
+  rebar_base_control/safety_node.py
   rebar_base_control/can_parser.py
   rebar_base_control/can_sender.py
   rebar_base_control/drive_controller.py
