@@ -50,3 +50,10 @@ data/vision_test/**/frame_*.jpg
 
 # 측정 도구가 쌓는 기록 (세션마다 달라진다)
 tools/test/enc_log.json
+
+# 학습 가중치 — GitHub 100MB 한도를 넘는다. 저장소가 아니라 별도 보관.
+model/
+*.pt
+*.pth
+*.onnx
+*.engine

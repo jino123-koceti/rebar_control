@@ -125,6 +125,8 @@ usb:
 # 교차점 검출 모델 — [확정] 2026-09-30
 model:
   path: src/rebar_control/model/new_weights_260930.pt
+  # ⚠ 이 파일은 **저장소에 없다** (128MB, GitHub 100MB 한도 초과로 .gitignore).
+  #    새로 clone 했으면 별도 보관처에서 받아 위 경로에 놓아야 검출이 뜬다.
   kind: RF-DETR Medium        # ⚠ YOLO 가 아니다. `rfdetr` 패키지가 필요하다
   # 체크포인트에 클래스 이름이 없다(args.class_names is None). 코드가 줘야 한다.
   # **인덱스는 1부터** — slot0 은 자리표시다.
