@@ -33,6 +33,7 @@ Z축 주의: 리프팅축이라 브레이크를 풀면 자중으로 내려앉을
 이 노드가 하지 않는다 (axes.yaml 의 never_auto_release).
 """
 
+import json
 import time
 
 import rclpy
@@ -79,6 +80,13 @@ class RemoteTeleop(Node):
 
         self.create_subscription(RemoteControl, '/remote_control', self._on_remote, 10)
         self.create_subscription(String, '/lateral/complete', self._on_lat_done, 10)
+        # 제어 권한. **내 모드가 아니면 축·주행 명령을 내지 않는다.**
+        # 2026-09-30: 호밍이 30dps 를 보내는 동안 이 노드가 같은 토픽에 "정지(0)" 를
+        # 0.1초마다 새로 보내서, 모터가 30/0 을 번갈아 받아 툭툭 끊겼다 (로그에서
+        # 0.0 이 102회, 30.0 이 103회로 정확히 1:1). 결국 호밍이 스톨로 실패했다.
+        # ⚠ 권한을 잃으면 **정지를 한 번만** 보내고 그 뒤로는 조용히 있어야 한다.
+        #   계속 0 을 보내는 것이 바로 그 문제의 원인이었다.
+        self.create_subscription(String, '/control_mode', self._on_mode, 10)
 
         self.remote = None
         self.last_remote = 0.0
@@ -87,6 +95,9 @@ class RemoteTeleop(Node):
         self.lat_started = 0.0
         self._warned = set()
         self._last_note = None
+        # 중재기가 없으면 예전처럼 동작한다 (이 변경만으로 시스템이 멈추면 안 된다)
+        self._has_control = True
+        self._released = False      # 권한을 잃고 정지를 이미 보냈는가
         self._pub_state = {}        # 토픽별 (마지막 발행값, 시각)
         # 공백 진단 (remote_bridge 와 같은 목적)
         self._gap_warn_sec = 0.15
@@ -104,12 +115,31 @@ class RemoteTeleop(Node):
     def _on_remote(self, msg):
         self.remote = msg
         now = time.time()
+        self.last_remote = now
+        if not self._has_control:
+            return               # 권한이 없으면 발행하지 않는다 (정지는 이미 보냈다)
         if self._last_rx_log and now - self._last_rx_log > self._gap_warn_sec:
             self.get_logger().warning(
                 f"/remote_control 수신 공백 {(now - self._last_rx_log)*1000:.0f}ms")
         self._last_rx_log = now
         self.last_remote = now
         self.tick()          # 받는 즉시 반영 — 타이머를 기다리지 않는다
+
+    def _on_mode(self, msg):
+        try:
+            mode = (json.loads(msg.data) or {}).get('mode', 'manual')
+        except ValueError:
+            return
+        has = (mode == 'manual')
+        if has == self._has_control:
+            return
+        self._has_control = has
+        if not has:
+            self._stop(f"제어 권한 넘김 (현재 모드 {mode})")
+            self._released = True
+        else:
+            self._released = False
+            self._note("제어 권한 회복 — 리모콘 조작 가능")
 
     def _on_lat_done(self, msg):
         self.lat_busy = False
@@ -137,6 +167,8 @@ class RemoteTeleop(Node):
 
     def watchdog(self):
         """리모콘이 끊겼을 때만 개입한다. 평소 발행은 _on_remote 가 한다."""
+        if not self._has_control:
+            return               # 권한이 없으면 워치독 정지도 내지 않는다
         if self.remote is None or time.time() - self.last_remote > self.remote_timeout:
             self._stop("/remote_control 끊김")
 

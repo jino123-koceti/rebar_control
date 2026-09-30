@@ -10,6 +10,7 @@ systemd `rebar-teleop.service` 가 이 파일을 띄운다. 전원만 넣으면 
       ezi_io_node             EZIO 2보드 → 리미트·범퍼·스위치
   L2  safety_node             안전 판정 (차단은 L1 이 한다)
   L3  remote_teleop_node      리모콘 입력 → 축 명령
+  L4  mode_arbiter            제어 권한 중재 (수동/호밍/자율)
 
 2026-09-30: 키보드 텔레옵(`teleop_keyboard`)을 제거하고 리모콘으로 통합했다.
 리모콘으로 주행·상부 축이 동작하는 것을 실장비에서 확인한 뒤 정리했다.
@@ -88,8 +89,14 @@ def generate_launch_description():
         package='rebar_base_control', executable='safety_node.py',
         name='safety_node', output='screen',
     )
+    # L4 권한 중재. 이게 없으면 호밍과 리모콘이 같은 축 토픽에 동시에 써서
+    # 축이 툭툭 끊긴다 (2026-09-30 실측, mode_arbiter.py 주석 참고).
+    mode_arbiter = Node(
+        package='rebar_base_control', executable='mode_arbiter.py',
+        name='mode_arbiter', output='screen',
+    )
 
     return LaunchDescription(args + [
         LogInfo(msg=['리모콘 조작 구성 기동 — 안전 차단: ', use_safety]),
-        motor, lateral, remote_bridge, remote_teleop, ezi_io, safety,
+        motor, lateral, remote_bridge, remote_teleop, ezi_io, safety, mode_arbiter,
     ])

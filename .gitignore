@@ -47,3 +47,6 @@ captured_training/
 # --- vision_test: 대용량 원본/영상 제외 (요약 PNG만 커밋) ---
 data/vision_test/**/*.mp4
 data/vision_test/**/frame_*.jpg
+
+# 측정 도구가 쌓는 기록 (세션마다 달라진다)
+tools/test/enc_log.json

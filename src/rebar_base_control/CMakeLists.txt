@@ -19,6 +19,8 @@ install(PROGRAMS
   rebar_base_control/remote_bridge.py
   # L2 안전 판정 (차단은 L1 이 한다)
   rebar_base_control/safety_node.py
+  # L4 제어 권한 중재 — 누가 축·주행에 쓸 수 있는지 한 곳에서 정한다
+  rebar_base_control/mode_arbiter.py
   rebar_base_control/can_parser.py
   rebar_base_control/can_sender.py
   rebar_base_control/drive_controller.py
