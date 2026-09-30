@@ -9,7 +9,7 @@ import rclpy
 from rclpy.node import Node
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray, Float32, Int32, Empty
+from std_msgs.msg import Float64MultiArray, Float32, Int32, Empty, String
 from rebar_base_interfaces.msg import SafetyState
 from geometry_msgs.msg import Twist
 from std_srvs.srv import Trigger
@@ -360,6 +360,33 @@ class PositionControlNode(Node):
         self.safety_sub = self.create_subscription(
             SafetyState, '/safety/state', self._on_safety, 1)
 
+        # 축별 브레이크. 기존 서비스(`safe_brake_release`)는 **전 모터를 한꺼번에** 푼다.
+        # Z 는 리프팅축이라 풀면 자중으로 내려앉을 수 있어 자동 해제에서 빼야 하고
+        # (`axes.yaml` brake.never_auto_release), 호밍도 돌리는 축만 풀고 시작한다.
+        #   ros2 topic pub --once /brake_cmd std_msgs/String "{data: 'release x,y'}"
+        #   ros2 topic pub --once /brake_cmd std_msgs/String "{data: 'lock x,y'}"
+        #   ros2 topic pub --once /brake_cmd std_msgs/String "{data: 'release z force'}"
+        self.brake_cmd_sub = self.create_subscription(
+            String, '/brake_cmd', self._on_brake_cmd, 10)
+
+        # 단회전 절대 위치 발행 (0x61 mod 262144).
+        # **멀티턴은 전원에 날아가지만 단회전값은 물리적으로 고정**이라, 전원 재투입
+        # 후에도 "지금 어느 각도인가" 를 말해준다. 호밍 전제 검사(yaw 가 12시 근처인가)
+        # 와 기구 무결성 검사(커플링이 미끄러졌나)에 쓴다.
+        # 2026-09-30: yaw 감지판을 옮겼을 때 이 값이 275104→205327 로 바뀌었다.
+        self.encoder_single_pubs = {
+            mid: self.create_publisher(Int32, f"motor_{hex(mid)}/encoder_single", 10)
+            for mid in self.motor_ids}
+        self.encoder_single = {}
+
+        # 엔코더 명령 진단. 어떤 읽기 명령이 이 모터에서 실제로 동작하는지 확인한다.
+        #   ros2 topic pub --once /encoder_probe std_msgs/String "{data: 'yaw'}"
+        # 멀티턴(0x92)은 전원을 내리면 사라진다. 자세를 저장해 두려면 **싱글턴
+        # 앱솔루트**가 필요해서, 0x90·0x94·0x60·0x61·0x62 중 무엇이 응답하는지 봐야 한다.
+        # (횡이동에서는 0x90 이 응답하지 않아 0x61 을 썼다 — 개체마다 다르다.)
+        self.encoder_probe_sub = self.create_subscription(
+            String, '/encoder_probe', self._on_encoder_probe, 10)
+
         self.left_wheel_position_sub = self.create_subscription(
             Float64MultiArray,
             '/motor_0x141/position',
@@ -381,6 +408,8 @@ class PositionControlNode(Node):
         self.drive_watchdog_timer = self.create_timer(0.1, self.drive_watchdog_tick)
         self.joint_watchdog_timer = self.create_timer(0.05, self.joint_watchdog_tick)
         self.drive_latch_timer = self.create_timer(0.5, self.drive_latch_tick)
+        # 1Hz 면 충분하다 — 사람이 축을 옮기는 속도에 비하면 빠르고, CAN 부담도 작다
+        self.encoder_single_timer = self.create_timer(1.0, self._read_encoder_single)
         
         # 서비스 생성
         self.brake_release_service = self.create_service(
@@ -553,6 +582,162 @@ class PositionControlNode(Node):
         else:
             self.get_logger().info("✅ 브레이크 잠금 완료")
 
+    # 찔러볼 엔코더 읽기 명령. 이름은 참고용이고, 실제로 응답하는지가 중요하다.
+    PROBE_COMMANDS = (
+        (0x90, '싱글턴 엔코더 원시(위치/원위치/오프셋)'),
+        (0x92, '멀티턴 각도 (전원 내리면 사라짐)'),
+        (0x94, '싱글턴 각도 0.01도'),
+        (0x60, '멀티턴 엔코더 위치'),
+        (0x61, '멀티턴 엔코더 원위치'),
+        (0x62, '멀티턴 엔코더 영점 오프셋'),
+    )
+
+    def _on_encoder_probe(self, msg):
+        """축 하나에 엔코더 읽기 명령을 차례로 보내고 원시 응답을 로그로 남긴다.
+
+        `ros2 topic pub --once /encoder_probe std_msgs/String "{data: 'yaw'}"`
+        축 이름 대신 `0x148` 처럼 CAN ID 를 직접 줘도 된다.
+        """
+        tok = msg.data.strip().lower()
+        # `yaw:0x61` 처럼 명령 하나만 지정할 수 있다. 전체를 돌리면 6개×0.25초라
+        # 1.5초가 걸려, 움직임 직후를 잡아야 하는 측정에는 너무 느리다.
+        only = None
+        idx = None
+        # `yaw:raw:A200000048F4FFFF` — 8바이트 원시 프레임을 그대로 보낸다.
+        # 노드의 인코딩을 우회해야 프로토콜 해석 차이를 시험할 수 있다.
+        if ':raw:' in tok:
+            name, hexs = tok.split(':raw:', 1)
+            by = {v: k for k, v in self.AXIS_BY_MOTOR.items()}
+            mid = by.get(name.strip())
+            if mid is None:
+                try: mid = int(name, 0)
+                except ValueError:
+                    self.get_logger().error(f"원시 전송: 축을 모르겠습니다 '{name}'"); return
+            hexs = hexs.strip().replace(' ', '')
+            try: frame = bytes.fromhex(hexs)
+            except ValueError:
+                self.get_logger().error(f"원시 전송: 16진수가 아닙니다 '{hexs}'"); return
+            if len(frame) != 8:
+                self.get_logger().error(f"원시 전송: 8바이트여야 합니다 ({len(frame)})"); return
+            self._probe_until = time.time() + 2.5
+            self.get_logger().info(f"[PROBE] 0x{mid:03X} → RAW {frame.hex().upper()}")
+            if not self.can_manager.send_frame(mid, frame):
+                self.get_logger().warning("[PROBE] 원시 전송 실패")
+            return
+        if ':' in tok:
+            tok, cmd_s = tok.split(':', 1)
+            if ':' in cmd_s:                      # `yaw:0x30:4` — 명령 + 인덱스
+                cmd_s, idx_s = cmd_s.split(':', 1)
+                try:
+                    idx = int(idx_s, 0)
+                except ValueError:
+                    self.get_logger().error(f"인덱스를 모르겠습니다 '{idx_s}'"); return
+            try:
+                only = int(cmd_s, 0)
+            except ValueError:
+                self.get_logger().error(f"엔코더 진단: 명령을 모르겠습니다 '{cmd_s}'")
+                return
+        by_name = {v: k for k, v in self.AXIS_BY_MOTOR.items()}
+        if tok in by_name:
+            mid = by_name[tok]
+        else:
+            try:
+                mid = int(tok, 0)
+            except ValueError:
+                self.get_logger().error(f"엔코더 진단: 축을 모르겠습니다 '{msg.data}'")
+                return
+
+        # 응답을 INFO 로 찍는 창을 연다
+        cmds = ([(only, '지정 명령')] if only is not None else list(self.PROBE_COMMANDS))
+        self._probe_until = time.time() + (1.0 if only is not None else 3.0)
+        self.get_logger().info(f"[PROBE] 0x{mid:03X} 엔코더 명령 진단 시작")
+        for code, what in cmds:
+            frame = bytearray(8)
+            frame[0] = code
+            # `yaw:0x30:4` 처럼 인덱스를 줄 수 있다. 0x30(PID 읽기)은 DATA[1] 에
+            # 인덱스가 필요하다 (0x04=속도루프 KP, 0x05=KI 등). 안 주면 전부 0 이 온다.
+            if idx is not None:
+                frame[1] = idx & 0xFF
+            self.get_logger().info(f"[PROBE] 0x{mid:03X} → 0x{code:02X}  {what}")
+            if not self.can_manager.send_frame(mid, bytes(frame)):
+                self.get_logger().warning(f"[PROBE] 0x{code:02X} 전송 실패")
+            time.sleep(0.05 if only is not None else 0.25)   # 응답이 섞이지 않게 띄운다
+        self.get_logger().info(
+            "[PROBE] 끝. 응답이 없는 명령은 이 모터가 지원하지 않는 것이다")
+
+    # 자동 해제 금지 축. `axes.yaml` 의 brake.never_auto_release 와 같은 정책을
+    # 코드에도 둔다 — 설정 파일을 못 읽어도 Z 가 실수로 풀리면 안 된다.
+    NEVER_AUTO_RELEASE = ('z',)
+
+    ENCODER_CPR = 262144            # 18bit. 0x61 을 이 값으로 나눈 나머지가 단회전 절대값
+
+    def _read_encoder_single(self):
+        """상부 축의 0x61 을 읽어 단회전 절대값을 발행한다."""
+        frame = bytearray(8)
+        frame[0] = 0x61
+        for mid in self.motor_ids:
+            if mid in (self.left_motor_id, self.right_motor_id):
+                continue                # 주행은 이 값이 의미 없다
+            self.can_manager.send_frame(mid, bytes(frame))
+            time.sleep(0.002)
+
+    def _on_brake_cmd(self, msg):
+        """축별 브레이크 해제/잠금.
+
+        `release x` / `release x,y` / `lock z` / `release z force`
+
+        Z 는 자중 낙하 위험이 있어 `force` 를 붙여야 풀린다. 잠그는 것은 언제나 허용한다
+        (안전한 방향이다).
+        """
+        parts = msg.data.strip().lower().split()
+        if not parts:
+            return
+        action = parts[0]
+        if action not in ('release', 'lock'):
+            self.get_logger().error(
+                f"브레이크 명령을 모르겠습니다: '{msg.data}' — 'release x,y' 형식")
+            return
+
+        force = 'force' in parts[1:]
+        names = []
+        for tok in parts[1:]:
+            if tok == 'force':
+                continue
+            names.extend(n for n in tok.split(',') if n)
+        if not names:
+            self.get_logger().error("브레이크 명령에 축이 없습니다 (예: 'release x,y')")
+            return
+
+        by_name = {v: k for k, v in self.AXIS_BY_MOTOR.items()}
+        if names == ['all']:
+            names = list(by_name)
+
+        cmd = self.protocol.create_system_command(
+            CommandType.BRAKE_RELEASE if action == 'release' else CommandType.BRAKE_LOCK)
+
+        done, skipped, failed = [], [], []
+        for name in names:
+            mid = by_name.get(name)
+            if mid is None:
+                skipped.append(f"{name}(모르는 축)")
+                continue
+            if action == 'release' and name in self.NEVER_AUTO_RELEASE and not force:
+                skipped.append(f"{name}(자중 낙하 위험 — 풀려면 'force')")
+                continue
+            if self.can_manager.send_frame(mid, cmd):
+                done.append(f"{name}(0x{mid:03X})")
+            else:
+                failed.append(f"{name}(0x{mid:03X})")
+            time.sleep(0.05)
+
+        verb = '해제' if action == 'release' else '잠금'
+        if done:
+            self.get_logger().info(f"브레이크 {verb}: {', '.join(done)}")
+        if skipped:
+            self.get_logger().warning(f"브레이크 {verb} 건너뜀: {', '.join(skipped)}")
+        if failed:
+            self.get_logger().error(f"브레이크 {verb} 실패: {', '.join(failed)}")
+
     def brake_release_service_callback(self, request, response):
         """브레이크 해제 서비스 콜백"""
         try:
@@ -685,6 +870,23 @@ class PositionControlNode(Node):
             speed_dps = 0.0
         else:
             speed_dps = self._safety_clamp_axis(motor_id, speed_dps)
+
+        # ── 위치 읽기가 나가게 한다 ──────────────────────────────────────────
+        # 위치 읽기(0x92)는 `position_control_loop` 이 **is_moving 인 모터에만** 보낸다.
+        # 그런데 is_moving 은 위치 제어(0xA4) 경로에서만 서고, 속도 제어(0xA2)로 움직일
+        # 때는 아무도 세우지 않았다. 그래서 **속도로 움직이는 내내 위치가 갱신되지
+        # 않았다** — 2026-09-30 실측: Y 를 y_max 에서 y_min 까지 옮겼는데
+        # `/motor_0x146_position` 이 한 값에 고정이었다 (6초에 39건 수신, 값 1종).
+        # 호밍이 그 값을 원점 레퍼런스로 적으면 엉뚱한 상수가 남는다.
+        #
+        # 멈춘 뒤 0.5초는 계속 읽는다. 감속 구간이 남아 있어서, 속도가 0 이 된 순간
+        # 읽으면 실제로 멈춘 위치가 아니다.
+        st = self.motor_states.setdefault(motor_id, {})
+        if abs(speed_dps) > 0.01:
+            st['is_moving'] = True
+            st['_moving_until'] = time.time() + 0.5
+        elif time.time() >= st.get('_moving_until', 0.0):
+            st['is_moving'] = False
 
         # 값이 바뀔 때만 로그 (연속 같은 값은 초당 수십 번 들어온다)
         if not hasattr(self, '_last_joint_speed'):
@@ -1464,11 +1666,17 @@ class PositionControlNode(Node):
 
             command = data[0]
 
-            # RAW 응답은 debug 레벨로 (터미널 로그 방지)
-            self.get_logger().debug(
-                f"📥 [RAW] 모터 0x{motor_id:03X} 응답: 명령=0x{command:02X}, "
-                f"데이터={data.hex().upper()}, 길이={len(data)}"
-            )
+            # RAW 응답은 debug 레벨로 (터미널 로그 방지).
+            # 단 `/encoder_probe` 진단 중에는 INFO 로 올린다 — 어떤 엔코더 명령이
+            # 실제로 응답하는지 보려면 원시 바이트를 봐야 한다.
+            if time.time() < getattr(self, '_probe_until', 0.0):
+                self.get_logger().info(
+                    f"[PROBE] 0x{motor_id:03X} ← 0x{command:02X}  {data.hex().upper()}")
+            else:
+                self.get_logger().debug(
+                    f"📥 [RAW] 모터 0x{motor_id:03X} 응답: 명령=0x{command:02X}, "
+                    f"데이터={data.hex().upper()}, 길이={len(data)}"
+                )
 
             if command == CommandType.READ_MULTI_TURN_ANGLE:
                 # 0x92 멀티턴 각도 응답 파싱: [cmd][reserved(3)][angle(4)] = 8바이트
@@ -1595,6 +1803,18 @@ class PositionControlNode(Node):
                            CommandType.SET_MOTOR_SPEED, CommandType.SET_MOTOR_POSITION]:
                 # 이러한 명령들은 단순 확인 응답만 함
                 self.get_logger().debug(f"모터 0x{motor_id:03X} 명령 0x{command:02X} 응답 수신")
+            elif command == 0x61:
+                # 멀티턴 원위치. 전원마다 영점이 달라지므로 **절대값은 세션 한정**이지만,
+                # `mod CPR` 한 단회전값은 물리적으로 고정이라 전원과 무관하다.
+                if len(data) >= 8:
+                    raw = struct.unpack('<i', data[4:8])[0]
+                    single = raw % self.ENCODER_CPR
+                    self.encoder_single[motor_id] = single
+                    pub = self.encoder_single_pubs.get(motor_id)
+                    if pub is not None:
+                        m = Int32()
+                        m.data = int(single)
+                        pub.publish(m)
             elif command == 0x9A:
                 # 에러 상태 읽기 응답 (0x9A)
                 if len(data) >= 8:
