@@ -36,6 +36,8 @@ setup(
             'rebar_detection = rebar_vision.rebar_detection_node:main',
             'tying_orchestrator = rebar_vision.tying_orchestrator_node:main',
             'obstacle_detector = rebar_vision.obstacle_detector_node:main',
+            # L5 — RF-DETR 교차점 검출 + depth 역투영 (YOLO 기반 orbbec_detector 대체)
+            'crossing_detector = rebar_vision.crossing_detector:main',
             'zedxone_publisher = rebar_vision.zedxone_publisher:main',
             'usbcam_publisher = rebar_vision.usbcam_publisher:main',
         ],

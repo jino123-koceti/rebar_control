@@ -1,0 +1,157 @@
+# 카메라 식별 단일 소스 (3차년도)
+#
+# 왜 필요한가: Orbbec 3대가 **모두 같은 벤더**라 시리얼을 지정하지 않으면 어느 카메라가
+# 잡힐지 알 수 없다. 2차년도 스크립트에도 경고가 적혀 있다 —
+#   "serial_number 필수! 305(좌측)도 Orbbec이라, 2L이 serial 없이 뜨면 …"
+#
+# 표기: [확정] 실측 확인 / [추정] 근거 있음·미확인 / [미확인]
+# 시리얼은 2026-09-30 실측 (`cat /sys/bus/usb/devices/*/serial`).
+
+orbbec:
+  # 교차점 검출 — 자율결속·배근인지 주행이 이 카메라를 쓴다
+  # 2차년도 토픽 이름(/camera/color, /camera/depth)을 그대로 유지한다:
+  #   rebar_drive_node 와 tying_orchestrator_node 가 그 이름으로 구독한다
+  crossing:
+    model: Gemini 2 L
+    serial: CPAV563008Y        # [확정] ⚠ 2차년도 개체(CPAX1630093)와 다르다 — 새로 달린 것
+    launch: gemini2L.launch.py
+    camera_name: camera        # → /camera/color/image_raw, /camera/depth/image_raw
+    usb_port: 1-4.1.1.2        # ⚠ 참고용일 뿐 — 허브를 다시 꽂으면 바뀐다. 시리얼로만 지정할 것
+    role: 교차점 검출 (결속 지점)
+    # [확정] 2026-09-30 실측. 이 카메라는 **USB 2.0(480Mbps)** 에 물려 있고 (아래 usb 항목)
+    # UVC 는 대역폭을 미리 예약하므로, 모자라면 fps 가 떨어지는 게 아니라 **스트림이 아예
+    # 안 열린다.** 그래서 "토픽은 있는데 데이터가 안 오는" 모습으로 나타난다.
+    # 토픽 목록만 보고 판단하지 말 것 — 실제 수신을 재야 한다.
+    #
+    #  · depth 1280x800@30 **프로파일 자체가 없다.** 센서가 내는 것은 1280x800@10 /
+    #    640x400@30 / 320x200@30 이다. 로그의 "depth Frame - Width: 1280 Height: 800
+    #    fps: 30" 은 640x400@30 을 정합하며 컬러 해상도로 **업샘플한 출력의 라벨**이지
+    #    센서가 1280x800 을 30fps 로 찍었다는 뜻이 아니다 (실측 15.2fps).
+    #  · depth 1280x800 은 최대 10fps. 런치 기본값이
+    #    depth 1280x800@30 이라 그대로 띄우면 "Failed to configure the requested
+    #    stream profile" 로 죽는다.
+    #  · depth 1280x800@10 은 **IR 을 끄면** 컬러 30fps 와 같이 된다. IR 을 켜면
+    #    대역폭이 모자라 depth 가 시작조차 못 한다.
+    #  · depth 640x400@30 은 IR 을 켠 채로도 되지만 실제로는 15fps 로 떨어지고,
+    #    depth_registration 이 컬러 해상도로 **업샘플**한 1280x800 을 낸다.
+    #
+    # 실측 비교 (컬러 30fps 고정, 유효픽셀·중앙값은 같은 장면):
+    #   640x400@30 + IR 켬 : depth 15.2fps, 업샘플 1280x800, 유효 57.4%, 중앙값 528mm
+    #   1280x800@10 + IR 끔: depth  9.4fps, **네이티브** 1280x800, 유효 57.6%, 527mm
+    # 결속은 정지 상태에서 재므로 9.4fps 로 충분하고, 2차년도 파이프라인은 IR 을 쓰지
+    # 않는다. 그래서 네이티브 쪽을 기본으로 한다.
+    launch_args:
+      depth_registration: true   # CAD 강체변환이 컬러에 정합된 depth 를 쓴다
+      depth_width: 1280
+      depth_height: 800
+      depth_fps: 10
+      enable_ir: false           # ⚠ 켜면 depth 가 시작을 못 한다 (USB 2.0 대역폭)
+      enable_left_ir: false
+      enable_right_ir: false
+
+  # 좌·우 305 — 측면 판정용 (2차년도 usbcam 을 대체)
+  # ⚠ 어느 개체가 좌측인지 **미확인**이다. 영상을 보고 확정해야 한다.
+  side_a:
+    model: Gemini 305
+    serial: CV2L3600003P       # [확정] 2차년도 스크립트에서 camera_left 로 쓰던 시리얼
+    launch: gemini_301_series.launch.py   # ⚠ v2-main 에는 gemini305.launch.py 가 없다
+    camera_name: camera_left   # [추정] 2차년도 표기를 따랐다 — 영상으로 확인 필요
+    usb_port: 1-4.1.1.4        # ⚠ 2026-09-30 재측정. 전에 적은 1-4.1.1.3 이 아니다 —
+                               #   허브를 다시 꽂으면서 바뀌었다. 포트로 식별하지 말 것
+    role: 측면 판정 (좌측 추정)
+  side_b:
+    model: Gemini 305
+    serial: CV2856D000D0       # [확정]
+    launch: gemini_301_series.launch.py
+    camera_name: camera_right  # [추정]
+    usb_port: 1-4.1.1.3        # ⚠ 위와 같은 이유로 바뀐 값이다
+    role: 측면 판정 (우측 추정)
+
+# 전·후방 ZED X — GMSL(ZED Link Quad), USB 아님
+# ⚠ [미확인] 2026-09-30 현재 미인식: 캡처카드 배럴잭 전원(9~19V, 5.5/2.5mm)이 없다.
+#   드라이버는 정상 로드되는데 `Active GMSL ports : 0` / `No Camera connected` 이다.
+#   전원 연결 후 **재부팅**해야 인식된다 (GMSL 링크는 부팅 시 probe).
+zed:
+  front:
+    model: ZED X
+    namespace: zed_front       # 2차년도 obstacle_detector 가 쓰던 이름
+    role: 전방 장애물·사람 감지
+  back:
+    model: ZED X
+    namespace: zed_back
+    role: 후방 장애물·사람 감지
+
+# USB 연결 — [확정] 2026-09-30 실측
+#
+# ⚠ **카메라 3대가 USB 2.0(480Mbps)로 떨어져 있다. 장비 탓이 아니라 링크 탓이다.**
+#
+# 허브 체인을 USB2 쪽(Bus 01)과 USB3 쪽(Bus 02)에서 나란히 보면 어디서 끊겼는지 보인다.
+# USB 3.x 허브는 USB2 반쪽과 USB3 반쪽이 **양쪽 버스에 각각** 열거된다.
+#
+#   Realtek 0bda:5420 4포트   1-4        480M  ↔  2-3   0bda:0420 10000M   정상
+#   Microchip USB2807/5807    1-4.1      480M  ↔  2-3.1 110a:0417  5000M   정상
+#   Terminus 1a40:0101        1-4.1.1    480M  ↔  (있을 수 없음)          ← USB 2.0 전용 칩
+#   VIA Labs 2109:2817 4포트  1-4.1.1.1  480M  ↔  (없음)
+#
+# 위 두 허브는 양쪽 버스에 다 뜨므로 거기까지는 SuperSpeed 가 살아 있다.
+#
+# [확정] 2026-09-30 후반: "5Gbps" 연장선으로 교체했지만 **속도가 그대로 480M 이었다.**
+# 교체 후 체인에 `Terminus 1a40:0101 "USB 2.0 Hub"` 가 새로 생겼다. 이 칩은 USB 2.0
+# 전용이라 USB3 반쪽이 존재할 수 없다 — 경로에 있으면 그 아래 전부가 480M 으로 묶인다.
+# **능동형(액티브) 연장선은 안에 허브 칩이 들어 있고, 그 칩이 2.0 이면 무용지물이다.**
+# 교체가 성공했는지는 속도 표기가 아니라 **Bus 02 에 장치가 새로 뜨는지**로 판단할 것.
+# 전송률은 교체 전후가 같았다 (color 30.3fps / depth 14.5~15.2fps). 저하도 개선도 없다.
+# ⚠ 교체 직후 첫 측정에서 depth 8.9fps 가 나왔는데 이는 시동 직후 값이고, 두 번 더
+#   재니 14.5 / 15.2 로 돌아왔다. 한 번 재고 판단하지 말 것.
+#
+# 카메라는 셋 다 USB 3.0 지원 장치다 (Gemini 2 L: VID/PID 2BC5/0673, "USB 3.0 and
+# USB 2.0"; Gemini 305: "USB 3.0 권장, USB 2.0 폴백 시 프레임레이트 저하").
+# 지금 bcdUSB 가 2.00/2.10 으로 보이는 것은 2.0 링크로 떨어진 결과다.
+#
+# [확정] 2026-09-30 결론: **카메라가 꽂힌 허브 자체가 USB 2.0 이다.**
+#   강원전자 NETmate IU-170 (산업용 USB2.0 4포트, 9~36VDC, 480Mbps).
+#   그래서 앞단이 아무리 SuperSpeed 여도(Realtek 10G, Microchip 5G 정상) 소용없고,
+#   연장선을 5Gbps 로 바꿔도 효과가 없었다. **마지막 한 단만 3.0 허브로 바꾸면 된다.**
+#   → Moxa 허브 주문·배송 대기 중. 교체 후 재측정할 것.
+#
+# ⚠ 지금까지의 측정은 **카메라 1대(2L)만 띄운 값**이다. 305 두 대까지 동시에 켜면
+#   480Mbps 를 넷이 나눠 쓰므로 더 나빠진다. 3대 동시 스트리밍은 아직 검증 안 했다.
+usb:
+  bus: 1
+  link_speed_mbps: 480
+  bottleneck: VIA Labs 2109:2817 허브로 가는 케이블이 USB 2.0 (SuperSpeed 미열거)
+  note: 대역폭 부족은 fps 저하가 아니라 **스트림 미개시**로 나타난다 — 토픽 목록만 보고 판단하지 말 것
+
+# 교차점 검출 모델 — [확정] 2026-09-30
+model:
+  path: src/rebar_control/model/new_weights_260930.pt
+  kind: RF-DETR Medium        # ⚠ YOLO 가 아니다. `rfdetr` 패키지가 필요하다
+  # 체크포인트에 클래스 이름이 없다(args.class_names is None). 코드가 줘야 한다.
+  # **인덱스는 1부터** — slot0 은 자리표시다.
+  class_names: ['_', 'crossing', 'tie', 'untie']
+  # 실측: slot0·slot1 은 threshold 0.05 에서도 안 뜬다. 라벨링을 "묶였는지" 로만 한 듯.
+  #       slot2(tie) 는 클립이 보이는 교차점, slot3(untie) 는 맨 교차점에 붙었다.
+  # 6개 지점 중 3개에서 tie 와 untie 가 동시에 떴다 (모델이 판단을 못 한 자리).
+  # **[확정 2026-09-30 운용 방침] 그래도 상관없다 — 이중결속이더라도 결속하는 게 맞다.**
+  #   그래서 tie/untie 를 가리지 않고 **검출된 지점은 전부 결속 대상**으로 본다.
+  #   클래스는 참고용으로만 싣는다. 2차년도가 3클래스를 철회했던 고민이 여기서는
+  #   문제가 되지 않는다 (놓치는 것보다 두 번 묶는 편이 낫다).
+  threshold: 0.3              # 2차년도 conf 와 같게
+  fp16: true                  # Orin 실측 FP32 70ms → FP16 36ms
+  merge_px: 25                # 2차년도 병합 반경. 좌표는 **박스 중심**
+
+# 드라이버
+driver:
+  # OrbbecSDK_ROS2 **v2-main** 브랜치. Gemini 2 L 과 305 를 둘 다 지원하는 유일한 브랜치다
+  # (v1 계열은 305 미지원). arm64 SDK(libOrbbecSDK.so.2.9.3)가 저장소에 포함되어 있다.
+  orbbec_repo: https://github.com/orbbec/OrbbecSDK_ROS2 (v2-main)
+  orbbec_path: ~/ros2_ws/src/OrbbecSDK_ROS2
+  # udev 규칙 — 2026-09-30 설치 완료. 권한 확인됨 (crw-rw-rw-)
+  #   sudo cp install/orbbec_camera/share/orbbec_camera/udev/99-obsensor-libusb.rules /etc/udev/rules.d/
+  #   sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# 2차년도 → 3차년도에서 사라진 카메라 (이식 대상 아님)
+removed:
+  - zedxmini1, zedxmini2   # 좌·우 교차점 검출 → Orbbec 으로 대체됨. 3차년도 장비에 없다
+  - zedxone, zedxone_left  # top-view 미세보정 → 없다
+  - usbcam                 # 측면 판정 → 305 로 대체

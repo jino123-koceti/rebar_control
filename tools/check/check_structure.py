@@ -55,12 +55,20 @@ R3_PLANNED = {
     '/obstacle_pause': 'obstacle_detector 이식 전 (S6)',
     '/drive/release': '키보드 텔레옵 제거로 발행자가 없어졌다 — 리모콘 버튼 배정 미정',
     '/sequence_cmd': 'tying_sequence 이식 전 (S5)',
-    '/control_mode_request': 'mode_arbiter 이식 전 (S5)',
     '/encoder_odom/reset': '외부(UI)에서 부르는 토픽 — 발행자가 저장소에 없다',
     '/gripper/command': '외부에서 부르는 토픽',
     '/gripper/position': '외부에서 부르는 토픽',
     '/rebar/recorder/trigger': '데이터 수집 도구에서 부른다',
+    '/rebar/detect': '사람·L4 가 보내는 검출 트리거 (ros2 topic pub)',
+    '/stage/goal': '캘리브레이션 도구·L4 가 발행할 예정 — 지금은 사람이 직접 준다',
+    '/stage/goal_deg': '축 각도 목표. 캘리브레이션 결과를 사람이 직접 준다'
+                       ' (mm_per_deg 실측 전에도 쓸 수 있다)',
+    '/stage/stop': '사람·UI 가 보내는 정지 명령',
     '/robot_pose': 'pose_mux·ZED 연동 전 (S8)',
+    '/encoder_probe': '사람이 직접 보내는 진단 토픽 — 어떤 엔코더 읽기 명령이'
+                      ' 이 모터에서 동작하는지 확인 (ros2 topic pub)',
+    '/brake_cmd': '사람이 직접 보내는 명령 토픽 — 호밍 전 축별 브레이크 해제용'
+                  ' (ros2 topic pub). 발행 노드가 있으면 안 된다',
 }
 
 # R4 — 아키텍처 문서 §4 의 규모 상한

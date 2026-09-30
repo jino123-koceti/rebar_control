@@ -156,7 +156,7 @@ S1 에서 뒤로 미루고 S4 에서 `lateral_node` 를 L3 로 정리할 때 함
 
 | 노드 | 책임 | 2차년도 출처 |
 |---|---|---|
-| `crossing_detector` | Orbbec 교차점 검출 + 호모그래피 → 로봇 XY | `orbbec_detector` + `orbbec_cad_transform` |
+| `crossing_detector` | Orbbec 교차점 검출 → 로봇 XY. **호모그래피가 아니라 depth 역투영 + 강체변환**이다 (2차년도가 2026-08-05 에 교체했다). 모델은 RF-DETR (YOLO 아님) | `orbbec_detector` + `orbbec_cad_transform` |
 | `deck_edge` | 주행가능 판정 → 방향별 차단 | `deck_edge_node` 926줄 |
 | `obstacle_detector` | 사람·장애물 → 일시정지 | 그대로 |
 | `side_judge` | 측면 판정 (Orbbec 305) | `usb_side_cam_node` 재작성 |
@@ -187,6 +187,10 @@ S1 에서 뒤로 미루고 S4 에서 `lateral_node` 를 L3 로 정리할 때 함
 | `/gripper_control` | GripperControl | `tying_sequence` | `gripper_node` |
 | `/trigger_control` | Bool | `tying_sequence` | `trigger_node` |
 | `/homing_cmd` | String | L4, UI | `homing_node` |
+| `/control_mode_request` | String | L3·L4 (권한 요청자) | `mode_arbiter` |
+| `/stage/goal` | Point | L4, 캘리브레이션 도구 | `stage_node` |
+| `/stage/goal_deg` | Point | 캘리브레이션 도구 | `stage_node` |
+| `/stage/stop` | Empty | L4, UI | `stage_node` |
 
 ### 상태 (아래 → 위)
 
@@ -199,6 +203,10 @@ S1 에서 뒤로 미루고 S4 에서 `lateral_node` 를 L3 로 정리할 때 함
 | `/switches/{start_rear,stop}` | Bool | `ezi_io_node` |
 | `/safety/state` | (신규) | `safety_node` |
 | `/homing_status` | String | `homing_node` |
+| `/control_mode` | String(JSON) | `mode_arbiter` |
+| `/stage/status` | String(JSON) | `stage_node` |
+| `/rebar/crossings` | RebarGrid | `crossing_detector` |
+| `/rebar/detector_status` | String | `crossing_detector` |
 | `/deck_edge_block` | String(JSON) | `deck_edge` |
 | `/obstacle_pause` | Bool | `obstacle_detector` |
 | `/encoder_odom` | PoseStamped | `odom_node` |
@@ -327,7 +335,7 @@ axes:
 | 상부 스테이지가 리미트에 닿지 않음 | 하드웨어 담당자 수정 예정. **호밍(S3) 실검증의 선행 조건** |
 | ZED X 2대 | 캡처카드 배럴잭 전원 미연결로 미인식 |
 | 상부 EZIO 출력 8점 배선 | 미확인 (보류) |
-| `orbbec_crossing.pt` | 신규 모델 재학습 중 |
+| 교차점 검출 모델 | **해결(2026-09-30)** — `new_weights_260930.pt` 수령, RF-DETR Medium 으로 확정. 클래스 순서만 미확인 (아래) |
 
 ### 작업 중 발견
 
@@ -336,12 +344,29 @@ axes:
   `ros2 run` 이 애초에 불가능했다. 설치 목록에 추가했다.
 - 2차년도 `ezi_io_node` 는 `/limit_sensors/yaw_min` 으로 발행하고 호밍·관절·송신 노드는
   `yaw_home` 을 구독했다 — **yaw 리미트가 실제로 안 붙어 있었을 수 있다.**
+- **신규 교차점 모델은 YOLO 가 아니다.** `new_weights_260930.pt` 는 Roboflow 학습
+  **RF-DETR Medium** 이라서 ultralytics 로 열리지 않는다. `rfdetr` 런타임을 2026-09-30 에
+  설치했다 (numpy 1.26.4 · JetPack OpenCV 4.5.4 · cv_bridge 무손상 확인).
+  Orin 실측 FP32 70ms(14fps) → **FP16 36ms(28fps)**, `model.inference(dtype=torch.float16)`.
+- **모델 체크포인트에 클래스 이름이 없다** (`args.class_names is None`). rfdetr 은
+  `class_id` 를 0-기반 인덱스로만 주므로 이름 순서를 코드가 공급해야 한다.
+  `crossing,tie,untie` 는 알파벳 순 **가정**이다 — 실영상으로 확정할 것
+  (`tools/test/rfdetr_check.py`).
+- **2차년도의 75% 뒤집힘은 신규 모델에서 재현되지 않았다.** 실카메라 10프레임에서
+  지점별 최고 신뢰도 슬롯이 내내 일정했다(뒤집힘 0%). 대신 6개 지점 중 3개에서
+  **한 프레임 안에** 두 슬롯이 동시에 떴다 — DETR 은 NMS 가 없어 생기는 중복이고
+  승자는 항상 같다. **지점당 최고 신뢰도 하나만 남기면 된다.**
+- **분류 슬롯이 4개이고 뜨는 것은 slot2·slot3 뿐이다** (slot0·slot1 은 threshold 0.05
+  에서도 안 뜬다). 이름 대응은 Roboflow 클래스 목록으로 확정할 것.
+- 검출 십자가 교차점 위에 정확히 찍히는 것을 실영상에서 확인했다 — 2차년도 좌표변환이
+  쓰는 **박스 중심**을 그대로 쓸 수 있다.
 
 ## 9.5 위험
 
 | 위험 | 완화 |
 |---|---|
 | 모터 ID 오배정으로 엉뚱한 축 구동 | `axes.yaml` 참조, 1축씩 저속 확인 |
+| 슬롯 이름 오배정으로 `tie` 를 `untie` 로 읽음 → **이중결속** | Roboflow 클래스 목록으로 slot2·slot3 확정. 확정 전에는 슬롯 번호로만 다룬다(`rfdetr_check.py`) |
 | can2 이중 소유로 버스 사고 | 소유자 1개 원칙(§3), `can_sender` 동시 기동 금지 |
 | 범퍼·STOP 미연동 상태의 자율주행 | S2 완료 전 자율주행 금지 |
 | Z축 브레이크 해제 시 자중 낙하 | `axes.yaml` 의 `never_auto_release`. 기구 확인 후 판단 |

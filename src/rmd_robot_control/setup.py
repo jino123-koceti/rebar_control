@@ -28,6 +28,8 @@ setup(
             'lateral_node = rmd_robot_control.lateral_node:main',
             'remote_teleop_node = rmd_robot_control.remote_teleop_node:main',
             'homing_node = rmd_robot_control.homing_node:main',
+            # L3 — 상부 스테이지를 mm 목표로 보낸다 (검출점 이동용)
+            'stage_node = rmd_robot_control.stage_node:main',
         ],
     },
 )
