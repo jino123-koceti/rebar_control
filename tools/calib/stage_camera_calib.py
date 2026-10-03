@@ -1,35 +1,51 @@
 #!/usr/bin/env python3
-"""카메라 좌표 → 스테이지 축 각도 변환을 실측으로 뜬다 (간이 캘리브레이션).
+"""카메라 좌표 → **그 자세에서 보낼 스테이지 위치(mm)** 를 실측으로 뜬다.
 
 ## 무엇을 푸는가
 
-`crossing_detector` 는 교차점을 **카메라 좌표(mm)** 로 낸다. 축은 **각도**로 움직인다.
-그 사이를 잇는 변환이 없으면 "검출했는데 어디로 보내야 할지 모른다".
+`crossing_detector` 는 교차점을 **카메라 좌표(mm)** 로 낸다. 결속하려면 "그 점에
+건 끝을 두려면 스테이지를 어디로 보내야 하나" 를 알아야 한다.
 
-    stage_deg = A · P_cam + b        A 는 2x3, b 는 2  → 미지수 8개
+    stage_mm = A · P_cam + b        A 는 3x3, b 는 3  → 미지수 12개 (자세당)
 
-카메라가 **고정 프레임**에 있으므로(2026-09-30 확인) 스테이지가 움직여도 교차점의
-카메라 좌표는 변하지 않는다. 그래서 절대 위치로 짝지으면 된다.
+⚠⚠ **자세마다 따로 뜬다.** 건이 yaw 축에 달려 있어 자세를 바꾸면 건 끝이 X·Y 로
+움직인다. 자세 범위가 건 33.4° 이므로 건 끝이 축에서 100mm 떨어져 있으면 자세에
+따라 약 58mm 차이가 난다 — 하나로 뭉치면 그만큼 틀린다.
 
-**mm 가 아니라 각도로 맞추는 이유:** 변환이 mm↔도 환산까지 흡수한다. `mm_per_deg`
-실측(자로 재기)을 건너뛸 수 있다. mm 는 나중에 사람이 읽기 좋으라고 재면 된다.
+⚠ 이것은 **좌표계 변환이 아니다.** 같은 세상의 점이라도 자세가 다르면 보낼
+스테이지 위치가 다르다. 그래서 결과를 "stage 좌표" 라 부르지 않고 **"그 자세에서
+보낼 위치"** 라 부른다.
+
+## 왜 mm 인가 (각도가 아니라)
+
+옛 버전은 **절대 모터 각도**로 떴고 "호밍 원점이 바뀌면 다시 떠야 한다" 는 경고가
+붙어 있었다. 멀티턴은 전원에 날아가므로 절대 각도는 전원 세션 안에서만 산다.
+mm 는 **원점 기준**이라 재호밍·전원 재투입을 견딘다 (원점 반복오차 ~0.4mm 만 남는다).
+`/tying/goal` 과 자세별 가동범위·사분면 규칙도 전부 mm 라 그대로 맞물린다.
+
+`/stage/status` 의 `current_mm` 을 그대로 쓴다 — `stage_node` 가 이미 원점과
+`mm_per_deg` 로 환산해 발행한다. 여기서 또 환산하면 두 곳이 어긋난다.
 
 ## 절차
 
-  1. 호밍으로 원점을 잡는다 (`/homing_cmd` → `all`)
-  2. 이 도구를 띄우고 `s` — 지금 보이는 교차점들을 번호와 함께 고정한다
-  3. 번호를 고른다
-  4. **리모콘으로 건 끝을 그 교차점에 정확히 맞춘다**
-  5. `r` — 그 순간의 축 각도를 읽어 짝으로 기록한다
-  6. 2~5 를 **최소 4점, 권장 5~6점** 반복한다
-  7. `f` — 최소제곱으로 A,b 를 구하고 yaml 로 저장한다
+  1. 호밍 (`/homing_cmd` → `all`). 원점이 없으면 mm 가 안 나온다
+  2. 이 도구를 띄운다. 현재 자세가 **판별되어 있어야** 한다
+     (안 되면 `/stage/yaw_declare` 로 알려줄 것 — 1번·4번은 단회전이 모호하다)
+  3. `s` — 지금 보이는 교차점을 번호와 함께 고정한다
+  4. **리모콘으로 건 끝을 그 점에 맞춘다** (X·Y·Z 다)
+  5. `r <번호>` — 그 순간의 스테이지 mm 를 짝으로 기록한다
+  6. 3~5 를 **자세당 최소 4점, 권장 6점** 반복
+  7. 리모콘 **S23/S24** 로 다음 자세로 옮기고 3~6 반복 (1~4번 전부)
+  8. `f` — 자세별로 최소제곱을 풀고 yaml 로 저장한다
 
 ⚠ 점들이 **한 줄로 늘어서면 안 된다.** 시야 안에서 좌우·앞뒤로 흩어진 점을 고를 것.
-⚠ 4점은 미지수와 같은 수라 오차 확인이 안 된다. 5점 이상이어야 잔차가 의미를 갖는다.
-⚠ Z(결속 깊이)는 성격이 달라 여기서 다루지 않는다. X/Y 만 맞춘다.
+⚠ **깊이(z)도 흩어져야 한다** — A 가 3x3 이라 z 가 거의 같으면 그 열이 결정되지
+  않는다. 철근 배근이 기울어 있어 보통은 349~624mm 로 충분히 퍼진다.
+⚠ 4점은 미지수와 같은 수라 잔차가 0 으로 나와 정확도 확인이 안 된다.
+
+명령: s=고정  r <n>=기록  p <n>=예측검증  l=목록  u=마지막취소  f=산출·저장  q=종료
 """
 
-import argparse
 import json
 import os
 import sys
@@ -38,27 +54,30 @@ import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Empty, Float32
+from std_msgs.msg import Empty, String
 from rebar_base_interfaces.msg import RebarGrid
 
 OUT = os.path.expanduser(
     '~/ros2_ws/src/rebar_control/data/calibration/stage_camera.yaml')
-MOTOR = {'x': '0x145', 'y': '0x146'}
+AXES = ('x', 'y', 'z')
 
 
 class Calib(Node):
     def __init__(self):
         super().__init__('stage_camera_calib')
-        self.deg = {'x': None, 'y': None}
-        for a, m in MOTOR.items():
-            self.create_subscription(
-                Float32, f'/motor_{m}_position',
-                (lambda k: (lambda msg: self.deg.__setitem__(k, msg.data)))(a), 20)
+        self.stage = None
         self.grid = None
+        self.create_subscription(String, '/stage/status', self._on_stage, 10)
         self.create_subscription(RebarGrid, '/rebar/crossings', self._on_grid, 10)
         self.trig = self.create_publisher(Empty, '/rebar/detect', 10)
         self.frozen = []          # 고정한 검출점 [(x,y,z,conf), ...]
-        self.pairs = []           # [(P_cam(3), stage_deg(2)), ...]
+        self.pairs = {}           # 자세 → [(P_cam(3), stage_mm(3)), ...]
+
+    def _on_stage(self, msg):
+        try:
+            self.stage = json.loads(msg.data)
+        except ValueError:
+            pass
 
     def _on_grid(self, msg):
         self.grid = msg
@@ -68,155 +87,216 @@ class Calib(Node):
         while rclpy.ok() and time.time() < end:
             rclpy.spin_once(self, timeout_sec=0.02)
 
+    # ---- 현재 상태 ---------------------------------------------------------
+    def pose(self):
+        return (self.stage or {}).get('pose')
+
+    def mm(self):
+        c = (self.stage or {}).get('current_mm') or {}
+        v = [c.get(a) for a in AXES]
+        return None if any(x is None for x in v) else v
+
+    def show(self):
+        s = self.stage or {}
+        p, g = s.get('pose'), s.get('gun_deg')
+        m = self.mm()
+        print(f"  자세 {p if p is not None else '미확인'}"
+              f"  건 {g if g is not None else '?'}°"
+              f"  위치 " + (f"X {m[0]:.1f} Y {m[1]:.1f} Z {m[2]:.1f} mm" if m else '없음'))
+        if p is None:
+            print("  ⚠ 자세가 판별되지 않았습니다 — /stage/yaw_declare 로 알려주세요")
+        if m is None:
+            print("  ⚠ mm 를 못 받습니다 — 호밍이 필요합니다 (/homing_cmd all)")
+
     # ---- 동작 --------------------------------------------------------------
     def snapshot(self):
         self.grid = None
         self.trig.publish(Empty())
-        t = time.time() + 5.0
+        t = time.time() + 6.0
         while rclpy.ok() and self.grid is None and time.time() < t:
             rclpy.spin_once(self, timeout_sec=0.05)
         if self.grid is None:
             print("  검출 결과를 못 받았습니다 — crossing_detector 가 떠 있나요?")
             return
-        frame = self.grid.error_message
         self.frozen = [(d.x, d.y, d.z, d.confidence) for d in self.grid.detections]
-        print(f"  검출 {len(self.frozen)}개  ({frame})")
+        print(f"  검출 {len(self.frozen)}개  ({self.grid.error_message})")
         if not self.frozen:
-            print("  깊이가 확보된 검출이 없습니다. 카메라 시야·조명을 확인하세요.")
+            print("  깊이가 확보된 검출이 없습니다. 시야·조명을 확인하세요.")
         for i, (x, y, z, c) in enumerate(self.frozen):
             print(f"    [{i}] 카메라 ({x:+8.1f}, {y:+8.1f}, {z:8.1f}) mm  신뢰도 {c:.2f}")
 
     def record(self, idx):
         if not (0 <= idx < len(self.frozen)):
-            print(f"  번호가 범위를 벗어났습니다 (0~{len(self.frozen)-1})")
+            print(f"  번호가 범위를 벗어났습니다 (0~{len(self.frozen) - 1})")
             return
-        self.spin(0.6)
-        if any(v is None for v in self.deg.values()):
-            print("  축 위치를 못 받고 있습니다 (position_control_node 확인)")
+        self.spin(0.8)
+        p, m = self.pose(), self.mm()
+        if p is None:
+            print("  자세를 모릅니다 — 기록하지 않습니다 "
+                  "(/stage/yaw_declare 로 알려주세요)")
+            return
+        if m is None:
+            print("  스테이지 mm 를 못 받습니다 — 기록하지 않습니다 (호밍 필요)")
             return
         x, y, z, _ = self.frozen[idx]
-        pair = ([x, y, z], [self.deg['x'], self.deg['y']])
-        self.pairs.append(pair)
-        print(f"  짝 {len(self.pairs)} 기록 — 카메라 ({x:+.1f},{y:+.1f},{z:.1f}) "
-              f"↔ 축 (x {self.deg['x']:+.2f}°, y {self.deg['y']:+.2f}°)")
+        self.pairs.setdefault(p, []).append(([x, y, z], m))
+        print(f"  {p}번 자세 짝 {len(self.pairs[p])} 기록 — "
+              f"카메라 ({x:+.1f},{y:+.1f},{z:.1f}) ↔ "
+              f"스테이지 (X {m[0]:.1f}, Y {m[1]:.1f}, Z {m[2]:.1f}) mm")
+
+    def undo(self):
+        p = self.pose()
+        if p is None or not self.pairs.get(p):
+            print("  취소할 짝이 없습니다 (지금 자세 기준)")
+            return
+        self.pairs[p].pop()
+        print(f"  {p}번 자세 마지막 짝 취소 — 남은 {len(self.pairs[p])}개")
+
+    def listing(self):
+        if not self.pairs:
+            print("  기록된 짝이 없습니다")
+            return
+        for p in sorted(self.pairs):
+            rows = self.pairs[p]
+            zs = [q[0][2] for q in rows]
+            print(f"  {p}번 자세: {len(rows)}개"
+                  + (f"  (카메라 z {min(zs):.0f}~{max(zs):.0f}mm)" if rows else ''))
+            for i, (c, m) in enumerate(rows):
+                print(f"     {i} cam({c[0]:+7.1f},{c[1]:+7.1f},{c[2]:7.1f})"
+                      f" → stage({m[0]:7.1f},{m[1]:7.1f},{m[2]:7.1f})")
+
+    # ---- 산출 --------------------------------------------------------------
+    def fit_one(self, rows):
+        """(A 3x3, b 3, rms, worst) 또는 None."""
+        if len(rows) < 4:
+            return None
+        P = np.array([c for c, _ in rows], dtype=float)        # (n,3)
+        S = np.array([m for _, m in rows], dtype=float)        # (n,3)
+        M = np.hstack([P, np.ones((len(rows), 1))])            # (n,4)
+        sol, *_ = np.linalg.lstsq(M, S, rcond=None)            # (4,3)
+        A, b = sol[:3, :].T, sol[3, :]
+        res = (A @ P.T).T + b - S
+        return (A, b,
+                float(np.sqrt((res ** 2).sum(axis=1).mean())),
+                float(np.abs(res).max()))
 
     def fit(self, out_path):
-        n = len(self.pairs)
-        if n < 4:
-            print(f"  짝이 {n}개뿐입니다 — 미지수 8개라 **최소 4점** 필요합니다")
+        done = {}
+        print()
+        for p in sorted(self.pairs):
+            rows = self.pairs[p]
+            r = self.fit_one(rows)
+            if r is None:
+                print(f"■ {p}번 자세 — 짝 {len(rows)}개뿐 (미지수 12개, 최소 4점)")
+                continue
+            A, b, rms, worst = r
+            done[p] = (A, b, rms, worst, len(rows))
+            print(f"■ {p}번 자세 — 짝 {len(rows)}개   잔차 RMS {rms:.2f}mm  "
+                  f"최대 {worst:.2f}mm")
+            zs = [q[0][2] for q in rows]
+            if max(zs) - min(zs) < 30.0:
+                print(f"   ⚠ 카메라 z 범위가 {max(zs)-min(zs):.0f}mm 뿐입니다 — "
+                      "A 의 z 열이 결정되지 않아 깊이가 다른 점에서 틀립니다")
+            if len(rows) == 4:
+                print("   ⚠ 4점은 미지수와 같은 수라 잔차가 0 으로 나옵니다 — "
+                      "정확도 확인이 안 됩니다")
+            elif rms > 10.0:
+                print("   ⚠ 잔차가 큽니다. 맞춘 점이 틀렸거나 점이 한 줄로 늘어서 "
+                      "있을 수 있습니다")
+        if not done:
+            print("  저장할 것이 없습니다")
             return
-        P = np.array([p for p, _ in self.pairs], dtype=float)      # (n,3)
-        S = np.array([s for _, s in self.pairs], dtype=float)      # (n,2)
-        M = np.hstack([P, np.ones((n, 1))])                        # (n,4)
-        sol, *_ = np.linalg.lstsq(M, S, rcond=None)                # (4,2)
-        A = sol[:3, :].T                                           # (2,3)
-        b = sol[3, :]                                              # (2,)
-
-        pred = (A @ P.T).T + b
-        res = pred - S
-        rms = float(np.sqrt((res ** 2).sum(axis=1).mean()))
-        worst = float(np.abs(res).max())
-
-        print(f"\n■ 변환 산출 (짝 {n}개)")
-        print(f"  A =\n{np.array2string(A, precision=5)}")
-        print(f"  b = {np.array2string(b, precision=3)}")
-        print(f"  잔차 RMS {rms:.3f}°   최대 {worst:.3f}°")
-        if n == 4:
-            print("  ⚠ 4점은 미지수와 같은 수라 잔차가 0 으로 나옵니다 — 정확도 확인이 "
-                  "안 됩니다. 5점 이상을 권합니다")
-        elif rms > 2.0:
-            print("  ⚠ 잔차가 큽니다. 점을 잘못 맞췄거나 한 줄로 늘어서 있을 수 있습니다")
+        missing = [p for p in (1, 2, 3, 4) if p not in done]
+        if missing:
+            print(f"\n  ⚠ 아직 안 뜬 자세: {missing} — 그 자세에서는 결속할 수 "
+                  "없습니다 (자세마다 따로 떠야 합니다)")
 
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         with open(out_path, 'w', encoding='utf-8') as f:
-            f.write("# 카메라 좌표(mm) → 스테이지 축 각도 변환\n")
-            f.write("#   stage_deg = A @ P_cam + b     (A 2x3, b 2)\n")
-            f.write("#   [0]=x축(0x145), [1]=y축(0x146) 모터 각도(절대)\n")
-            f.write("# 카메라는 고정 프레임에 있으므로 스테이지가 움직여도 P_cam 은 변하지 않는다.\n")
-            f.write(f"# 실측 {time.strftime('%Y-%m-%d %H:%M')}  짝 {n}개  "
-                    f"잔차 RMS {rms:.3f}° 최대 {worst:.3f}°\n")
-            f.write("# ⚠ 호밍 원점이 바뀌면 다시 떠야 한다 (축 각도가 절대값이므로).\n")
-            f.write(f"A: {json.dumps(A.tolist())}\n")
-            f.write(f"b: {json.dumps(b.tolist())}\n")
-            f.write(f"rms_deg: {rms:.4f}\n")
-            f.write(f"max_deg: {worst:.4f}\n")
-            f.write("pairs:\n")
-            for p, sv in self.pairs:
-                f.write(f"  - cam: {json.dumps([round(v,2) for v in p])}\n")
-                f.write(f"    deg: {json.dumps([round(v,3) for v in sv])}\n")
-        print(f"  저장: {out_path}")
+            f.write("# 카메라 좌표(mm) → **그 자세에서 보낼 스테이지 위치(mm)**\n")
+            f.write("#   stage_mm = A @ P_cam + b      (A 3x3, b 3)\n")
+            f.write("#   [0]=X [1]=Y [2]=Z, 전부 **호밍 원점 기준 mm**\n")
+            f.write("# ⚠ 좌표계 변환이 아니다 — 같은 점이라도 자세가 다르면 보낼\n")
+            f.write("#   위치가 다르다 (건이 yaw 축에 달려 회전한다). 그래서 자세별이다.\n")
+            f.write("# ⚠ mm 는 원점 기준이라 재호밍·전원 재투입을 견딘다. 다만 원점\n")
+            f.write("#   반복오차(~0.4mm)는 남는다.\n")
+            f.write(f"# 실측 {time.strftime('%Y-%m-%d %H:%M')}\n")
+            f.write("poses:\n")
+            for p in sorted(done):
+                A, b, rms, worst, n = done[p]
+                f.write(f"  {p}:\n")
+                f.write(f"    A: {json.dumps([[round(v, 6) for v in r] for r in A.tolist()])}\n")
+                f.write(f"    b: {json.dumps([round(v, 4) for v in b.tolist()])}\n")
+                f.write(f"    pairs: {n}\n")
+                f.write(f"    rms_mm: {rms:.3f}\n")
+                f.write(f"    max_mm: {worst:.3f}\n")
+            f.write("raw:\n")
+            for p in sorted(self.pairs):
+                f.write(f"  {p}:\n")
+                for c, m in self.pairs[p]:
+                    f.write(f"    - cam: {json.dumps([round(v, 2) for v in c])}\n")
+                    f.write(f"      stage: {json.dumps([round(v, 2) for v in m])}\n")
+        print(f"\n  저장: {out_path}")
 
-    def predict(self, idx, A, b):
+    def predict(self, idx):
+        p = self.pose()
+        rows = self.pairs.get(p) or []
+        r = self.fit_one(rows)
+        if r is None:
+            print(f"  {p}번 자세 짝이 모자랍니다 (최소 4점)")
+            return
+        if not (0 <= idx < len(self.frozen)):
+            print(f"  번호가 범위를 벗어났습니다 (0~{len(self.frozen) - 1})")
+            return
+        A, b, rms, _ = r
         x, y, z, _ = self.frozen[idx]
-        d = A @ np.array([x, y, z]) + b
-        print(f"  [{idx}] → 축 목표 x {d[0]:+.2f}°, y {d[1]:+.2f}°")
-        print(f"      ros2 topic pub --once /stage/goal_deg geometry_msgs/Point "
-              f"\"{{x: {d[0]:.3f}, y: {d[1]:.3f}, z: .nan}}\"")
-
-
-HELP = """
-  s        지금 보이는 교차점을 고정하고 번호를 매긴다
-  r <번호> 리모콘으로 건 끝을 그 점에 맞춘 뒤, 지금 축 각도를 짝으로 기록
-  l        기록한 짝 보기
-  d <n>    n 번째 짝 지우기
-  f        변환 산출 + 저장
-  p <번호> (저장된 변환으로) 그 점의 축 목표를 계산해 본다
-  q        끝내기
-"""
+        q = A @ np.array([x, y, z]) + b
+        m = self.mm()
+        print(f"  [{idx}] 예측 보낼 위치  X {q[0]:.1f}  Y {q[1]:.1f}  Z {q[2]:.1f} mm"
+              f"   (자세 {p}, 잔차 RMS {rms:.2f}mm)")
+        if m:
+            d = q - np.array(m)
+            print(f"       지금 위치와 차이  X {d[0]:+.1f}  Y {d[1]:+.1f}  Z {d[2]:+.1f} mm")
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--out', default=OUT)
-    a = ap.parse_args()
-
     rclpy.init()
     n = Calib()
-    print("■ 스테이지-카메라 간이 캘리브레이션")
-    print("  먼저 호밍이 끝나 있어야 합니다 (축 각도가 원점 기준이어야 하므로).")
-    print(HELP)
-    A = b = None
+    n.spin(2.5)
+    print(__doc__.split('명령:')[0].rstrip())
+    print("명령: s=고정  r <n>=기록  p <n>=예측  l=목록  u=취소  f=저장  q=종료\n")
+    n.show()
     try:
         while rclpy.ok():
-            n.spin(0.15)
+            n.spin(0.3)
             try:
-                cmd = input("calib> ").strip().split()
+                cmd = input("> ").strip().split()
             except EOFError:
                 break
             if not cmd:
+                n.show()
                 continue
-            c = cmd[0].lower()
+            c = cmd[0]
             if c == 'q':
                 break
             elif c == 's':
                 n.snapshot()
             elif c == 'r' and len(cmd) > 1:
                 n.record(int(cmd[1]))
+            elif c == 'p' and len(cmd) > 1:
+                n.predict(int(cmd[1]))
             elif c == 'l':
-                for i, (p, s) in enumerate(n.pairs):
-                    print(f"  [{i}] cam ({p[0]:+.1f},{p[1]:+.1f},{p[2]:.1f}) "
-                          f"↔ deg ({s[0]:+.2f},{s[1]:+.2f})")
-            elif c == 'd' and len(cmd) > 1:
-                i = int(cmd[1])
-                if 0 <= i < len(n.pairs):
-                    n.pairs.pop(i); print(f"  {i} 삭제")
+                n.listing()
+            elif c == 'u':
+                n.undo()
             elif c == 'f':
-                n.fit(a.out)
-                try:
-                    import yaml
-                    d = yaml.safe_load(open(a.out, encoding='utf-8'))
-                    A = np.array(d['A']); b = np.array(d['b'])
-                except Exception:
-                    pass
-            elif c == 'p' and len(cmd) > 1 and A is not None:
-                n.predict(int(cmd[1]), A, b)
+                n.fit(OUT)
             else:
-                print(HELP)
+                print("  s / r <n> / p <n> / l / u / f / q")
     except KeyboardInterrupt:
         pass
     n.destroy_node()
-    if rclpy.ok():
-        rclpy.shutdown()
+    rclpy.shutdown()
     return 0
 
 
