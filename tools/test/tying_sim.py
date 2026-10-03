@@ -60,6 +60,7 @@ class FakeStage(Node):
         self.tgt = {}                     # 축 → mm
         self.yaw_tgt = None
         self.detail = '대기'
+        self.rejects = 0                  # 실물과 같다 — 상위가 이걸로 가린다
         self.log = []
 
         self.st = self.create_publisher(String, '/stage/status', 10)
@@ -71,6 +72,7 @@ class FakeStage(Node):
 
     # ---- 실물과 같은 거부 규칙 -------------------------------------------
     def _reject(self, why):
+        self.rejects += 1
         self.detail = f'거부: {why}'
         self.log.append(('거부', why))
         print(f"    [가짜 stage] 거부 — {why}")
@@ -146,6 +148,7 @@ class FakeStage(Node):
                             else f'자세 사이 (건 {self.gun:+.2f}°)'),
             'detail': self.detail,
             'homed': ['x', 'y', 'z'],
+            'rejects': self.rejects,
         }, ensure_ascii=False)))
 
 

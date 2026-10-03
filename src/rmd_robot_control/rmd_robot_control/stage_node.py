@@ -181,6 +181,7 @@ class StageNode(Node):
         self.t_start = 0.0
         self.t_arm = 0.0
         self.moving = False
+        self.rejects = 0          # 거부 횟수. 상위가 "내 명령이 거부됐나" 를 가린다
         self.detail = '대기'
 
         self.create_timer(0.05, self.tick)
@@ -353,6 +354,14 @@ class StageNode(Node):
 
     # ---- 명령 --------------------------------------------------------------
     def _reject(self, why):
+        """거부하고 **카운터를 올린다.**
+
+        ⚠ `detail` 은 다음 일이 생길 때까지 남는다(끈적하다). 상위가 그 문자열만
+        보고 "내 명령이 거부됐다" 고 판단하면 **한참 전의 거부**에 걸린다 —
+        2026-10-03 실장비에서 시퀀스가 시작 즉시 중단됐다. 그래서 상위는 이
+        카운터가 **늘었는지**로 본다.
+        """
+        self.rejects += 1
         self.get_logger().error(f"이동 거부 — {why}")
         self.detail = f"거부: {why}"
         self._publish_status()
@@ -559,6 +568,7 @@ class StageNode(Node):
             'limit_mm': lim,              # 지금 자세에서 갈 수 있는 X·Y 범위
             'limit_why': lim_why,         # 그 범위가 어디서 왔는가
             'enforce_envelope': self.enforce,
+            'rejects': self.rejects,      # 늘었으면 **방금** 거부된 것이다
             'detail': self.detail,
         }, ensure_ascii=False)))
 

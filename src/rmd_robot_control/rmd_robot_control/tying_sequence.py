@@ -102,6 +102,7 @@ class TyingSequence(Node):
         self.goal = None             # (x, y) mm
         self.want_pose = None
         self._retract_tgt = None     # 보낸 후퇴 목표 (도착까지 붙잡는다)
+        self._rej0 = None            # 단계 시작 시점의 stage_node 거부 횟수
         self._passed = []            # 회전이 지나가는 자세들
         self.detail = '대기'
         self.t_step = 0.0
@@ -135,6 +136,8 @@ class TyingSequence(Node):
 
     # ---- 단계 전이 ---------------------------------------------------------
     def _enter(self, step, detail):
+        # 이 단계를 시작하는 시점의 거부 횟수를 기억한다 — 이후에 늘면 내 명령 탓이다
+        self._rej0 = (self.stage or {}).get('rejects')
         self.step = step
         self.detail = detail
         self.t_step = time.time()
@@ -181,8 +184,14 @@ class TyingSequence(Node):
             return self._fail('안전 정지')
         if self.stage is None:
             return self._fail('/stage/status 가 없다 — stage_node 가 떠 있는가')
-        # stage_node 가 거부했으면 그 사유를 그대로 올린다 (삼키면 진단이 어렵다)
-        if self._stage_detail().startswith('거부'):
+        # stage_node 가 거부했으면 사유를 그대로 올린다 (삼키면 진단이 어렵다).
+        # ⚠ `detail` 문자열로 보면 **한참 전의 거부**에 걸린다 — 그 필드는 다음
+        #   일이 생길 때까지 남는다. 2026-10-03 실장비에서 그래서 시작 즉시
+        #   중단됐다 (몇 분 전 가드 시험의 "모르는 자세 7" 이 남아 있었다).
+        #   **거부 횟수가 늘었는지**로 본다.
+        rej = (self.stage or {}).get('rejects')
+        if rej is not None and self._rej0 is not None and rej > self._rej0:
+            self._rej0 = rej
             return self._fail(f"stage_node — {self._stage_detail()[4:]}")
         if time.time() - self.t_step > self.step_timeout:
             return self._fail(f'{self.step.value} 타임아웃 {self.step_timeout:.0f}s')
