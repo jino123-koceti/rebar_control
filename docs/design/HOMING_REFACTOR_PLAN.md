@@ -1,134 +1,155 @@
-# Homing Controller 분리 및 신규 시퀀스 구현 계획
+# 호밍 시퀀스 설계 — 3차년도
 
-## 1. 목표
+> **2026-10-03 전면 개정.** 이전 내용은 2차년도 계획(`joint_controller.py` 1772줄에서
+> `homing_controller.py` 분리)이었고, 그 작업은 2차년도에 끝났다. 3차년도는
+> `rmd_robot_control/homing_node.py` 로 이식했으므로 그 문서는 더 유효하지 않았다.
+> 특히 **yaw 자세를 Left/Right 둘로 보고 `yaw_home_encoder_90=16328`,
+> `yaw_max=44710` 을 쓰던 부분은 다른 모터 개체 값이라 지금과 맞지 않는다.**
+> 권위 있는 계층 정의는 `YEAR3_ARCHITECTURE.md` (L3 `homing_node`, ≤600줄) 이다.
 
-`joint_controller.py` (1772줄)에서 호밍 관련 코드(~500줄)를 `homing_controller.py`로 분리하고,
-새로운 호밍 시퀀스를 구현한다.
+## 1. 책임
 
-## 2. 현재 구조
+**"어떤 순서로 원점을 찾나"** 만 담당한다. 축을 어떻게 움직이는지는 하위 계층이 안다.
+리미트 토픽을 구독하고 축 명령 토픽으로 명령한다. CAN 을 직접 만지지 않는다.
 
-### 기존 호밍 시퀀스 (joint_controller.py)
-```
-Z_UP (z_min까지 상승)
-  → COARSE_HOME (X+Y+Yaw 동시 리미트 이동)
-  → BACK_OFF (리미트에서 후퇴)
-  → FINE_HOME (느린 속도로 리미트 재접근)
-  → MOVE_TO_READY (준비 위치 이동)
-  → COMPLETE
-```
+## 2. 순서 — Z → Yaw → X → Y
 
-### 기존 호밍 코드 위치 (joint_controller.py)
-| 라인 | 내용 |
-|------|------|
-| 26~35 | `HomingState` Enum |
-| 81~92 | 호밍 파라미터 선언 |
-| 115~126 | 호밍 파라미터 값 로드 |
-| 191~195 | `/homing_cmd` 구독, `/homing_status` 발행 |
-| 233~242 | 호밍 상태 변수 초기화 |
-| 341~343 | `_recv_limit_sensor`에서 호밍 중 리미트 트리거 호출 |
-| 567~572 | `process_joint_control`에서 `_homing_loop()` 호출 |
-| 931~938 | `_send_homing_speeds()` |
-| 1197~1239 | `_mission_command_callback` 내 EMERGENCY_STOP 처리 (호밍 중지) |
-| 1242~1284 | `_recv_homing_cmd()` (START/STOP/Z_HOME/SET_READY) |
-| 1286~1298 | `_homing_enter_state()`, `_publish_homing_status()` |
-| 1301~1599 | `_homing_loop()` 전체 상태머신 |
-| 1601~1663 | `_homing_on_limit_triggered()`, `_homing_fail()` |
-| 1665~1751 | `_move_axes_to_ready()`, `_set_ready_position()` |
+기구 간섭이 순서를 정한다. **바꾸면 부딪힌다.**
 
-### 호밍이 사용하는 공유 리소스
-- **모터 명령 함수**: `_send_joint_command_abs()`, `_send_joint_command_rel()`, `_send_speed_command()`
-- **리미트 센서**: `self.limit_sensors` dict (joint_controller가 구독 중)
-- **모터 각도**: `stage_x_angle`, `stage_y_angle`, `stage_z_angle`, `yaw_angle` (0x92 피드백)
-- **Yaw 엔코더**: `yaw_encoder_90` (0x90 싱글턴 엔코더)
-- **발행 토픽**: `/joint_control` (JointControl), `/homing_status` (String)
+| | 축 | 목표 | 이유 |
+|---|---|---|---|
+| 1 | Z | `z_min` (**물리적으로 위**) | 내려와 있으면 X 이동 중 철근 배근에 걸린다 |
+| 2 | Yaw | 리미트 에지 → **12시** | Y 보다 먼저. 12시가 아니면 Y 가 상부 프레임을 친다 |
+| 3 | X | `x_min` | 12시에서 간섭 없음 |
+| 4 | Y | `y_min` | **yaw 가 12시일 때만** 도달 가능 |
 
-## 3. 새 호밍 시퀀스
+> `z_min` 센서는 이름과 물리 방향이 반대다 (`dir = -1`).
+> 3·4 동시 이동은 미구현 — 안전성은 같고 시간만 더 걸린다.
+
+## 3. 축 하나당 단계
 
 ```
-1. Z_SAFE     — Z_min 리미트 체크 → 미도달 시 Z_min까지 상승, 도달 시 skip
-2. X_SAFE     — X_min 리미트 체크 → 미도달 시 X_min까지 이동, 도달 시 skip
-3. YAW_CHECK  — Yaw 0x90 싱글턴 엔코더로 현재 자세 판단
-                - 좌측(Left) 자세이면 → L→R 자세복귀 시퀀스 실행
-                - 우측(Right) 자세이면 → skip
-4. YAW_SAFE   — Yaw 리미트(home) 체크 → 미도달 시 Yaw home까지 이동, 도달 시 skip
-5. Y_SAFE     — Y_min 리미트 체크 → 미도달 시 Y_min까지 이동, 도달 시 skip
-6. BACK_OFF   — X+Y+Yaw 리미트에서 살짝 후퇴 (센서 해제될 때까지)
-7. FINE_HOME  — 느린 속도로 X+Y+Yaw 리미트 재접근 (정밀 호밍, 레퍼런스 기록)
-8. READY      — 준비 위치로 이동 (X 3단계 분할, Y/Z/Yaw 동시)
-9. COMPLETE   — 레퍼런스 발행, IDLE 복귀
+ARM        브레이크 해제(0x77) → **해제 확인까지** 대기
+             ⚠ 고정 시간 대기는 모자란다. 2026-10-03 에 1.50초 걸린 경우를 봤다
+               (0.4초 시점에는 아직 잠김). 0x9A DATA[3]==1 을 확인하고 넘어간다.
+             센서가 이미 켜져 있으면 SEEK 건너뛰고 BACK_OFF 로
+SEEK       원점 리미트까지    X/Y 100 · Z 30 · yaw 30 dps (모터축)
+BACK_OFF   센서 꺼질 때까지 반대로 + 0.3초
+FINE       느린 속도로 재접근 → 센서 켜지는 순간 **원점 레퍼런스 기록**
+             전 축 30 dps 이하. 백래시와 감속 오차를 여기서 지운다
+OFFSET     **yaw 만.** 에지 → 12시, 모터축 +57.70°
+             X·Y·Z 는 오프셋 없음 (리미트가 곧 원점)
 ```
 
-### Yaw 자세 판단 기준
-- 0x90 싱글턴 엔코더 값 기반
-- `yaw_home_encoder_90` (16328) = Right 자세 (home 근처)
-- `yaw_max_encoder_90` (44710) = Left 자세 (풀 스트로크)
-- 판단 임계: 중간값 (~30000) 기준, 이상이면 Left, 이하면 Right
-- tying_orchestrator.yaml 참고: Right 작업자세 = -3°, Left 작업자세 = 393°
+## 4. Yaw 특별 처리
 
-### L→R 자세복귀 시퀀스 (tying_orchestrator 자세변경 역순)
-1. X → 0mm (홈), Y → 250mm 이동
-2. Yaw → 접근자세(390°)
-3. Y → 100mm 이동
-4. Yaw → 중간자세(173°)
-5. X → 0mm (홈), Y → 0mm 이동
+yaw 는 **원점이 구동범위 한가운데**(12시 −4.62°)에 있고 **리미트가 하나**뿐이다.
+다른 축과 근본적으로 다르다.
 
-## 4. 구현 작업
+### 4.1 사전조건 — 자세 판별 (12시 ±3° 전제를 대체)
 
-### 4.1 homing_controller.py 신규 생성
-- **패키지**: `rebar_base_control`
-- **노드명**: `homing_controller`
-- **구독 토픽**:
-  - `/homing_cmd` (String) — START, STOP, Z_HOME, SET_READY
-  - `/motor_feedback` (MotorFeedback) — 0x92/0x90 모터 피드백
-  - `/limit_sensors/*` (Bool) — x_min, x_max, y_min, y_max, z_min, z_max, yaw_home
-  - `/mission/command` (String) — EMERGENCY_STOP 시 호밍 중지
-- **발행 토픽**:
-  - `/joint_control` (JointControl) — 모터 명령
-  - `/homing_status` (String) — 호밍 상태/완료 발행
-  - `/encoder_request` (JointControl) — 0x90 엔코더 요청
-- **파라미터**: can_devices.yaml에서 로드
-  - homing_speed, homing_fine_speed, homing_timeout
-  - yaw_home_encoder_90, yaw_max_encoder_90, yaw_full_stroke_deg
-  - stage_x_step_deg, stage_y_step_deg, stage_z_step_deg
-  - ready_x_mm, ready_y_mm, ready_z_mm, ready_yaw_deg
-  - (신규) yaw_left_threshold_90: Left/Right 판단 임계값
+멀티턴은 전원에 날아가고 단회전만 복원된다. 그런데 **1~4번 자세와 12시의 단회전값이
+최소 건 4.54° 떨어져 있어 유일하게 갈린다.** 그래서 전원을 올린 직후에도 자세를 알 수
+있고, 사용자가 호밍 전에 yaw 를 손으로 12시에 맞출 필요가 없다.
 
-### 4.2 joint_controller.py에서 제거할 코드
-- `HomingState` Enum (homing_controller로 이동)
-- 호밍 파라미터 선언/로드 (81~92, 115~126)
-- `/homing_cmd` 구독, `/homing_status` 발행 (191~195)
-- 호밍 상태 변수 (233~242)
-- `_recv_limit_sensor`에서 호밍 트리거 호출 부분 (341~343) → 제거
-- `process_joint_control`에서 `_homing_loop()` 호출 (567~572) → 제거
-- `_send_homing_speeds()` (931~938) → 제거
-- EMERGENCY_STOP 호밍 중지 (1197~1239) → 제거
-- `_recv_homing_cmd()` ~ `_set_ready_position()` (1242~1751) → 전부 제거
+| 자세 | 12시 기준 건° | 단회전값 | 탐색 방향 |
+|---|---|---|---|
+| 1번 | −16.52 | 115830 | **+1** (에지가 위) |
+| 2번 | −5.46 | 216501 | **+1** — 이미 감지 구간 안, SEEK 생략 |
+| 12시 | 0 | 4055 | **−1** |
+| 3번 | +6.81 | 66041 | **−1** |
+| 4번 | +18.80 | 175177 | **−1** |
 
-### 4.3 joint_controller.py에 유지할 코드
-- 모터 명령 함수: `_send_joint_command_abs/rel()`, `_send_speed_command()` → 유지 (조이스틱에도 사용)
-- 리미트 센서 구독/상태: `_setup_limit_sensor_subscribers()`, `_recv_limit_sensor()`, `_check_limit_safe()` → 유지 (조이스틱 안전에도 사용)
-- 모터 피드백: `recv_motor_feedback()` → 유지
+판별 허용오차 **건 ±2.0°** (최소 간격 4.54° 의 절반 2.27° 보다 작게).
+**자세 사이에 있으면 거부한다** — 모터 1회전(건 28.8°) 떨어진 두 후보가 생겨 모호하고,
+모르는 채로 탐색하면 기계 끝단에 박는다.
 
-### 4.4 setup.py 수정
-```python
-'homing_controller = rebar_base_control.homing_controller:main',
+### 4.2 탐색 방향이 두 가지인 이유
+
+에지가 자세 범위 **안쪽**에 있다. 한 방향으로만 탐색하면 반대쪽 자세에서 출발했을 때
+에지를 못 만나고 끝단으로 달린다 — `+` 로만 하면 3·4번, `−` 로만 하면 1·2번이 그렇다.
+
+### 4.3 탐색 거리 상한
+
+어느 자세에서든 에지까지 **최대 건 23.42°**(4번). **건 26° 를 넘으면 멈춘다.**
+방향을 뒤집지 않는다 — 역방향 재탐색은 이미 끝단에 박은 뒤의 동작이다
+(2026-09-30 에 그렇게 10.7A/86°C 까지 갔다).
+
+## 5. 준비자세 (READY)
+
+호밍 완료 후 작업 시작 자세로 옮긴다.
+
+| 축 | 목표 | 모터축 이동량 |
+|---|---|---|
+| X | `x_min` 유지 | 없음 |
+| Z | `z_min` 유지 (상단) | 없음 |
+| Y | **중앙 174.55mm** (스트로크 349.1mm) | `+783.8°` (y_min 기준) |
+| Yaw | **1번 자세** | `−206.5°` (12시 기준) |
+
+**순서: Y 먼저, yaw 나중.** Y 는 yaw 가 12시일 때만 리미트에 닿는다고 기록돼 있다.
+중앙은 스트로크 중간이라 아마 괜찮겠지만, **검증된 조건에서 Y 를 먼저 옮기는 쪽이
+안전하다.** yaw 를 먼저 1번으로 돌리면 Y 이동이 막히는지 모른다.
+
+⚠ **1번 자세는 부하가 가장 큰 자세다.** 접근하면서 전류가 2.0 → 5.3A 로 올랐다
+(건 10° 이동). 기계적 간섭 지점에 가깝다. 작업 흐름상 1번에서 시작해야 하므로
+그대로 쓰되, 전류를 보며 접근하고 넘기지 말 것.
+
+## 6. 주차
+
+```
+0x78 (브레이크 잠금)  →  0x80 (여자 해제)
 ```
 
-### 4.5 launch 파일 수정
-- `full_system.launch.py`에 homing_controller 노드 추가
-- params-file: can_devices.yaml
+**`0x78` 만으로는 전류가 끊기지 않는다.** 모터가 여자된 채 마지막 속도 명령(0 이어도)을
+계속 수행해 브레이크와 반력을 상대로 밀면서 발열한다. 2026-10-03 yaw 실측: `0x78` 후
+**−4.02A 가 계속 흐르고 29→43°C**, `0x80` 후 0.00A·하강. 부하가 없으면 증상이 안 보여서
+놓치기 쉽다 — yaw 1번 자세 근처와 Z 자중이 그 조건이다.
 
-### 4.6 테스트
-1. 빌드 후 서비스 재시작
-2. GO_HOME 명령 → 새 시퀀스 순서대로 동작 확인
-3. Left 자세에서 GO_HOME → 자세복귀 후 호밍 확인
-4. 이미 홈 위치일 때 GO_HOME → 각 축 skip 확인
-5. Z_HOME 명령 → Z축 단독 호밍 확인
+순서를 거꾸로 하면 Z 가 떨어진다 (`0x80` 은 유지 토크를 없앤다).
 
-## 5. 주의사항
+## 7. 토픽
 
-- joint_controller에서 `self.is_homed` 플래그가 사라지므로, 필요 시 `/homing_status` 구독으로 대체
-- `_recv_limit_sensor` 내 호밍 트리거 부분만 제거, 리미트 안전 체크는 유지
-- tying_orchestrator가 `/homing_status`의 `COMPLETE:` 메시지를 파싱하므로 메시지 형식 유지 필수
-- navigator.py도 `/homing_status` 구독 중 → 형식 유지
-- can_devices.yaml에 신규 파라미터 추가 필요 (`yaw_left_threshold_90`)
+| 방향 | 토픽 | 형 | 비고 |
+|---|---|---|---|
+| 입력 | `/homing_cmd` | String | `all` / 축이름 / `stop` |
+| 입력 | `/limit_sensors/*` | Bool | x_min·x_max·y_min·y_max·z_min·z_max·yaw_home |
+| 입력 | `/motor_*/encoder_single` | Int32 | 자세 판별용 (전원 무관) |
+| 입력 | `/motor_*_position` | **Float32** | ⚠ Float64 로 구독하면 한 건도 안 온다 |
+| 입력 | `/motor_*/brake` | Bool | **신규** — ARM 확인용 |
+| 입력 | `/control_mode` | String | 권한 수락 확인 |
+| 출력 | `/joint_N/speed` | Float32 | SEEK·BACK_OFF·FINE |
+| 출력 | `/joint_N/position` | Float32 | OFFSET·READY (아는 거리는 위치 제어) |
+| 출력 | `/brake_cmd` | String | `release`/`lock`/**`shutdown`** |
+| 출력 | `/control_mode_request` | String | 권한 요청 |
+| 출력 | `/homing_status` | String | 상태·완료 |
+
+**의도적 편차:** 아키텍처 계약은 `homing_node` → `/joint_cmd` → `stage_node` 다. 그런데
+`stage_node` 가 아직 X·Y·Z 만 다루고 yaw 가 없다. yaw 를 `stage_node` 에 넣는 것은 별도
+작업이므로, 지금은 기존 축 토픽을 쓰고 `mode_arbiter` 로 권한을 중재한다. 계층(L3)과
+책임 분리는 지키고 **소유권 통합은 다음 단계로 남긴다.**
+
+## 8. 구현 상태 (2026-10-03)
+
+| 항목 | 상태 |
+|---|---|
+| 순서 `z→yaw→x→y`, 5단계 상태기계 | 됨 |
+| X·Y·Z 호밍 | 됨 (실장비 반복 성공) |
+| yaw 속도 제어로 에지 도달 | 확인 (30dps, 2.22A, 센서 켜짐) |
+| `load_pose_id`/`identify_pose` | 작성됨 |
+| ① `ARM` 의 브레이크 해제 확인 | **미구현** |
+| ② 사전조건 교체 + 탐색 방향 유도 | **미구현** |
+| ③ 탐색 거리 상한 (방향 뒤집기 제거) | **미구현** |
+| ④ `0x80` 주차 | **미구현** |
+| ⑤ `READY` 단계 | **미구현** |
+| X+Y 동시 | 미구현 (시간 단축만) |
+
+## 9. 폐기된 접근
+
+- **yaw 를 위치 제어(0xA4)로만 돌리기** — "속도 제어로는 안 움직인다" 를 전제로 검토했으나,
+  원인은 **브레이크 해제 타이밍**이었다. 해제를 확인한 뒤 30dps 를 주면 2.22A 로
+  정상 회전한다. 위치 제어도 동작하지만(0.2° 정밀도 실측) 필수는 아니다.
+  아는 거리를 가는 OFFSET·READY 에만 쓴다.
+- **`breakaway: 160dps`** — 위와 같은 오진에서 나온 우회책. 근본 대책이 아니다.
+- **영점(`0x63`/`0x64`)으로 자세 복원** — 영점은 ROM 에 남지만 멀티턴은 날아간다.
+  영점은 단회전 창(건 28.8°)이 어디 놓이는지만 정하고 창을 넓히지 못한다.
+  자세 범위가 35.3° 로 더 넓어서 모호성이 남는다.

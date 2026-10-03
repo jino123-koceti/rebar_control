@@ -49,9 +49,11 @@ import rclpy
 from rclpy.node import Node
 
 from .axis_config import (load_axis_motor_ids, load_home_offsets,
-                          load_precheck, load_seek_dirs, precheck_violation)
+                          load_precheck, load_seek_dirs, precheck_violation,
+                          load_pose_id, identify_pose, pose_label,
+                          load_search_limit, load_ready_pose)
 from .axis_config import HOMING_AXES as AXES
-from std_msgs.msg import Bool, Float32, Float64, Int32, String
+from std_msgs.msg import Bool, Float32, Float64, Float64MultiArray, Int32, String
 
 
 class Phase(Enum):
@@ -61,6 +63,7 @@ class Phase(Enum):
     BACK_OFF = 'back_off'  # 리미트에서 살짝 빠짐 (센서 해제)
     FINE = 'fine'          # 느린 속도로 재접근 → 레퍼런스 기록
     OFFSET = 'offset'      # 에지에서 작업 위치까지 더 간다 (yaw 12시)
+    READY = 'ready'        # 전 축 호밍 후 작업 시작 자세로 (Y 중앙 → yaw 1번)
     DONE = 'done'
     FAILED = 'failed'
 
@@ -71,19 +74,14 @@ class Phase(Enum):
 #   joint: 명령 토픽 번호,  home_limit: 원점 리미트,  far_limit: 반대쪽(안전 확인용)
 #   dir: 원점 방향 부호 (실측으로 확정해야 한다 — 기본값은 미검증)
 LIMITS = ('x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max', 'yaw_home')
-# 순서는 **기구 간섭 때문에** 이 순서여야 한다 (2026-09-30 실장비 확인):
-#   z   : 먼저 올려둔다(z_min=위). 내려와 있으면 아래 동작들이 간섭한다
-#   x   : x_min 은 yaw 자세와 무관하게 언제나 가능. 집어넣으면 yaw 회전 여유가 생긴다
+# **기구 간섭이 순서를 정한다** (2026-09-30 실장비 확인, 사용자 지정):
+#   z   : 먼저 올린다(z_min=위). 내려와 있으면 X 이동 중 철근 배근에 걸린다
 #   yaw : 12시로. **y 보다 먼저여야 한다**
+#   x   : x_min 은 12시에서 간섭 없음
 #   y   : y_min/y_max 는 **yaw 가 12시일 때만** 도달 가능. 아니면 상부 프레임을 친다
-# ⚠ 기존 순서 (z,x,y,yaw) 는 y 가 yaw 보다 앞이라, 12시가 아닌 상태로 y 가 리미트까지
-#   달려 프레임을 친다. 절대 되돌리지 말 것.
-# 2026-09-30 확정 (사용자 지정):
-#   z   : 먼저 올린다. z_max 쪽에 있으면 X 이동 중 철근 배근에 걸린다
-#   yaw : 12시로. **사용자가 호밍 전 12시 ±3° 에 놓는다는 전제** 위에서 동작한다
-#   x, y: 12시에서는 x_min·y_min 둘 다 간섭이 없다 (사용자 확인)
-# ⚠ 동시 이동(x+y)은 아직 미구현이다 — 상태기계가 축 하나만 다룬다. 순차로도
-#   순서 자체는 같으므로 안전성은 동일하고, 시간만 더 걸린다.
+# ⚠ 옛 순서 (z,x,y,yaw) 는 y 가 yaw 보다 앞이라 12시가 아닌 상태로 y 가 리미트까지
+#   달려 프레임을 친다. 되돌리지 말 것.
+# ⚠ x+y 동시 이동은 미구현 — 순서는 같으므로 안전성은 동일하고 시간만 더 걸린다.
 ALL_ORDER = ('z', 'yaw', 'x', 'y')
 
 
@@ -110,12 +108,12 @@ class HomingNode(Node):
         # 그 뒤 yaw 가 브레이크를 문 채 5.4A 를 끌며 거의 안 움직였다. 해제를 먼저
         # 확실히 보내고 기다리면 3.2A 로 떨어지고 명령의 88% 가 나온다.
         self.declare_parameter('arm_sec', 1.0)
+        self.declare_parameter('ready_tol_deg', 3.0)      # 준비자세 도달 판정 (모터축)
         # yaw 스톨 시 방향 반전을 쓸지. **현재 위치를 알고 있으면 꺼야 한다.**
         # 2026-09-30: 반전이 걸려 1번 자세(구동범위 하한)를 지나쳤다. 홈이 어느 쪽인지
         # 아는 상황에서는 반전이 도움이 아니라 위험이다.
         self.declare_parameter('yaw_sweep', True)
         # 이탈(breakaway): 출발 직후 이 시간 안에 안 움직이면 더 센 속도로 민다
-        self.declare_parameter('breakaway_sec', 0.5)
         # 권한 요청 후 이 시간까지 못 받으면 실패한다 (중재기가 있는 경우에만 적용)
         self.declare_parameter('grant_timeout', 3.0)
         # 스톨 감지 — 명령을 보내는데 엔코더가 안 변하면 기계 끝에 닿은 것이다.
@@ -135,7 +133,7 @@ class HomingNode(Node):
         self.axis_timeout = float(g('axis_timeout_sec').value)
         self.limit_stale = float(g('limit_stale_sec').value)
         self.arm_sec = float(g('arm_sec').value)
-        self.breakaway_sec = float(g('breakaway_sec').value)
+        self.ready_tol = float(g('ready_tol_deg').value)
         self.grant_timeout = float(g('grant_timeout').value)
         for name in AXES:
             AXES[name]['dir'] = int(g(f'{name}_dir').value)
@@ -144,6 +142,11 @@ class HomingNode(Node):
 
         self.speed_pubs = {n: self.create_publisher(Float32, f"/joint_{c['joint']}/speed", 10)
                            for n, c in AXES.items()}
+        # 아는 거리는 위치 제어로 보낸다(READY). stage_node 와 같은 규약:
+        # Float64MultiArray [목표각도, 최대속도dps].
+        self.pos_pubs = {n: self.create_publisher(
+            Float64MultiArray, f"/joint_{c['joint']}/position", 10)
+            for n, c in AXES.items()}
         self.status_pub = self.create_publisher(String, '/homing_status', 10)
         # 브레이크는 L1(position_control_node) 이 건다. 여기서는 요청만 한다.
         # ⚠ Z 는 브레이크를 풀면 **즉시 떨어진다** (2026-09-30 실측 출력축 -12.74°).
@@ -190,6 +193,19 @@ class HomingNode(Node):
             # 원점 레퍼런스가 영영 비어 있게 된다.
             self.create_subscription(Float32, f"/motor_{mid}_position",
                                      lambda m, k=name: self.pos.__setitem__(k, m.data), 10)
+        # 브레이크 해제 확인용. **고정 시간 대기로는 모자란다** — 0x77 이 먹기까지
+        # 1.50초 걸린 경우를 봤다(2026-10-03). 문 채로 명령하면 최대 전류로 밀면서
+        # 거의 안 움직인다 — 증상이 "모터 고장" 과 같다.
+        self.brake_ok = {}
+        for name, mid in motor_ids.items():
+            self.create_subscription(
+                Bool, f"/motor_{mid}/brake",
+                (lambda k: (lambda m: self.brake_ok.__setitem__(k, m.data)))(name), 10)
+        self.pose_id = load_pose_id('yaw')       # yaw 자세 판별 (12시 ±3° 전제를 대체)
+        self.search_limit = load_search_limit('yaw')
+        self.ready_order, self.ready_off, self.ready_speed = load_ready_pose()
+        self._ready_queue = []
+        self._ready_sent = 0.0
         self.create_subscription(String, '/homing_cmd', self._on_cmd, 10)
 
         self.phase = Phase.IDLE
@@ -202,7 +218,6 @@ class HomingNode(Node):
         self.stall_deg = float(g('stall_deg').value)
         self._stall_pos = None        # 마지막으로 "움직였다" 고 본 위치
         self._stall_t = 0.0
-        self._reversed = False        # sweep 축이 이미 방향을 뒤집었는가
         self._off_since = None        # 후퇴 중 센서가 풀린 시각
         self._phase_pos0 = None       # 단계 시작 시 위치 (이탈 판정용)
 
@@ -262,19 +277,62 @@ class HomingNode(Node):
             return False
         return True
 
+    def _finish(self):
+        self._lock_all()
+        self._release_control()
+        self._enter(Phase.DONE, '완료')
+        self.get_logger().info(f"호밍 완료 — 레퍼런스 {self.refs}")
+
+    def _start_ready(self):
+        """준비자세로 옮긴다 — 호밍이 끝난 자리가 작업 시작 자세가 아니다.
+
+        순서는 `axes.yaml` 의 `ready.order` 를 따른다 (**Y 먼저, yaw 나중**).
+        Y 는 yaw 가 12시일 때만 리미트에 닿는다고 기록돼 있어, 검증된 조건에서
+        Y 를 먼저 옮기는 쪽이 안전하다.
+        """
+        self._ready_queue = [a for a in self.ready_order
+                             if a in self.refs and a in self.ready_off]
+        skip = [a for a in self.ready_order if a not in self._ready_queue]
+        if skip:
+            self.get_logger().warning(
+                f"준비자세 건너뜀: {', '.join(skip)} (원점 레퍼런스나 환산값이 없다)")
+        if not self._ready_queue:
+            self._finish()
+            return
+        self.axis = None
+        self._next_ready()
+
+    def _next_ready(self):
+        if not self._ready_queue:
+            self.get_logger().info("준비자세 완료")
+            self._finish()
+            return
+        prev = self.axis
+        self.axis = self._ready_queue.pop(0)
+        if prev is not None and prev != self.axis:
+            self._cmd_speed(prev, 0.0)
+            self._brake('shutdown', prev)
+        self._brake('release', self.axis)
+        self._ready_sent = 0.0
+        tgt = self.refs[self.axis] + self.ready_off[self.axis]
+        self._enter(Phase.READY, f"{self.axis} → {tgt:+.1f}°")
+
+    def _cmd_pos(self, axis, deg, speed):
+        self.pos_pubs[axis].publish(
+            Float64MultiArray(data=[float(deg), float(speed)]))
+
     def _next_axis(self):
         if not self.queue:
-            self._lock_all()
-            self._release_control()
-            self._enter(Phase.DONE, '완료')
-            self.get_logger().info(f"호밍 완료 — 레퍼런스 {self.refs}")
+            prev = self.axis
+            if prev is not None:
+                self._cmd_speed(prev, 0.0)
+            self._start_ready()
             return
         prev = self.axis
         self.axis = self.queue.pop(0)
         if prev is not None and prev != self.axis:
             self._brake('lock', prev)           # 끝난 축은 바로 잠근다
         self._brake('release', self.axis)       # 움직일 축만 푼다
-        self._reversed = False
         self._stall_pos = None
         # 해제가 먹을 때까지 기다렸다가 움직인다 (arm_sec 주석 참고)
         self._enter(Phase.ARM, '브레이크 해제 대기')
@@ -291,6 +349,22 @@ class HomingNode(Node):
             self.axis = None
 
     def _precheck_failed(self):
+        """호밍 시작 전제 — yaw 는 **자세 판별**로 본다.
+
+        옛 전제 "사용자가 12시 ±3° 에 놓는다" 는 운용 현실(전원 차단 시 1~4번 중
+        하나)과 맞지 않았다. 단회전값이 자세마다 건 4.54° 이상 떨어져 유일하게
+        갈리므로 손으로 맞출 필요가 없다. 판별된 자세로 **탐색 방향까지** 정한다 —
+        에지가 자세 범위 안쪽이라 방향이 ± 두 가지이고 틀리면 끝단으로 달린다.
+        """
+        if self.pose_id and 'yaw' in AXES:
+            n, info = identify_pose(self.pose_id, self.single.get('yaw'))
+            if n is None:
+                return f"yaw {info}"
+            AXES['yaw']['dir'] = int(info['dir'])
+            self.get_logger().info(
+                f"yaw 자세 판별: {pose_label(n)} (오차 건 {info['err_gun']:+.2f}°) "
+                f"→ 탐색 방향 {info['dir']:+d}, 에지까지 건 {info['to_edge_gun']:+.2f}°")
+            return None
         return precheck_violation(self.precheck, self.single)
 
     def _on_mode(self, msg):
@@ -313,6 +387,7 @@ class HomingNode(Node):
     def _brake(self, action, axis):
         """축 브레이크 요청. Z 는 자동해제 금지 축이라 force 를 붙여야 풀린다."""
         arg = f"{action} {axis}" + (' force' if action == 'release' and axis == 'z' else '')
+        # action: release / lock / shutdown (= lock + 0x80)
         self.brake_pub.publish(String(data=arg))
 
     def _release_control(self):
@@ -320,32 +395,20 @@ class HomingNode(Node):
         self._request_control('release')
 
     def _lock_all(self):
-        """전 축 잠금. **Z 를 먼저** 잠근다 — 떨어지는 축이 우선이다."""
+        """전 축 주차. **Z 를 먼저** 잠근다 — 떨어지는 축이 우선이다.
+
+        `shutdown` = 잠금 후 여자 해제. **잠금만으로는 전류가 끊기지 않는다** —
+        모터가 여자된 채 마지막 속도 명령(0 이어도)을 계속 수행해 브레이크와 반력을
+        상대로 밀면서 발열한다 (2026-10-03 yaw 실측: -4.02A 계속, 29→43°C).
+        부하가 없으면 증상이 안 보여 놓치기 쉽다.
+        """
         for a in ('z',) + tuple(x for x in AXES if x != 'z'):
-            self._brake('lock', a)
+            self._cmd_speed(a, 0.0)          # 먼저 명령을 거둔다
+            self._brake('shutdown', a)
 
     def _fine_of(self, axis):
         """축별 정밀 속도. 없으면 공통값."""
         return float(AXES[axis].get('fine', self.fine_speed))
-
-    def _with_breakaway(self, axis, base, elapsed):
-        """아직 안 움직였으면 더 센 속도로 민다 (정지마찰 이탈).
-
-        속도 제어기가 명령 속도에 비례해서만 전류를 올리는 탓에, 낮은 속도로는
-        정지 상태를 못 벗어나는 축이 있다 (yaw 실측: 30dps→2.2A 로 안 움직이고
-        80dps→3.7A 에서 풀린다). 일단 움직이면 원래 속도로 돌아간다.
-        """
-        bk = AXES[axis].get('breakaway')
-        if not bk or elapsed > self.breakaway_sec * 6:
-            return base
-        p = self.pos.get(axis)
-        if p is None or self._phase_pos0 is None:
-            return base
-        if abs(p - self._phase_pos0) > self.stall_deg:
-            return base                      # 이미 움직이고 있다
-        if elapsed < self.breakaway_sec:
-            return base                      # 잠깐은 정상 속도로 시도
-        return bk if base >= 0 else -bk
 
     def _backoff_of(self, axis):
         return float(AXES[axis].get('back_off', self.back_off_speed))
@@ -403,6 +466,14 @@ class HomingNode(Node):
         if self.phase is Phase.ARM:
             # 대기 중에도 해제를 여러 번 보낸다 (첫 발행은 연결 직후라 유실될 수 있다)
             self._brake('release', self.axis)
+            # **해제를 확인하고 넘어간다.** 고정 시간은 모자랄 수 있다 (실측 1.50초).
+            # 상태를 못 받는 경우(토픽 없음)에는 종전처럼 시간으로만 판단한다.
+            told = self.brake_ok.get(self.axis)
+            if told is False:
+                if elapsed > self.arm_sec * 6:
+                    self._fail(f"{self.axis}: 브레이크가 {elapsed:.1f}초 동안 풀리지 "
+                               f"않았다 — 0x77 이 먹는지 확인하세요")
+                return
             if elapsed >= self.arm_sec:
                 if self.limit[cfg['home_limit']]:
                     self.get_logger().info(
@@ -410,6 +481,32 @@ class HomingNode(Node):
                     self._enter(Phase.BACK_OFF, '이미 원점')
                 else:
                     self._enter(Phase.SEEK, f"{cfg['home_limit']} 탐색")
+            return
+
+        if self.phase is Phase.READY:
+            # 아는 거리를 가는 단계다 → 위치 제어. 브레이크 해제를 먼저 확인한다.
+            told = self.brake_ok.get(self.axis)
+            if told is False:
+                self._brake('release', self.axis)
+                if elapsed > self.arm_sec * 6:
+                    self._fail(f"{self.axis}: 준비자세 전 브레이크가 풀리지 않았다")
+                return
+            tgt = self.refs[self.axis] + self.ready_off[self.axis]
+            p = self.pos.get(self.axis)
+            if p is not None and abs(p - tgt) <= self.ready_tol:
+                self.get_logger().info(
+                    f"{self.axis}: 준비자세 도달 ({p:+.1f}°, 목표 {tgt:+.1f}°)")
+                self._next_ready()
+                return
+            if elapsed > self.axis_timeout:
+                self._fail(f"{self.axis}: 준비자세 타임아웃 — "
+                           f"현재 {p if p is None else f'{p:+.1f}'}°, 목표 {tgt:+.1f}°")
+                return
+            # **0xA4 는 명령의 일부만 가는 경우가 있다** (실측: +2.00° 명령에 +1.23°).
+            # 그래서 한 번 보내고 끝내지 않고 2Hz 로 같은 절대목표를 다시 보낸다.
+            if time.time() - self._ready_sent > 0.5:
+                self._ready_sent = time.time()
+                self._cmd_pos(self.axis, tgt, self.ready_speed)
             return
 
         if elapsed > self.axis_timeout:
@@ -421,6 +518,22 @@ class HomingNode(Node):
             return
 
         at_home = bool(self.limit[cfg['home_limit']])
+
+        # ── 탐색 거리 상한 ──────────────────────────────────────────────────
+        # yaw 는 리미트가 하나뿐이고 에지가 자세 범위 **안쪽**에 있다. 방향을 틀리면
+        # 에지를 못 만나고 기계 끝단으로 달린다. 어느 자세에서든 에지까지 최대
+        # 건 23.42° 이므로, 상한을 넘겼으면 방향이 틀렸거나 기구 이상이다.
+        # ⚠ **방향을 뒤집지 않는다** — 역방향 재탐색은 이미 박은 뒤의 동작이다
+        #   (2026-09-30 에 그렇게 10.7A/86°C 까지 갔다).
+        if (self.phase is Phase.SEEK and self.search_limit
+                and self.axis == 'yaw' and not at_home):
+            p0, p = self._phase_pos0, self.pos.get(self.axis)
+            if p0 is not None and p is not None and abs(p - p0) > self.search_limit:
+                self._stop_axis(self.axis)
+                self._fail(f"{self.axis}: {abs(p - p0):.0f}° 를 갔는데 "
+                           f"{cfg['home_limit']} 가 켜지지 않았다 "
+                           f"(상한 {self.search_limit:.0f}°) — 탐색 방향이나 기구를 확인하세요")
+                return
 
         # ── 스톨 감지 ────────────────────────────────────────────────────────
         # 명령을 보내는데 엔코더가 안 변하면 기계 끝에 닿은 것이다. yaw 는 끝 리미트가
@@ -437,15 +550,7 @@ class HomingNode(Node):
                 self._stall_pos = p
                 self._stall_t = time.time()
             elif time.time() - self._stall_t > self.stall_sec:
-                if cfg.get('sweep') and not self._reversed and self.phase is Phase.SEEK:
-                    # yaw: 반대쪽 끝이었다. 방향을 뒤집어 다시 쓴다
-                    cfg['dir'] = -cfg['dir']
-                    self._reversed = True
-                    self._stall_pos = None
-                    self.t_phase = time.time()          # 타임아웃도 다시 센다
-                    self.get_logger().warning(
-                        f"{self.axis}: 기계 끝에 닿음(스톨) — 방향을 {cfg['dir']:+d} 로 뒤집어 재탐색")
-                elif self.phase is Phase.FINE and cfg.get('fine_stall_ok'):
+                if self.phase is Phase.FINE and cfg.get('fine_stall_ok'):
                     # 홈 쪽으로 갈수록 부하가 커지는 축이 있다 (yaw: 12시 근처).
                     # 정밀 재접근에서 못 밀면 **이미 홈 직전**이라는 뜻이므로,
                     # SEEK 에서 잡은 에지를 원점으로 인정하고 넘어간다.
@@ -486,16 +591,14 @@ class HomingNode(Node):
                                f"{cfg['home_limit']} 가 안 풀림 — 센서 위치·감도 확인")
                     return
                 self._off_since = None
-                self._cmd_speed(self.axis, self._with_breakaway(
-                    self.axis, -cfg['dir'] * self._backoff_of(self.axis), elapsed))
+                self._cmd_speed(self.axis, -cfg['dir'] * self._backoff_of(self.axis))
             else:
                 if self._off_since is None:
                     self._off_since = time.time()
                     self.get_logger().info(
                         f"{self.axis}: {cfg['home_limit']} 해제됨 ({elapsed:.1f}초 걸림)")
                 if time.time() - self._off_since < self.back_off_sec:
-                    self._cmd_speed(self.axis, self._with_breakaway(
-                    self.axis, -cfg['dir'] * self._backoff_of(self.axis), elapsed))
+                    self._cmd_speed(self.axis, -cfg['dir'] * self._backoff_of(self.axis))
                 else:
                     self._stop_axis(self.axis)
                     self.get_logger().info(f"{self.axis}: 정밀 재접근")
@@ -525,8 +628,7 @@ class HomingNode(Node):
                     f"→ 작업 위치")
                 self._next_axis()
             else:
-                self._cmd_speed(self.axis, self._with_breakaway(
-                    self.axis, sign * self._fine_of(self.axis), elapsed))
+                self._cmd_speed(self.axis, sign * self._fine_of(self.axis))
 
         elif self.phase is Phase.FINE:
             if at_home:
@@ -542,8 +644,7 @@ class HomingNode(Node):
                 else:
                     self._next_axis()
             else:
-                self._cmd_speed(self.axis, self._with_breakaway(
-                    self.axis, cfg['dir'] * self._fine_of(self.axis), elapsed))
+                self._cmd_speed(self.axis, cfg['dir'] * self._fine_of(self.axis))
 
     def _publish_status(self):
         self.status_pub.publish(String(data=json.dumps({

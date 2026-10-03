@@ -155,6 +155,144 @@ def precheck_violation(precheck, single, gear=12.5):
     return None
 
 
+def load_pose_id(name='yaw'):
+    """자세 판별 정보. 없으면 None.
+
+    **왜 자세를 알아야 하나:** yaw 는 리미트 센서가 하나뿐이고 가동범위가 1.23바퀴다.
+    게다가 에지가 자세 범위 **안쪽**(12시 -4.62°)에 있어서, 시작 자세에 따라 탐색
+    방향이 ± 두 가지다. 한 방향으로만 탐색하면 반대쪽 자세에서 출발했을 때 에지를
+    못 만나고 **기계 끝단으로 달린다**(+ 로만 하면 3·4번, - 로만 하면 1·2번).
+
+    멀티턴은 전원에 날아가지만 단회전은 복원되고, 12시와 1~4번의 단회전값이 최소
+    건 4.54° 떨어져 있어 유일하게 갈린다. 그래서 **전원을 올린 직후에도 자세를
+    알 수 있고**, 사용자가 호밍 전에 yaw 를 손으로 12시에 맞출 필요가 없다.
+
+    돌려주는 각 항목: gun(12시 기준 건 각도), single(기대 단회전값),
+    dir(탐색 명령 부호 — 에지가 위에 있으면 +1).
+    """
+    try:
+        stage = _stage()
+        cfg = stage.get(name) or {}
+        enc = cfg.get('encoder') or {}
+        noon = enc.get('noon_single')
+        poses = enc.get('pose_offset_from_noon_gun_deg')
+        if noon is None or not poses:
+            return None
+        cpr = int(enc.get('cpr', 262144))
+        gear = float(stage.get('gear', 12.5))
+        cpg = (cpr / 360.0) * gear               # counts / 건 1도
+        # 에지는 12시에서 home_offset_deg(모터축, **명령 부호**) 만큼 떨어져 있다.
+        # 명령 + 는 건 각도 증가 방향이므로, 에지는 12시보다 그만큼 **아래**다.
+        edge_gun = -float(enc.get('home_offset_deg', 0.0)) / gear
+        tol_gun = float(enc.get('pose_id_tolerance_gun_deg', 2.0))
+        cand = {0: 0.0}                          # 0 = 12시 (호밍 직후 자세)
+        cand.update({int(k): float(v) for k, v in poses.items()})
+        out = {}
+        for n, g in cand.items():
+            out[n] = dict(gun=g,
+                          single=int(round((noon + g * cpg) % cpr)),
+                          dir=1 if g < edge_gun else -1)
+        return dict(poses=out, cpr=cpr, cpg=cpg, noon=int(noon),
+                    edge_gun=edge_gun, tol_gun=tol_gun, tol=tol_gun * cpg,
+                    limit_gun=float(enc.get('search_limit_gun_deg', 26.0)))
+    except Exception:
+        return None
+
+
+def pose_label(n):
+    return '12시' if n == 0 else f'{n}번 자세'
+
+
+def identify_pose(info, single):
+    """단회전값 → (자세번호, 상세) 또는 (None, 거부 사유).
+
+    자세 사이에 있으면 **거부한다.** 모터 1회전(건 28.8°) 떨어진 두 후보가 생겨
+    모호해지는데, 모르는 채로 탐색하면 끝단에 박을 수 있다.
+    """
+    if not info:
+        return None, "자세 판별 정보가 없다 (axes.yaml 의 noon_single / pose_offset 확인)"
+    if single is None:
+        return None, ("단회전값을 못 받고 있다 — "
+                      "/motor_*/encoder_single 이 발행되는지 확인하세요")
+    cpr, half = info['cpr'], info['cpr'] // 2
+    best, bd = None, None
+    for n, p in info['poses'].items():
+        d = (single - p['single'] + half) % cpr - half
+        if bd is None or abs(d) < abs(bd):
+            best, bd = n, d
+    err = bd / info['cpg']
+    if abs(bd) > info['tol']:
+        return None, (f"어느 자세에도 맞지 않는다 — 가장 가까운 {pose_label(best)} 에서 "
+                      f"건 {err:+.2f}° (허용 ±{info['tol_gun']:.2f}°). "
+                      f"1~4번 자세나 12시로 옮긴 뒤 다시 시작하세요")
+    p = dict(info['poses'][best])
+    p['err_gun'] = err
+    p['to_edge_gun'] = info['edge_gun'] - p['gun']
+    return best, p
+
+
+def load_search_limit(name='yaw'):
+    """탐색 거리 상한 (모터축 도). 없으면 None.
+
+    yaw 는 리미트가 하나뿐이라 **잘못된 방향으로 달리면 기계 끝단에 박는다.**
+    어느 자세에서든 에지까지 최대 건 23.42° 이므로, 그보다 넉넉한 값을 넘기면
+    방향이 틀렸거나 기구 이상이다. **그때는 방향을 뒤집지 말고 멈춘다** —
+    역방향 재탐색은 이미 박은 뒤의 동작이다 (2026-09-30: 10.7A/86°C).
+    """
+    try:
+        stage = _stage()
+        enc = ((stage.get(name) or {}).get('encoder') or {})
+        v = enc.get('search_limit_gun_deg')
+        if v is None:
+            return None
+        return float(v) * float(stage.get('gear', 12.5))
+    except Exception:
+        return None
+
+
+def load_ready_pose():
+    """준비자세 — 축별 **원점 레퍼런스로부터의 토픽 각도 차이**와 이동 순서.
+
+    `/motor_*_position` 토픽은 counts 부호와 반대다(토픽 = -counts/728). 그래서
+    **명령 부호가 양수면 토픽은 감소한다.** 아래 부호는 그 규약에 맞춰 계산했다.
+
+    · Y: mm 는 원점(y_min) 기준이고 `mm_per_deg` 가 부호를 흡수한다 →
+         `ref + mm / mm_per_deg`. stage_node 의 `deg_of()` 와 같은 식이다.
+    · yaw: 레퍼런스는 **에지**에 기록된다(12시가 아니다). 에지는 12시보다 건 4.62°
+         아래이고 1번 자세는 12시보다 건 16.52° 아래이므로, 에지→1번은 건 −11.90°.
+         건 각도가 줄면 토픽은 커진다 → `ref + 11.90 * gear`.
+         (12시를 경유해 계산해도 `-57.70 + 16.52*12.5 = +148.80` 으로 일치한다.)
+
+    돌려주는 것: (순서 리스트, {축: 토픽각도차}, 속도dps)
+    """
+    try:
+        stage = _stage()
+        r = stage.get('ready') or {}
+        gear = float(stage.get('gear', 12.5))
+        out = {}
+        order = [str(x) for x in (r.get('order') or [])]
+        if 'y' in order:
+            mpd = (stage.get('y') or {}).get('mm_per_deg')
+            if not mpd:
+                order.remove('y')        # 환산을 모르면 Y 는 건너뛴다
+            else:
+                out['y'] = float(r['y_mm']) / float(mpd)
+        if 'yaw' in order:
+            enc = ((stage.get('yaw') or {}).get('encoder') or {})
+            poses = enc.get('pose_offset_from_noon_gun_deg') or {}
+            key = r.get('yaw_pose')
+            gun = poses.get(key, poses.get(str(key)))
+            off_motor = float(enc.get('home_offset_deg', 0.0))
+            if gun is None:
+                order.remove('yaw')
+            else:
+                # 에지 기준: (12시까지) + (12시→자세). 둘 다 토픽 부호로 바꾼다.
+                out['yaw'] = -off_motor + (-float(gun)) * gear
+        return order, out, float(r.get('speed_dps', 60))
+    except Exception:
+        return [], {}, 60.0
+
+
 def load_stage_axes(names=('x', 'y', 'z')):
     """스테이지 이동에 필요한 축 정보 (관절 번호·모터·mm 환산·브레이크)."""
     stage = _stage()

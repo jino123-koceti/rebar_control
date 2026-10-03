@@ -130,8 +130,14 @@ S1 에서 뒤로 미루고 S4 에서 `lateral_node` 를 L3 로 정리할 때 함
 | `drive_node` | `/cmd_vel` → `/drive_control`. 슬루·좌우 배분·드리프트 보정 | ≤400 | `drive_controller` |
 | `stage_node` | 상부 X/Y/Z/Yaw 축 동작. `/joint_cmd` → `/joint_control` | ≤500 | `joint_controller`(횡이동 제외) |
 | `lateral_node` | 횡이동 2축. `/lateral/step` | ≤300 | 3차년도 구현(동작 검증됨) |
-| `homing_node` | 원점복귀 시퀀스. 리미트 구독 + 축 명령 | ≤600 | `homing_controller` |
+| `homing_node` | 원점복귀 시퀀스. 리미트 구독 + 축 명령 | ≤700 | `homing_controller` |
 | `remote_teleop` | 리모콘 입력(`/remote_control`) → 축 명령. CAN 을 모른다 | ≤300 | `iron_md_teleop_node` 조작 규칙 |
+
+**`homing_node` 상한을 600 → 700 으로 올렸다 (2026-10-03).** 600 은 2차년도
+`homing_controller` 이식분만 보고 잡은 값이었고, 3차년도에 **yaw 자세 판별 + 탐색 방향
+유도**(리미트가 하나뿐이라 방향을 틀리면 기계 끝단에 박는다), **브레이크 해제 확인**(고정
+대기로는 모자라다 — 실측 1.50초), **준비자세(READY)** 가 더해졌다. 한도를 지키려고
+주석을 깎는 쪽이 더 나쁘다 — 그 주석이 실측으로만 얻은 지식이다.
 
 **`stage_node` 와 `homing_node` 를 나누는 이유:** 호밍은 "축을 어떻게 움직이나" 가 아니라
 "어떤 순서로 원점을 찾나" 다. 2차년도도 `joint_controller` 에서 `homing_controller` 를

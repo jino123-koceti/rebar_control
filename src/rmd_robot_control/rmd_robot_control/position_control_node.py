@@ -9,7 +9,7 @@ import rclpy
 from rclpy.node import Node
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray, Float32, Int32, Empty, String
+from std_msgs.msg import Float64MultiArray, Float32, Int32, Empty, String, Bool
 from rebar_base_interfaces.msg import SafetyState
 from geometry_msgs.msg import Twist
 from std_srvs.srv import Trigger
@@ -379,6 +379,16 @@ class PositionControlNode(Node):
             for mid in self.motor_ids}
         self.encoder_single = {}
 
+        # 브레이크 해제 상태 — 0x9A DATA[3] (0x01 = 해제). **호밍이 이것을 기다린다.**
+        # 고정 시간 대기로는 모자란다: 2026-10-03 에 0x77 이 먹기까지 **1.50초** 걸린
+        # 경우를 봤다 (0.4초 시점에는 아직 잠김). 브레이크를 문 채 속도 명령을 받으면
+        # 모터는 최대 전류로 밀면서 거의 안 움직인다 — 증상이 "모터 고장" 과 같다.
+        self.brake_pubs = {
+            mid: self.create_publisher(Bool, f"motor_{hex(mid)}/brake", 10)
+            for mid in self.motor_ids
+            if mid not in (self.left_motor_id, self.right_motor_id)}
+        self.brake_state = {}
+
         # 엔코더 명령 진단. 어떤 읽기 명령이 이 모터에서 실제로 동작하는지 확인한다.
         #   ros2 topic pub --once /encoder_probe std_msgs/String "{data: 'yaw'}"
         # 멀티턴(0x92)은 전원을 내리면 사라진다. 자세를 저장해 두려면 **싱글턴
@@ -410,6 +420,8 @@ class PositionControlNode(Node):
         self.drive_latch_timer = self.create_timer(0.5, self.drive_latch_tick)
         # 1Hz 면 충분하다 — 사람이 축을 옮기는 속도에 비하면 빠르고, CAN 부담도 작다
         self.encoder_single_timer = self.create_timer(1.0, self._read_encoder_single)
+        # 2Hz. 호밍의 ARM 단계가 이 값을 보고 넘어간다 — 느리면 호밍이 그만큼 기다린다.
+        self.brake_state_timer = self.create_timer(0.5, self._read_brake_state)
         
         # 서비스 생성
         self.brake_release_service = self.create_service(
@@ -681,6 +693,17 @@ class PositionControlNode(Node):
             self.can_manager.send_frame(mid, bytes(frame))
             time.sleep(0.002)
 
+    def _read_brake_state(self):
+        """상부 축의 0x9A 를 읽어 브레이크 해제 상태를 발행한다.
+
+        응답 처리는 `0x9A` 분기에서 한다. 주행 축은 제외한다 — 브레이크가 없다.
+        """
+        frame = bytearray(8)
+        frame[0] = 0x9A
+        for mid in self.brake_pubs:
+            self.can_manager.send_frame(mid, bytes(frame))
+            time.sleep(0.002)
+
     def _on_brake_cmd(self, msg):
         """축별 브레이크 해제/잠금.
 
@@ -693,9 +716,10 @@ class PositionControlNode(Node):
         if not parts:
             return
         action = parts[0]
-        if action not in ('release', 'lock'):
+        if action not in ('release', 'lock', 'shutdown'):
             self.get_logger().error(
-                f"브레이크 명령을 모르겠습니다: '{msg.data}' — 'release x,y' 형식")
+                f"브레이크 명령을 모르겠습니다: '{msg.data}' — "
+                f"'release x,y' / 'lock z' / 'shutdown x,y' 형식")
             return
 
         force = 'force' in parts[1:]
@@ -714,6 +738,12 @@ class PositionControlNode(Node):
 
         cmd = self.protocol.create_system_command(
             CommandType.BRAKE_RELEASE if action == 'release' else CommandType.BRAKE_LOCK)
+        # `shutdown` = 잠금 후 여자 해제. **`0x78` 만으로는 전류가 끊기지 않는다** —
+        # 모터가 여자된 채 마지막 속도 명령(0 이어도)을 계속 수행해 브레이크와 반력을
+        # 상대로 밀면서 발열한다 (2026-10-03 yaw 실측: -4.02A 계속, 29→43°C).
+        # 순서가 중요하다: 먼저 잠그지 않고 0x80 을 보내면 **Z 가 떨어진다.**
+        shutdown_cmd = (self.protocol.create_system_command(CommandType.MOTOR_SHUTDOWN)
+                        if action == 'shutdown' else None)
 
         done, skipped, failed = [], [], []
         for name in names:
@@ -724,13 +754,17 @@ class PositionControlNode(Node):
             if action == 'release' and name in self.NEVER_AUTO_RELEASE and not force:
                 skipped.append(f"{name}(자중 낙하 위험 — 풀려면 'force')")
                 continue
-            if self.can_manager.send_frame(mid, cmd):
+            ok = self.can_manager.send_frame(mid, cmd)
+            if ok and shutdown_cmd is not None:
+                time.sleep(0.05)                 # 잠금이 먹은 뒤에 여자를 끊는다
+                ok = self.can_manager.send_frame(mid, shutdown_cmd)
+            if ok:
                 done.append(f"{name}(0x{mid:03X})")
             else:
                 failed.append(f"{name}(0x{mid:03X})")
             time.sleep(0.05)
 
-        verb = '해제' if action == 'release' else '잠금'
+        verb = {'release': '해제', 'lock': '잠금', 'shutdown': '잠금+차단'}[action]
         if done:
             self.get_logger().info(f"브레이크 {verb}: {', '.join(done)}")
         if skipped:
@@ -1817,6 +1851,19 @@ class PositionControlNode(Node):
                         pub.publish(m)
             elif command == 0x9A:
                 # 에러 상태 읽기 응답 (0x9A)
+                if len(data) >= 4:
+                    # DATA[3] = 브레이크 상태 (0x01 = 해제). 호밍 ARM 이 이걸 기다린다.
+                    rel = (data[3] == 0x01)
+                    if self.brake_state.get(motor_id) != rel:
+                        self.get_logger().info(
+                            f"브레이크 0x{motor_id:03X}: "
+                            f"{'해제' if rel else '잠김'}")
+                    self.brake_state[motor_id] = rel
+                    pub = self.brake_pubs.get(motor_id)
+                    if pub is not None:
+                        b = Bool()
+                        b.data = rel
+                        pub.publish(b)
                 if len(data) >= 8:
                     error_state = data[7]  # Error byte
                     if error_state != 0:

@@ -77,7 +77,13 @@ R4_LIMITS = {
     'ezi_io_node': 300, 'gripper_node': 300, 'seengrip_node': 300,
     'trigger_node': 150, 'pololu_node': 150, 'safety_node': 400,
     'drive_node': 400, 'drive_controller': 400, 'stage_node': 500,
-    'joint_controller': 500, 'lateral_node': 300, 'homing_node': 600,
+    # homing_node 600 → 700 (2026-10-03). 아키텍처 §4 의 600 은 2차년도
+    # homing_controller 이식분만 보고 잡은 값이었다. 3차년도에 **yaw 자세 판별+탐색
+    # 방향 유도**, **브레이크 해제 확인**, **준비자세(READY)** 가 더해졌다. 한도를
+    # 지키려고 주석을 깎는 쪽이 더 나쁘다 — 이 파일의 주석은 방향 부호 규약·기구
+    # 간섭 순서·브레이크 타이밍처럼 **실측으로만 얻은 지식**이고, 지우면 다시
+    # 알아내야 한다. 700 도 2차년도 실패 사례(joint_controller 1772)와는 멀다.
+    'joint_controller': 500, 'lateral_node': 300, 'homing_node': 700,
     'homing_controller': 600, 'mode_arbiter': 300, 'navigator': 500,
     'path_follower': 400, 'rebar_controller': 400, 'rebar_drive_node': 800,
     'tying_orchestrator_node': 800, 'sequence_controller': 400,
