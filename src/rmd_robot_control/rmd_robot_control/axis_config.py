@@ -257,7 +257,7 @@ def load_pose_id(name='yaw'):
             out[n] = dict(gun=g,
                           single=int(round((noon + g * cpg) % cpr)),
                           dir=1 if g < edge_gun else -1)
-        return dict(poses=out, cpr=cpr, cpg=cpg, noon=int(noon),
+        return dict(poses=out, cpr=cpr, cpg=cpg, noon=int(noon), gear=gear,
                     edge_gun=edge_gun, tol_gun=tol_gun, tol=tol_gun * cpg,
                     limit_gun=float(enc.get('search_limit_gun_deg', 26.0)))
     except Exception:
@@ -436,6 +436,31 @@ def envelope_violation(env, pose, want):
             return (f"{a}={v:.1f}mm 가 가동 범위 밖 ({where}: "
                     f"{rng[0]:.1f}~{rng[1]:.1f}mm, 여유 {env['margin']:.0f}mm 포함)")
     return None
+
+
+def transit_window(env, info, a, b):
+    """자세 a → b 로 **회전하는 동안** XY 가 있어야 하는 범위. (범위, 통과 자세들).
+
+    회전은 중간 자세를 **지나간다** — 1번에서 3번으로 가면 12시와 2번을 지난다.
+    그래서 지나가는 자세 전부의 **교집합** 안에 있어야 한다. 양 끝 자세만 보면
+    사이에 있는 최악값을 놓친다 — 2026-10-03 에 12시(X 361.0mm)를 안 재고 3번
+    (383.2)을 최악으로 써서 X 상한이 22mm 과했다.
+
+    범위를 못 구하면 네 자세 교집합(`any`)으로 떨어진다 — 모르면 좁게 잡는다.
+    """
+    if not env or not info:
+        return None, []
+    gun = {n: p['gun'] for n, p in info['poses'].items()}
+    if a not in gun or b not in gun:
+        return env['any'], []
+    lo, hi = sorted((gun[a], gun[b]))
+    passed = [n for n, g in gun.items() if lo <= g <= hi and n in env['poses']]
+    if not passed:
+        return env['any'], []
+    win = {ax: (max(env['poses'][n][ax][0] for n in passed),
+                min(env['poses'][n][ax][1] for n in passed))
+           for ax in ('x', 'y')}
+    return win, sorted(passed)
 
 
 def load_pose_select():

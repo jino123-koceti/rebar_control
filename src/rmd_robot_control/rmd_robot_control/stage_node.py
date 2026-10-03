@@ -42,8 +42,21 @@ mm 는 **호밍 원점에서의 거리**다. 그래서 호밍이 선행 조건�
 결속 지점의 사분면으로 **어느 자세로 결속할지**도 같이 알려준다 (`/stage/status`
 의 `pose_want`). X 가 xmax 쪽이면 1·4번, xmin 쪽이면 2·3번, Y 가 ymin 쪽이면
 1·2번, ymax 쪽이면 3·4번 — 겹치면 하나로 떨어진다. 규칙은 `axes.yaml` 에 있다.
-⚠ **이 노드는 yaw 를 돌리지 않는다.** 고를 뿐이고, 회전은 상위(결속 시퀀스)가
-`pose_want` 를 보고 시킨다.
+고르기만 한다 — "언제 돌릴지" 는 상위(결속 시퀀스)가 정한다.
+
+## yaw 자세 이동 (`/stage/yaw_pose`)
+
+**원점이 필요 없다.** 자세 판별이 현재 건 각도를 유일하게 정해 주므로 상대
+이동으로 간다 (실측 도착 오차 건 +0.02°):
+
+    목표 토픽각 = 현재 토픽각 + (현재 건각 − 목표 건각) × gear
+
+`axis_config.ready_target()` 은 호밍이 **실제 적용한** 에지→12시 오프셋을 알아야
+해서 `homing_node` 밖에서는 쓸 수 없다. 이 경로는 그 값이 필요 없다.
+
+⚠⚠ **회전은 중간 자세를 지나간다.** 1번에서 3번으로 가면 12시와 2번을 지나므로,
+XY 가 **지나가는 자세 전부의 교집합** 안에 있어야 한다. 아니면 거부한다 —
+후퇴는 상위가 시킨다 (이 노드는 막는 쪽만 맡는다).
 
 ## 안전
 
@@ -63,13 +76,14 @@ import time
 import rclpy
 from geometry_msgs.msg import Point
 from rclpy.node import Node
-from std_msgs.msg import Empty, Float32, Float64MultiArray, Int32, String
+from std_msgs.msg import Bool, Empty, Float32, Float64MultiArray, Int32, String
 from rebar_base_interfaces.msg import SafetyState
 
 from .axis_config import (envelope_for, envelope_violation, identify_pose,
                           load_axis_motor_ids,
                           load_envelope, load_pose_id, load_pose_select,
-                          load_stage_axes, pose_label, select_pose)
+                          load_stage_axes, pose_label, select_pose,
+                          transit_window)
 
 AXES = ('x', 'y', 'z')          # yaw 는 mm 개념이 아니라 여기서 다루지 않는다
 
@@ -84,6 +98,8 @@ class StageNode(Node):
         self.declare_parameter('arm_sec', 1.0)        # 브레이크 해제 후 대기
         # ⚠ 끄면 프레임 충돌을 막을 것이 없다. 범위를 다시 재는 동안만 끈다.
         self.declare_parameter('enforce_envelope', True)
+        self.declare_parameter('yaw_speed_dps', 60.0)     # 모터축. 실측 3.5s/208°
+        self.declare_parameter('yaw_tol_deg', 3.0)        # 도달 판정 (모터축)
 
         g = self.get_parameter
         self.speed = float(g('move_speed_dps').value)
@@ -91,9 +107,14 @@ class StageNode(Node):
         self.timeout = float(g('move_timeout_sec').value)
         self.arm_sec = float(g('arm_sec').value)
         self.enforce = bool(g('enforce_envelope').value)
+        self.yaw_speed = float(g('yaw_speed_dps').value)
+        self.yaw_tol = float(g('yaw_tol_deg').value)
 
-        self.ax = load_stage_axes(AXES)
-        missing = [n for n, c in self.ax.items() if c['mm_per_deg'] is None]
+        # yaw 도 같이 싣는다 — 관절 발행·브레이크·위치 구독 경로를 공유한다.
+        # mm 환산이 없는 축이라 `mm_of`/`deg_of` 는 AXES 에만 쓴다.
+        self.ax = load_stage_axes(AXES + ('yaw',))
+        missing = [n for n, c in self.ax.items()
+                   if n in AXES and c['mm_per_deg'] is None]
         if missing:
             self.get_logger().warning(
                 f"mm_per_deg 미측정: {', '.join(missing)} — 그 축은 이동을 거부합니다. "
@@ -109,7 +130,7 @@ class StageNode(Node):
         self.mode_pub = self.create_publisher(String, '/control_mode_request', 10)
         self.status_pub = self.create_publisher(String, '/stage/status', 10)
 
-        self.deg = {n: None for n in AXES}        # 현재 모터각(도)
+        self.deg = {n: None for n in self.ax}     # 현재 모터각(도). yaw 포함
         for n, c in self.ax.items():
             if c['motor']:
                 self.create_subscription(
@@ -133,11 +154,20 @@ class StageNode(Node):
         self.sel = load_pose_select()
         self.pose_id = load_pose_id('yaw')
         self.yaw_single = None          # yaw 단회전값 (자세 판별용)
+        self.yaw_brake = None           # 0x9A DATA[3] — 해제 확인 전엔 안 움직인다
         yaw_mid = load_axis_motor_ids(('yaw',)).get('yaw')
         if yaw_mid:
             self.create_subscription(
                 Int32, f"/motor_{yaw_mid}/encoder_single",
                 lambda m: setattr(self, 'yaw_single', m.data), 10)
+            self.create_subscription(
+                Bool, f"/motor_{yaw_mid}/brake",
+                lambda m: setattr(self, 'yaw_brake', m.data), 10)
+        self.create_subscription(Int32, '/stage/yaw_pose', self._on_yaw_pose, 10)
+        self.yaw_moving = False
+        self.yaw_tgt = None
+        self.yaw_want = None
+        self._yaw_sent = 0.0
         if self.env is None:
             self.get_logger().warning(
                 "자세별 가동 범위가 없다 (axes.yaml 의 stage.envelope) — "
@@ -204,6 +234,109 @@ class StageNode(Node):
                 hint = (f" → {pose_label(w)}로 돌리면 "
                         f"{'갈 수 있다' if ok else '역시 범위 밖이다'}")
         return f"{bad} [지금 {why}]{hint}"
+
+    def _on_yaw_pose(self, msg):
+        """yaw 를 1~4번 자세(또는 0=12시)로 돌린다. 상대 이동이라 원점이 필요 없다."""
+        want = int(msg.data)
+        info = self.pose_id
+        if self.moving or self.yaw_moving:
+            return self._reject('이미 이동 중이다 — /stage/stop 후 다시')
+        if not info or want not in info['poses']:
+            return self._reject(f'모르는 자세 {want} '
+                                f'(axes.yaml 의 pose_offset_from_noon_gun_deg)')
+        c = self.ax.get('yaw') or {}
+        if not c.get('joint') or self.deg.get('yaw') is None:
+            return self._reject('yaw: 축 정의나 현재 위치가 없다')
+        cur, why = self.cur_pose()
+        if cur is None:
+            return self._reject(f'현재 yaw 자세를 못 가린다 — {why}')
+        if cur == want:
+            self.detail = f'{pose_label(want)} — 이미 그 자세다'
+            self.get_logger().info(self.detail)
+            return self._publish_status()
+        stop = self._safety_stop()
+        if stop:
+            return self._reject(stop)
+
+        bad = self._transit_block(cur, want)
+        if bad:
+            return self._reject(bad)
+
+        g = info['poses']
+        self.yaw_want = want
+        self.yaw_tgt = (self.deg['yaw']
+                        + (g[cur]['gun'] - g[want]['gun']) * info['gear'])
+        self.yaw_moving = True
+        self.t_start = self.t_arm = time.time()
+        self._yaw_sent = 0.0
+        self.detail = f'{pose_label(cur)} → {pose_label(want)} — 브레이크 해제 대기'
+        self._brake('release', 'yaw')
+        self._request_control('auto')
+        self.get_logger().info(
+            f"yaw 회전 — {pose_label(cur)} → {pose_label(want)} "
+            f"(건 {g[cur]['gun']:+.2f}° → {g[want]['gun']:+.2f}°, "
+            f"모터축 {self.yaw_tgt - self.deg['yaw']:+.1f}°)")
+
+    def _transit_block(self, cur, want):
+        """회전 중 지나가는 자세들의 교집합 밖이면 사유, 안이면 None.
+
+        회전은 **중간 자세를 지나간다.** 양 끝만 보면 12시처럼 사이에 있는
+        최악값을 놓친다 (2026-10-03: X 상한 22mm 과했다).
+        """
+        if self.env is None or not self.enforce:
+            return None
+        win, passed = transit_window(self.env, self.pose_id, cur, want)
+        if not win:
+            return None
+        names = ', '.join(pose_label(n) for n in passed)
+        for ax in ('x', 'y'):
+            v = self.mm_of(ax)
+            if v is None:
+                return (f'{ax}: 현재 mm 를 몰라 회전 안전을 확인할 수 없다 '
+                        f'(호밍 원점과 mm_per_deg 가 있어야 한다)')
+            if not (win[ax][0] <= v <= win[ax][1]):
+                return (f'{pose_label(cur)}→{pose_label(want)} 회전은 [{names}] 를 '
+                        f'지난다 — 지금 {ax}={v:.1f}mm 가 그 교집합 '
+                        f'{win[ax][0]:.1f}~{win[ax][1]:.1f}mm 밖이다. '
+                        f'XY 를 먼저 그 안으로 옮기세요')
+        return None
+
+    def _yaw_tick(self):
+        stop = self._safety_stop()
+        if stop:
+            return self._yaw_done(f'안전 — {stop}')
+        if not self._granted():
+            return self._yaw_done(f'제어 권한 없음 (모드 {self.mode})')
+        if time.time() - self.t_start > self.timeout:
+            return self._yaw_done(f'타임아웃 {self.timeout:.0f}s')
+        # 해제가 명령보다 **먼저 도착해야** 한다. DATA[3] 로 확인한다 —
+        # 안 풀린 채로 명령하면 전류만 오른다 (0.4초로는 부족한 적이 있다)
+        if not self.yaw_brake or time.time() - self.t_arm < self.arm_sec:
+            self._brake('release', 'yaw')
+            return
+        self._request_control('auto')
+        err = self.yaw_tgt - self.deg['yaw']
+        if abs(err) <= self.yaw_tol:
+            return self._yaw_done(f'도달 (남은 모터축 {err:+.2f}°)')
+        if time.time() - self._yaw_sent > 0.4:
+            self._yaw_sent = time.time()
+            self.pos_pubs['yaw'].publish(
+                Float64MultiArray(data=[self.yaw_tgt, self.yaw_speed]))
+
+    def _yaw_done(self, reason):
+        """멈추고 **잠그고 0x80 까지** 보낸다 — 0x78 만으로는 전류가 계속 흐른다."""
+        self.spd_pubs['yaw'].publish(Float32(data=0.0))
+        self._brake('lock', 'yaw')
+        self._brake('shutdown', 'yaw')
+        got, why = self.cur_pose()
+        ok = got is not None and got == self.yaw_want
+        self.detail = (f'yaw {pose_label(self.yaw_want)} — {reason}'
+                       + ('' if ok else f' ⚠ 도착 자세 {why}'))
+        (self.get_logger().info if ok else self.get_logger().warning)(self.detail)
+        self.yaw_moving = False
+        self.yaw_tgt = None
+        self._request_control('release')
+        self._publish_status()
 
     # ---- 환산 --------------------------------------------------------------
     def mm_of(self, name):
@@ -335,6 +468,8 @@ class StageNode(Node):
         return self.mode is None or self.mode == 'auto'
 
     def _stop(self, reason):
+        if self.yaw_moving:
+            return self._yaw_done(reason)
         for name in list(self.target):
             self.spd_pubs[name].publish(Float32(data=0.0))
         for name in list(self.target):
@@ -349,6 +484,8 @@ class StageNode(Node):
 
     # ---- 진행 --------------------------------------------------------------
     def tick(self):
+        if self.yaw_moving:
+            return self._yaw_tick()
         if not self.moving:
             return
         stop = self._safety_stop()
@@ -406,7 +543,9 @@ class StageNode(Node):
         lim = ({k: [round(v[0], 1), round(v[1], 1)] for k, v in r.items()}
                if r else None)
         self.status_pub.publish(String(data=json.dumps({
-            'moving': self.moving,
+            'moving': self.moving or self.yaw_moving,
+            'yaw_moving': self.yaw_moving,
+            'yaw_pose_target': self.yaw_want if self.yaw_moving else None,
             'current_mm': cur,
             'target': {k: round(v, 2) for k, v in self.target.items()},
             'target_unit': self.target_unit,

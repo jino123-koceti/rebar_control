@@ -30,6 +30,10 @@ setup(
             'homing_node = rmd_robot_control.homing_node:main',
             # L3 — 상부 스테이지를 mm 목표로 보낸다 (검출점 이동용)
             'stage_node = rmd_robot_control.stage_node:main',
+            # L4 — 결속 지점 하나를 자세 선택 → 회전 → 이동으로 묶는다.
+            # axis_config(단일 소스)를 읽어야 해서 이 패키지에 둔다. 축·CAN 은
+            # 건드리지 않고 /stage/* 로만 명령하므로 계층은 지켜진다.
+            'tying_sequence = rmd_robot_control.tying_sequence:main',
         ],
     },
 )

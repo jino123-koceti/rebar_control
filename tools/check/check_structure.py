@@ -60,7 +60,11 @@ R3_PLANNED = {
     '/gripper/position': '외부에서 부르는 토픽',
     '/rebar/recorder/trigger': '데이터 수집 도구에서 부른다',
     '/rebar/detect': '사람·L4 가 보내는 검출 트리거 (ros2 topic pub)',
-    '/stage/goal': '캘리브레이션 도구·L4 가 발행할 예정 — 지금은 사람이 직접 준다',
+    '/stage/goal': '캘리브레이션 도구·사람이 직접 주는 경로도 남아 있다'
+                   ' (tying_sequence 가 발행하므로 위반은 아니다)',
+    '/tying/goal': '결속 지점 입구 — L4 상위(검출·순회)가 발행할 예정 (S7).'
+                   ' 지금은 사람이 직접 준다 (ros2 topic pub)',
+    '/tying/abort': '사람·UI 가 보내는 중단 명령',
     '/stage/goal_deg': '축 각도 목표. 캘리브레이션 결과를 사람이 직접 준다'
                        ' (mm_per_deg 실측 전에도 쓸 수 있다)',
     '/stage/stop': '사람·UI 가 보내는 정지 명령',
@@ -76,7 +80,16 @@ R4_LIMITS = {
     'motor_bridge': 600, 'position_control_node': 600, 'remote_bridge': 200,
     'ezi_io_node': 300, 'gripper_node': 300, 'seengrip_node': 300,
     'trigger_node': 150, 'pololu_node': 150, 'safety_node': 400,
-    'drive_node': 400, 'drive_controller': 400, 'stage_node': 500,
+    'drive_node': 400, 'drive_controller': 400,
+    # stage_node 500 → 620 (2026-10-03). 아키텍처 §4 는 stage_node 에 "상부 X/Y/Z/
+    # **Yaw** 축 동작" 을 맡기는데, 500 은 X/Y/Z 만 보고 잡은 값이었다. yaw 가
+    # 더해지며 들어온 것은 줄 수가 아니라 **별개의 이동 방식**이다: mm 가 아니라
+    # 자세 번호로 받고, 도달을 단회전 자세 재판별로 확인하고, 회전이 지나가는
+    # 중간 자세들의 교집합을 먼저 검사해야 한다(12시를 안 재서 22mm 과했던 일이
+    # 여기서 막힌다). 그리고 자세별 가동 범위 강제가 함께 들어왔다.
+    # 이 파일의 주석은 방향 부호·전환 안전창·브레이크 타이밍처럼 실측으로만 얻은
+    # 지식이라 한도를 지키려고 깎으면 다시 알아내야 한다 (homing_node 와 같은 이유).
+    'stage_node': 620,
     # homing_node 600 → 700 (2026-10-03). 아키텍처 §4 의 600 은 2차년도
     # homing_controller 이식분만 보고 잡은 값이었다. 3차년도에 **yaw 자세 판별+탐색
     # 방향 유도**, **브레이크 해제 확인**, **준비자세(READY)** 가 더해졌다. 한도를
@@ -87,6 +100,7 @@ R4_LIMITS = {
     'homing_controller': 600, 'mode_arbiter': 300, 'navigator': 500,
     'path_follower': 400, 'rebar_controller': 400, 'rebar_drive_node': 800,
     'tying_orchestrator_node': 800, 'sequence_controller': 400,
+    'tying_sequence': 400,
 }
 
 # R5 — 같은 기능이 여러 파일에 구현된 것

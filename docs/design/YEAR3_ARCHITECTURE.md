@@ -128,7 +128,7 @@ S1 에서 뒤로 미루고 S4 에서 `lateral_node` 를 L3 로 정리할 때 함
 | 노드 | 책임 | 규모 | 2차년도 출처 |
 |---|---|---|---|
 | `drive_node` | `/cmd_vel` → `/drive_control`. 슬루·좌우 배분·드리프트 보정 | ≤400 | `drive_controller` |
-| `stage_node` | 상부 X/Y/Z/Yaw 축 동작. `/joint_cmd` → `/joint_control` | ≤500 | `joint_controller`(횡이동 제외) |
+| `stage_node` | 상부 X/Y/Z/Yaw 축 동작. `/joint_cmd` → `/joint_control` | ≤620 ※ | `joint_controller`(횡이동 제외) |
 | `lateral_node` | 횡이동 2축. `/lateral/step` | ≤300 | 3차년도 구현(동작 검증됨) |
 | `homing_node` | 원점복귀 시퀀스. 리미트 구독 + 축 명령 | ≤700 | `homing_controller` |
 | `remote_teleop` | 리모콘 입력(`/remote_control`) → 축 명령. CAN 을 모른다 | ≤300 | `iron_md_teleop_node` 조작 규칙 |
@@ -138,6 +138,12 @@ S1 에서 뒤로 미루고 S4 에서 `lateral_node` 를 L3 로 정리할 때 함
 유도**(리미트가 하나뿐이라 방향을 틀리면 기계 끝단에 박는다), **브레이크 해제 확인**(고정
 대기로는 모자라다 — 실측 1.50초), **준비자세(READY)** 가 더해졌다. 한도를 지키려고
 주석을 깎는 쪽이 더 나쁘다 — 그 주석이 실측으로만 얻은 지식이다.
+
+※ **`stage_node` 500 → 620 (2026-10-03).** 500 은 X/Y/Z 만 보고 잡은 값인데 위 표가
+맡기는 Yaw 가 들어오면서 **별개의 이동 방식**이 추가됐다 — mm 가 아니라 자세 번호로
+받고, 도달을 단회전 자세 재판별로 확인하고, 회전이 **지나가는 중간 자세들의 교집합**을
+먼저 검사한다. 거기에 자세별 가동 범위 강제가 함께 들어왔다. 자세한 근거는
+`tools/check/check_structure.py` 의 `R4_LIMITS` 주석에 있다.
 
 **`stage_node` 와 `homing_node` 를 나누는 이유:** 호밍은 "축을 어떻게 움직이나" 가 아니라
 "어떤 순서로 원점을 찾나" 다. 2차년도도 `joint_controller` 에서 `homing_controller` 를
