@@ -30,10 +30,26 @@ mm 는 **호밍 원점에서의 거리**다. 그래서 호밍이 선행 조건�
         /brake_cmd        String              축별 브레이크
         /stage/status     String(JSON)        현재 mm·목표·도달 여부
 
+## 자세별 가동 범위 (2026-10-03)
+
+**yaw 자세에 따라 X·Y 가 갈 수 있는 거리가 다르다** — 결속건이 회전하며 간섭
+방향이 바뀐다. 그래서 목표를 받으면 **지금 yaw 자세를 판별해서** 그 자세의
+범위 밖이면 거부한다. 이게 없으면 검출 지점으로 보낼 때 프레임을 친다.
+자세를 못 가리면(자세 사이) 네 자세의 **교집합**으로 본다 — 모르면 좁게 잡는다.
+
+## 결속 자세 선택
+
+결속 지점의 사분면으로 **어느 자세로 결속할지**도 같이 알려준다 (`/stage/status`
+의 `pose_want`). X 가 xmax 쪽이면 1·4번, xmin 쪽이면 2·3번, Y 가 ymin 쪽이면
+1·2번, ymax 쪽이면 3·4번 — 겹치면 하나로 떨어진다. 규칙은 `axes.yaml` 에 있다.
+⚠ **이 노드는 yaw 를 돌리지 않는다.** 고를 뿐이고, 회전은 상위(결속 시퀀스)가
+`pose_want` 를 보고 시킨다.
+
 ## 안전
 
   · `mm_per_deg` 가 `axes.yaml` 에 없으면(미측정) **이동을 거부한다.** 환산값을
     모르는 채로 움직이면 엉뚱한 거리를 간다.
+  · 목표가 **현재 yaw 자세의 가동 범위 밖**이면 거부한다 (위 참조)
   · Z 는 브레이크를 풀면 떨어진다 → 이동 직전에 풀고 도달 즉시 잠근다
   · 안전 차단(`blocked_axes`)에 걸린 방향으로는 안 보낸다
   · 제어 권한이 없으면 명령하지 않는다 (mode_arbiter)
@@ -47,10 +63,12 @@ import time
 import rclpy
 from geometry_msgs.msg import Point
 from rclpy.node import Node
-from std_msgs.msg import Empty, Float32, Float64MultiArray, String
+from std_msgs.msg import Empty, Float32, Float64MultiArray, Int32, String
 from rebar_base_interfaces.msg import SafetyState
 
-from .axis_config import load_stage_axes
+from .axis_config import (envelope_violation, identify_pose, load_axis_motor_ids,
+                          load_envelope, load_pose_id, load_pose_select,
+                          load_stage_axes, pose_label, select_pose)
 
 AXES = ('x', 'y', 'z')          # yaw 는 mm 개념이 아니라 여기서 다루지 않는다
 
@@ -63,12 +81,15 @@ class StageNode(Node):
         self.declare_parameter('tolerance_mm', 1.0)
         self.declare_parameter('move_timeout_sec', 30.0)
         self.declare_parameter('arm_sec', 1.0)        # 브레이크 해제 후 대기
+        # ⚠ 끄면 프레임 충돌을 막을 것이 없다. 범위를 다시 재는 동안만 끈다.
+        self.declare_parameter('enforce_envelope', True)
 
         g = self.get_parameter
         self.speed = float(g('move_speed_dps').value)
         self.tol_mm = float(g('tolerance_mm').value)
         self.timeout = float(g('move_timeout_sec').value)
         self.arm_sec = float(g('arm_sec').value)
+        self.enforce = bool(g('enforce_envelope').value)
 
         self.ax = load_stage_axes(AXES)
         missing = [n for n, c in self.ax.items() if c['mm_per_deg'] is None]
@@ -106,6 +127,24 @@ class StageNode(Node):
         self.create_subscription(Point, '/stage/goal_deg', self._on_goal_deg, 10)
         self.create_subscription(Empty, '/stage/stop', lambda m: self._stop('정지 명령'), 10)
 
+        # ── 자세별 가동 범위 ────────────────────────────────────────────
+        self.env = load_envelope()
+        self.sel = load_pose_select()
+        self.pose_id = load_pose_id('yaw')
+        self.yaw_single = None          # yaw 단회전값 (자세 판별용)
+        yaw_mid = load_axis_motor_ids(('yaw',)).get('yaw')
+        if yaw_mid:
+            self.create_subscription(
+                Int32, f"/motor_{yaw_mid}/encoder_single",
+                lambda m: setattr(self, 'yaw_single', m.data), 10)
+        if self.env is None:
+            self.get_logger().warning(
+                "자세별 가동 범위가 없다 (axes.yaml 의 stage.envelope) — "
+                "범위 검사를 하지 않는다. 자세에 따라 프레임을 칠 수 있다")
+        elif not self.enforce:
+            self.get_logger().warning(
+                "enforce_envelope=false — 범위 밖 목표를 막지 않는다")
+
         self.target = {}          # 축 → 목표값
         self.target_unit = 'mm'   # 'mm' 또는 'deg' — 목표가 어느 단위인가
         self.t_start = 0.0
@@ -138,6 +177,32 @@ class StageNode(Node):
             self.mode = (json.loads(msg.data) or {}).get('mode')
         except ValueError:
             pass
+
+    # ---- 자세 --------------------------------------------------------------
+    def cur_pose(self):
+        """지금 yaw 자세. (번호|None, 설명). None 이면 자세 사이거나 값이 없다."""
+        pose, detail = identify_pose(self.pose_id, self.yaw_single)
+        return pose, (pose_label(pose) if pose is not None else str(detail))
+
+    def _envelope_check(self, want_mm):
+        """목표 mm 가 현재 자세의 가동 범위 안인가. 밖이면 사유, 안이면 None.
+
+        자세를 못 가리면 교집합으로 본다 — 모르면 좁게 잡는 쪽이 안전하다.
+        """
+        if self.env is None or not self.enforce:
+            return None
+        pose, why = self.cur_pose()
+        bad = envelope_violation(self.env, pose, want_mm)
+        if bad is None:
+            return None
+        hint = ''
+        if self.sel:
+            w, _ = select_pose(self.sel, want_mm.get('x'), want_mm.get('y'), pose)
+            if w is not None and w != pose:
+                ok = envelope_violation(self.env, w, want_mm) is None
+                hint = (f" → {pose_label(w)}로 돌리면 "
+                        f"{'갈 수 있다' if ok else '역시 범위 밖이다'}")
+        return f"{bad} [지금 {why}]{hint}"
 
     # ---- 환산 --------------------------------------------------------------
     def mm_of(self, name):
@@ -182,6 +247,15 @@ class StageNode(Node):
                 return self._reject(f"{name}: axes.yaml 에 축 정의가 없다")
             if self.deg[name] is None:
                 return self._reject(f"{name}: 현재 위치를 못 받고 있다")
+        # 각도 목표도 mm 로 환산되면 같이 검사한다. 원점·환산값이 없으면 못 한다 —
+        # 캘리브레이션 도구용 경로라 그때는 통과시킨다 (사람이 보며 쓰는 경로다).
+        mm = {}
+        for name in ('x', 'y'):
+            if name in want and name in self.refs and self.ax[name]['mm_per_deg']:
+                mm[name] = (want[name] - self.refs[name]) * self.ax[name]['mm_per_deg']
+        bad = self._envelope_check(mm) if mm else None
+        if bad:
+            return self._reject(bad)
         self._begin(want, 'deg')
 
     def _on_goal(self, msg):
@@ -205,6 +279,11 @@ class StageNode(Node):
                     f"각도로 주려면 /stage/goal_deg 를 쓰세요")
             if self.deg[name] is None:
                 return self._reject(f"{name}: 현재 위치를 못 받고 있다")
+
+        # 자세별 가동 범위. X·Y 만 재어 두었다 (Z 는 [미측정])
+        bad = self._envelope_check({k: v for k, v in want.items() if k in ('x', 'y')})
+        if bad:
+            return self._reject(bad)
 
         self._begin(want, 'mm')
 
@@ -316,6 +395,14 @@ class StageNode(Node):
     def _publish_status(self):
         cur = {n: (round(v, 2) if v is not None else None)
                for n, v in ((k, self.mm_of(k)) for k in AXES)}
+        pose, pose_detail = self.cur_pose()
+        # 지금 위치에서 결속한다면 어느 자세여야 하는가. 상위가 이걸 보고 yaw 를 돌린다
+        want, want_why = (select_pose(self.sel, cur['x'], cur['y'], pose)
+                          if self.sel else (None, '선택 규칙 없음'))
+        lim = None
+        if self.env is not None:
+            r = self.env['poses'].get(pose) if pose is not None else self.env['any']
+            lim = {k: [round(v[0], 1), round(v[1], 1)] for k, v in (r or {}).items()}
         self.status_pub.publish(String(data=json.dumps({
             'moving': self.moving,
             'current_mm': cur,
@@ -324,6 +411,12 @@ class StageNode(Node):
             'current_deg': {k: (round(v, 2) if v is not None else None)
                             for k, v in self.deg.items()},
             'homed': sorted(self.refs),
+            'pose': pose,                 # 지금 yaw 자세 (None = 자세 사이)
+            'pose_detail': pose_detail,
+            'pose_want': want,            # 지금 위치에서 결속할 자세
+            'pose_want_why': want_why,
+            'limit_mm': lim,              # 지금 자세에서 갈 수 있는 X·Y 범위
+            'enforce_envelope': self.enforce,
             'detail': self.detail,
         }, ensure_ascii=False)))
 

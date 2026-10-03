@@ -377,6 +377,112 @@ def ready_target(axis, ref, lin_off, yaw_motor, off_used):
     return None
 
 
+def load_envelope():
+    """자세별 X·Y 가동 범위. {'poses': {n: {축: (lo, hi)}}, 'any': {축: (lo, hi)}}.
+
+    **yaw 자세에 따라 X·Y 가동 범위가 다르다** — 결속건이 회전하며 간섭 방향이
+    바뀐다. 이 표가 없으면 검출 지점으로 보낼 때 프레임을 친다.
+
+    `margin_mm` 을 양쪽에서 깎아 돌려준다. `any` 는 네 자세의 **교집합**이고,
+    자세를 못 가릴 때(자세 사이) 쓰는 보수적 범위다 — 어느 자세에서든 안전하다.
+    """
+    try:
+        env = (_stage().get('envelope') or {})
+        poses = env.get('poses') or {}
+        if not poses:
+            return None
+        m = float(env.get('margin_mm', 0.0))
+        out = {}
+        for n, axes in poses.items():
+            out[int(n)] = {a: (float(v[0]) + m, float(v[1]) - m)
+                           for a, v in axes.items()}
+        any_ = {}
+        for a in set().union(*(set(v) for v in out.values())):
+            lo = max(v[a][0] for v in out.values() if a in v)
+            hi = min(v[a][1] for v in out.values() if a in v)
+            any_[a] = (lo, hi)
+        return {'poses': out, 'any': any_, 'margin': m}
+    except Exception:
+        return None
+
+
+def envelope_violation(env, pose, want):
+    """목표가 가동 범위를 벗어나는가. 벗어나면 사유 문자열, 괜찮으면 None.
+
+    `pose` 가 None(자세 판별 실패)이면 **교집합**으로 본다 — 모르면 좁게 잡는다.
+    """
+    if not env:
+        return None
+    lim = env['poses'].get(pose) if pose is not None else env['any']
+    if lim is None:
+        lim = env['any']
+    where = f"{pose}번 자세" if pose is not None else "자세 미확인 → 교집합"
+    for a, v in want.items():
+        rng = lim.get(a)
+        if rng is None:
+            continue
+        if not (rng[0] <= v <= rng[1]):
+            return (f"{a}={v:.1f}mm 가 가동 범위 밖 ({where}: "
+                    f"{rng[0]:.1f}~{rng[1]:.1f}mm, 여유 {env['margin']:.0f}mm 포함)")
+    return None
+
+
+def load_pose_select():
+    """결속 자세 선택 규칙. 없으면 None.
+
+    {'x_mid','y_mid','dead','quadrant'} — quadrant 는 ('x_max'|'x_min',
+    'y_max'|'y_min') → 자세번호.
+    """
+    try:
+        cfg = (_stage().get('pose_select') or {})
+        q = cfg.get('quadrant') or {}
+        if not q or cfg.get('x_mid_mm') is None or cfg.get('y_mid_mm') is None:
+            return None
+        quad = {}
+        for k, v in q.items():
+            xs, ys = k.split('_y_')
+            quad[(xs, 'y_' + ys)] = int(v)
+        return {'x_mid': float(cfg['x_mid_mm']), 'y_mid': float(cfg['y_mid_mm']),
+                'dead': float(cfg.get('deadband_mm', 0.0)), 'quadrant': quad}
+    except Exception:
+        return None
+
+
+def select_pose(sel, x_mm, y_mm, current=None):
+    """결속 지점 (x,y)mm → (자세번호, 사유). 바꿀 필요가 없으면 자세 = current.
+
+    사분면으로 고른다 — X 가 중앙보다 xmax 쪽이면 1·4번, xmin 쪽이면 2·3번,
+    Y 가 ymin 쪽이면 1·2번, ymax 쪽이면 3·4번. 둘을 겹치면 하나로 떨어진다.
+
+    **중앙 ±deadband 안은 "절반지점"** 으로 보고 자세를 바꾸지 않는다 (사용자 지정:
+    "정확히 절반지점에서는 그냥 당시 자세로"). 한 축만 절반이면 그 축만 현재
+    자세를 따르고 나머지 축으로는 못 고르므로 역시 current 를 쓴다.
+    """
+    if not sel:
+        return current, "선택 규칙이 없다 (axes.yaml 의 stage.pose_select)"
+    if x_mm is None or y_mm is None:
+        return current, "목표 X·Y 가 둘 다 있어야 자세를 고를 수 있다"
+
+    def side(v, mid, lo, hi):
+        if abs(v - mid) <= sel['dead']:
+            return None
+        return hi if v > mid else lo
+
+    xs = side(x_mm, sel['x_mid'], 'x_min', 'x_max')
+    ys = side(y_mm, sel['y_mid'], 'y_min', 'y_max')
+    if xs is None or ys is None:
+        half = ' · '.join(n for n, v in (('X', xs), ('Y', ys)) if v is None)
+        return current, (f"{half} 가 절반지점(±{sel['dead']:.0f}mm) — "
+                         f"현재 자세 유지")
+    want = sel['quadrant'].get((xs, ys))
+    if want is None:
+        return current, f"사분면 {xs}/{ys} 에 배정된 자세가 없다"
+    return want, (f"X {x_mm:.1f}mm {'>' if xs == 'x_max' else '<'} "
+                  f"{sel['x_mid']:.1f} · Y {y_mm:.1f}mm "
+                  f"{'>' if ys == 'y_max' else '<'} {sel['y_mid']:.1f} "
+                  f"→ {pose_label(want)}")
+
+
 def load_stage_axes(names=('x', 'y', 'z')):
     """스테이지 이동에 필요한 축 정보 (관절 번호·모터·mm 환산·브레이크)."""
     stage = _stage()

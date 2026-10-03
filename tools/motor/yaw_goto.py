@@ -35,9 +35,21 @@ IFACE, YAW = 'can2', 0x148
 CPR, GEAR = 262144, 12.5
 CPD = CPR / 360.0
 CPG = CPD * GEAR
-NOON = 4055
-POSE = {1: -16.74, 2: -5.46, 3: 6.81, 4: 18.80}
-GUN_MIN, GUN_MAX = -18.5, 20.5          # 자세 범위 + 약간의 여유
+# ⚠ **자세표와 12시 기준은 axes.yaml 이 단일 소스다.** 여기에 베껴 두면 설정을
+# 바꿀 때 어긋난다 — 2026-10-03 에 3번 자세를 +6.81 → +4.00° 로 재조정했는데 이
+# 도구가 옛 값을 들고 있어 yaw 를 2.82° 지나친 곳으로 보냈다.
+def _cfg():
+    from rmd_robot_control.axis_config import load_pose_id
+    info = load_pose_id('yaw')
+    if not info:
+        raise SystemExit("axes.yaml 에서 yaw 자세 정보를 못 읽었다")
+    poses = {n: p['gun'] for n, p in info['poses'].items() if n != 0}
+    return info['noon'], poses
+
+
+NOON, POSE = _cfg()
+# 자세 범위 + 약간의 여유 (범위 자체도 자세표에서 끌어온다)
+GUN_MIN, GUN_MAX = min(POSE.values()) - 2.0, max(POSE.values()) + 2.0
 
 s = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
 s.bind((IFACE,))
