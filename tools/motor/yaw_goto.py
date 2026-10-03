@@ -108,6 +108,17 @@ def gun_once(sg):
     그래서 **이동 중에는 다시 부르지 않는다.** 시작 시 한 번 절대각을 잡고,
     이후는 0x92(전원 세션 내 연속값)로 추적한다 — 접히지 않으므로 진동이 불가능하다.
     """
+    # 1순위: 호밍과 **같은 논리**로 가린다 — 자세값과 ±tol 안에서 맞추므로
+    # 자세에 세워져 있으면 유일하다. 범위 창(39°)은 모터 1회전(28.8°)보다 넓어
+    # 후보가 둘 들어오므로 그것만으로는 못 가린다.
+    try:
+        from rmd_robot_control.axis_config import load_pose_id, identify_pose
+        n, det = identify_pose(load_pose_id('yaw'), sg)
+        if n is not None:
+            return float(det['gun']) + float(det['err_gun']), None
+    except Exception:
+        pass
+    # 2순위: 자세 사이에 있는 경우. 범위 창으로 후보가 하나면 그것을 쓴다.
     g = wrap(sg - NOON) / CPG
     cand = [g - 28.8, g, g + 28.8]
     inside = [x for x in cand if GUN_MIN <= x <= GUN_MAX]
@@ -115,8 +126,8 @@ def gun_once(sg):
         return inside[0], None
     if not inside:
         return None, f"어느 후보도 자세 범위에 안 든다: {[round(x,2) for x in cand]}"
-    return None, (f"후보가 여럿이라 가릴 수 없다: {[round(x,2) for x in inside]} — "
-                  f"자세에 손으로 맞춘 뒤 다시 하세요")
+    return None, (f"자세 사이에 있고 후보가 여럿이다: {[round(x,2) for x in inside]} — "
+                  f"자세에 맞추거나 --from-gun 으로 지정하세요")
 
 
 def goto(deg, spd):
