@@ -671,8 +671,10 @@ class StageNode(Node):
         # ⚠ 강제(`envelope_violation`)와 **같은 함수**로 구한다. 따로 계산했다가
         # 12시에서 표시만 빈 값이 나왔다 (2026-10-03)
         r, lim_why = envelope_for(self.env, pose)
-        lim = ({k: [round(v[0], 1), round(v[1], 1)] for k, v in r.items()}
-               if r else None)
+        # inf 는 JSON 으로 못 내보낸다(표준이 아니다) → 제약 없음은 null 로
+        lim = ({k: [None if v[0] == float('-inf') else round(v[0], 1),
+                    None if v[1] == float('inf') else round(v[1], 1)]
+                for k, v in r.items()} if r else None)
         self.status_pub.publish(String(data=json.dumps({
             'moving': self.moving or self.yaw_moving,
             'yaw_moving': self.yaw_moving,

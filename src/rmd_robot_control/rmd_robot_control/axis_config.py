@@ -476,13 +476,28 @@ def load_envelope():
         if not poses:
             return None
         m = float(env.get('margin_mm', 0.0))
+        # ⚠ **여유는 간섭 경계에만 적용한다.** 기계 끝단(원점·스트로크 끝)은
+        #   리미트 스위치가 지키는 하드 스톱이지 실측한 간섭선이 아니다. 거기서
+        #   10mm 를 깎으면 안전에 기여하지 않고 정상 동작만 막는다 —
+        #   2026-10-03 에 호밍 직후 X=-3mm(원점)에서 자세 변경이 거부됐다.
+        #   끝단 쪽은 **제약 없음(±inf)** 으로 둔다.
+        stage = _stage()
+        stroke = {a: (stage.get(a) or {}).get('stroke_mm') for a in ('x', 'y', 'z')}
+        INF = float('inf')
+
+        def bound(a, lo, hi):
+            lo2 = -INF if lo <= 0.0 else lo + m
+            st = stroke.get(a)
+            hi2 = INF if (st and hi >= float(st) - 0.5) else hi - m
+            return (lo2, hi2)
+
         out = {}
         for n, axes in poses.items():
-            out[int(n)] = {a: (float(v[0]) + m, float(v[1]) - m)
+            out[int(n)] = {a: bound(a, float(v[0]), float(v[1]))
                            for a, v in axes.items()}
         samples = []
         for sm in (env.get('samples') or []):
-            rng = {a: (float(v[0]) + m, float(v[1]) - m)
+            rng = {a: bound(a, float(v[0]), float(v[1]))
                    for a, v in sm.items() if a in ('x', 'y')}
             if rng:
                 samples.append({'gun': float(sm['gun']), 'range': rng,

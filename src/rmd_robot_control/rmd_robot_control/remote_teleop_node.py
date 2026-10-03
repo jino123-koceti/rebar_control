@@ -23,11 +23,13 @@
   S18   횡이동 −1스텝 (우측 50mm)   → /lateral/step
   S13   누르고 있는 동안 Z축 상승   → /joint_5/speed (0x147)
   S14   누르고 있는 동안 Z축 하강   → /joint_5/speed (0x147)
+  S23   토글할 때마다 yaw 자세 **한 단계 위로** (1→2→3→4)  → /stage/yaw_pose
+  S24   토글할 때마다 yaw 자세 **한 단계 아래로** (4→3→2→1) → /stage/yaw_pose
 
   비상정지 → 전 축 정지. `remote_bridge` 가 판정해서 넘겨준다.
   송신기 꺼짐·START 전(DATA[0]=0x00)도 비상정지로 들어온다.
 
-  미구현: S21/S22(작업 시퀀스), S23/S24(자율주행 시작·정지 — L4 가 받는다)
+  미구현: S21/S22(작업 시퀀스)
 ──────────────────────────────────────────────────────────────────────────
 
 Z축 주의: 리프팅축이라 브레이크를 풀면 자중으로 내려앉을 수 있다. 브레이크 해제는
@@ -55,6 +57,24 @@ X·Y 는 `home_dir` 가 +1 이라 **양수 dps 가 원점(x_min/y_min) 방향**�
 
 Z 는 아직 이 차단에 넣지 않았다 — `blocked_axes` 에 `z±` 도 들어오므로 같은 방식으로
 한 줄이면 되지만, 요청 범위가 X·Y 였다. [미적용]
+
+## yaw 자세 변경 (S23 / S24)
+
+`/stage/yaw_pose` 로 **자세 번호**를 낸다. 회전 자체와 안전(전환 안전창·브레이크·
+도달 확인)은 `stage_node` 가 맡는다 — 이 노드는 "다음 자세가 몇 번인가" 만 정한다.
+
+**현재 자세를 스스로 세지 않는다.** `/stage/status` 의 `gun_deg`(멀티턴 기준점에서
+나온 실측 건 각도)를 보고 그보다 큰/작은 **가장 가까운 자세**로 간다. 그래서
+
+  · 12시에서도 동작한다 (S23 → 3번, S24 → 2번)
+  · 자세 **사이**에 있어도 동작한다 (건 +10.8° → S23 는 4번, S24 는 3번)
+  · 양 끝에서는 **그대로 유지**한다 (4번에서 S23, 1번에서 S24 는 아무것도 안 한다)
+
+⚠ 건 각도를 모르면(멀티턴 기준점 없음) **아무것도 하지 않고 알린다.** 자세를
+추측해 돌리면 20~28° 를 지나쳐 밀 수 있다 (yaw 는 끝 리미트가 없다).
+
+회전 중에는 `stage_node` 가 중재기에서 `auto` 를 쥐므로 이 노드는 조용해진다 —
+스틱 입력이 회전과 겹치지 않는다. 끝나면 권한이 돌아온다.
 """
 
 import json
@@ -66,7 +86,7 @@ from geometry_msgs.msg import Twist
 from std_msgs.msg import Float32, Int32, String
 from rebar_base_interfaces.msg import RemoteControl, SafetyState
 
-from .axis_config import load_stage_axes
+from .axis_config import load_pose_id, load_stage_axes, pose_label
 
 # RemoteControl.buttons 순서 — remote_bridge 와 같아야 한다
 BUTTON_ORDER = ('S13', 'S14', 'S17', 'S18', 'S21', 'S22', 'S23', 'S24')
@@ -120,6 +140,12 @@ class RemoteTeleop(Node):
         self.blocked = None           # None = 한 번도 못 받았다 (막지 않는다)
         self.create_subscription(SafetyState, '/safety/state', self._on_safety, 1)
         self._limit_noted = set()
+        # yaw 자세 변경 (S23/S24) — 회전은 stage_node 가 한다
+        self.pose_id = load_pose_id('yaw')
+        self.yaw_pose_pub = self.create_publisher(Int32, '/stage/yaw_pose', 10)
+        self.stage = None
+        self.create_subscription(String, '/stage/status', self._on_stage, 10)
+        self._pose_noted = set()
 
         self.remote = None
         self.last_remote = 0.0
@@ -173,6 +199,41 @@ class RemoteTeleop(Node):
         else:
             self._released = False
             self._note("제어 권한 회복 — 리모콘 조작 가능")
+
+    def _on_stage(self, msg):
+        try:
+            self.stage = json.loads(msg.data)
+        except ValueError:
+            pass
+
+    def _step_pose(self, up):
+        """건 각도 기준으로 한 단계 위/아래 자세로 보낸다. 양 끝이면 유지."""
+        g = (self.stage or {}).get('gun_deg')
+        if self.pose_id is None or g is None:
+            if 'nogun' not in self._pose_noted:
+                self._pose_noted.add('nogun')
+                self.get_logger().warning(
+                    "yaw 건 각도를 모른다 — 자세 변경을 하지 않는다. 호밍하거나 "
+                    "/stage/yaw_declare 로 지금 자세를 알려주세요 "
+                    "(추측해 돌리면 끝단으로 밀 수 있다)")
+            return
+        self._pose_noted.discard('nogun')
+        # 1~4번만 쓴다. 12시는 결속 자세가 아니라 건너뛸 대상이 아니라 **기준점**이다
+        poses = sorted(((n, p['gun']) for n, p in self.pose_id['poses'].items()
+                        if n != 0), key=lambda kv: kv[1])
+        eps = 0.5                      # 자세에 서 있을 때 그 자세로 다시 가지 않도록
+        cand = [n for n, gg in poses if gg > g + eps] if up else \
+               [n for n, gg in reversed(poses) if gg < g - eps]
+        if not cand:
+            end = poses[-1][0] if up else poses[0][0]
+            self.get_logger().info(
+                f"{pose_label(end)} 가 끝이다 — 자세 유지 (건 {g:+.2f}°)")
+            return
+        want = cand[0]
+        self.yaw_pose_pub.publish(Int32(data=int(want)))
+        self.get_logger().info(
+            f"yaw 자세 변경 요청 — 건 {g:+.2f}° → {pose_label(want)} "
+            f"({'S23 위로' if up else 'S24 아래로'})")
 
     def _on_lat_done(self, msg):
         self.lat_busy = False
@@ -297,9 +358,13 @@ class RemoteTeleop(Node):
                     self.lat_pub.publish(Int32(data=turns))
                     self.get_logger().info(f"횡이동 {label} 50mm ({name})")
 
+        # yaw 자세 변경 — 누른 순간에만 (토글 에지)
+        for name, up in (('S23', True), ('S24', False)):
+            if btn[name] and not self.prev[name]:
+                self._step_pose(up)
+
         # 미구현 토글은 한 번만 알린다
-        for name, why in (('S21', '작업 시퀀스 미구현'), ('S22', '작업 시퀀스 미구현'),
-                          ('S23', '자율주행 시작은 L4 담당'), ('S24', '자율주행 정지는 L4 담당')):
+        for name, why in (('S21', '작업 시퀀스 미구현'), ('S22', '작업 시퀀스 미구현')):
             if btn[name] and name not in self._warned:
                 self._warned.add(name)
                 self.get_logger().warning(f"{name}: {why}")
