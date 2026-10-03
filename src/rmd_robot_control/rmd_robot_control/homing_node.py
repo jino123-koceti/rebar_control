@@ -538,20 +538,22 @@ class HomingNode(Node):
 
         at_home = bool(self.limit[cfg['home_limit']])
 
-        # ── 탐색 거리 상한 ──────────────────────────────────────────────────
-        # yaw 는 리미트가 하나뿐이고 에지가 자세 범위 **안쪽**에 있다. 방향을 틀리면
-        # 에지를 못 만나고 기계 끝단으로 달린다. 어느 자세에서든 에지까지 최대
-        # 건 23.42° 이므로, 상한을 넘겼으면 방향이 틀렸거나 기구 이상이다.
-        # ⚠ **방향을 뒤집지 않는다** — 역방향 재탐색은 이미 박은 뒤의 동작이다
-        #   (2026-09-30 에 그렇게 10.7A/86°C 까지 갔다).
+        # ── 탐색 상한 ───────────────────────────────────────────────────────
+        # yaw 는 리미트가 하나뿐이고 에지가 자세 범위 **안쪽**이라, 방향을 틀리면
+        # 에지를 못 만나고 기계 끝단으로 달린다. ⚠ **방향을 뒤집지 않는다** —
+        # 역방향 재탐색은 이미 박은 뒤의 동작이다 (9/30 에 10.7A/86°C 까지 갔다).
+        # **거리가 아니라 시간으로 잰다**: 위치 토픽은 is_moving 인 모터만 갱신되므로
+        # 첫 값이 묵으면 거리가 엉뚱해진다 — 움직이지도 않은 yaw 가 "415° 를 갔다" 며
+        # 2초 만에 헛실패했다 (2026-10-03). 시간은 그 실패 모드가 없다.
         if (self.phase is Phase.SEEK and self.search_limit
                 and self.axis == 'yaw' and not at_home):
-            p0, p = self._phase_pos0, self.pos.get(self.axis)
-            if p0 is not None and p is not None and abs(p - p0) > self.search_limit:
+            budget = self.search_limit / max(self._seek_of(self.axis), 1.0) * 2.0
+            if elapsed > budget:
                 self._stop_axis(self.axis)
-                self._fail(f"{self.axis}: {abs(p - p0):.0f}° 를 갔는데 "
+                self._fail(f"{self.axis}: {elapsed:.1f}초 탐색했는데 "
                            f"{cfg['home_limit']} 가 켜지지 않았다 "
-                           f"(상한 {self.search_limit:.0f}°) — 탐색 방향이나 기구를 확인하세요")
+                           f"(상한 {budget:.1f}초 = 모터축 {self.search_limit:.0f}° 분) "
+                           f"— 탐색 방향이나 기구를 확인하세요")
                 return
 
         # ── 스톨 감지 ────────────────────────────────────────────────────────
