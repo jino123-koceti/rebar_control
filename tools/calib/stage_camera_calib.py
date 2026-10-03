@@ -8,9 +8,23 @@
 
     stage_mm = A · P_cam + b        A 는 3x3, b 는 3  → 미지수 12개 (자세당)
 
+⚠ **장비(하부체·횡이동)를 옮겨도 이 변환은 유효하다.** 카메라와 스테이지가 둘 다
+상부체에 달려 있어 서로의 관계가 변하지 않기 때문이다 — 장비가 움직이면 교차점의
+카메라 좌표와 보낼 스테이지 위치가 **함께** 바뀐다. 그래서 여러 위치에서 모은
+짝을 섞어 써도 된다 (오히려 카메라 좌표가 넓게 퍼져 변환이 단단해진다).
+
+⚠ 다만 **고정해 둔(frozen) 좌표는 장비가 움직이면 무효다.** 같은 교차점이 다른
+카메라 좌표로 보이므로 `s` 로 다시 고정해야 한다. `r` 이 기록 전에 그 좌표에
+지금도 점이 있는지 확인해 막는다.
+
+[오판 기록] 2026-10-03 에 스냅샷 두 장의 카메라 x 가 -101mm 움직이고 같은 기간
+스테이지 Y 가 +95mm 움직인 것을 보고 "카메라가 캐리지에 달려 있다" 고 결론 냈다.
+**우연의 일치였다** — 카메라 x 이동은 횡이동 1회 때문이었고 Y 이동은 그 사이
+리모콘 조작이었다. 인과를 확인하지 않고 비율만 보고 판단한 것이 잘못이었다.
+확인하려면 **한 축만** 움직이고 나머지는 고정한 채 비교해야 한다.
+
 ⚠⚠ **자세마다 따로 뜬다.** 건이 yaw 축에 달려 있어 자세를 바꾸면 건 끝이 X·Y 로
-움직인다. 자세 범위가 건 33.4° 이므로 건 끝이 축에서 100mm 떨어져 있으면 자세에
-따라 약 58mm 차이가 난다 — 하나로 뭉치면 그만큼 틀린다.
+움직인다. 실측 오프셋이 100~130mm 다 — 하나로 뭉치면 그만큼 틀린다.
 
 ⚠ 이것은 **좌표계 변환이 아니다.** 같은 세상의 점이라도 자세가 다르면 보낼
 스테이지 위치가 다르다. 그래서 결과를 "stage 좌표" 라 부르지 않고 **"그 자세에서
@@ -86,7 +100,8 @@ class Calib(Node):
                                  self._on_color, qos_profile_sensor_data)
         self.trig = self.create_publisher(Empty, '/rebar/detect', 10)
         self.frozen = []          # 고정한 검출점 [(x,y,z,conf), ...]
-        self.pairs = {}           # 자세 → [(P_cam(3), stage_mm(3)), ...]
+        self.pairs = {}           # 자세 → [{cam, stage, snap, gun, idx, t}, ...]
+        self.snap_stage = None    # 마지막 스냅샷 당시 스테이지 mm
         self._load_state()
 
     # ---- 중간 상태 ---------------------------------------------------------
@@ -110,6 +125,7 @@ class Calib(Node):
                 out[int(k)] = rows
             self.pairs = out
             self.frozen = [tuple(f) for f in (d.get('frozen') or [])]
+            self.snap_stage = d.get('snap_stage')
         except Exception:
             pass
 
@@ -137,6 +153,7 @@ class Calib(Node):
         os.makedirs(os.path.dirname(STATE), exist_ok=True)
         json.dump({'pairs': {str(k): v for k, v in self.pairs.items()},
                    'frozen': [list(f) for f in self.frozen],
+                   'snap_stage': self.snap_stage,
                    'saved': time.strftime('%Y-%m-%d %H:%M:%S')},
                   open(STATE, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
 
@@ -153,7 +170,12 @@ class Calib(Node):
         self.color = msg
 
     def rows(self, p):
-        """(cam, stage) 짝만 뽑는다 — 수식 쪽이 형식을 몰라도 되게."""
+        """(cam, stage) 짝. **절대 위치**로 푼다 — 카메라와 스테이지가 둘 다
+        상부체에 있어 장비가 움직여도 둘 사이 관계가 변하지 않는다.
+
+        `snap`(검출 당시 스테이지 위치)은 수식에 쓰지 않고 기록만 한다 — 나중에
+        "이 짝이 어느 상황에서 나왔나" 를 되짚을 때 필요하다.
+        """
         return [(q['cam'], q['stage']) for q in self.pairs.get(p, [])]
 
     def spin(self, sec):
@@ -194,6 +216,12 @@ class Calib(Node):
             return
         self.frozen = [(d.x, d.y, d.z, d.confidence, d.pixel_u, d.pixel_v)
                        for d in self.grid.detections]
+        # 카메라가 캐리지에 달려 있다 — 이 좌표들이 어느 위치에서 본 것인지
+        # 남겨야 나중에 다른 위치의 스냅샷과 섞어 쓸 수 있다
+        self.snap_stage = self.mm()
+        print(f"  검출 당시 스테이지 " + (f"X {self.snap_stage[0]:.1f} "
+              f"Y {self.snap_stage[1]:.1f} Z {self.snap_stage[2]:.1f} mm"
+              if self.snap_stage else "— mm 없음 ⚠ 이 스냅샷은 쓸 수 없다"))
         print(f"  검출 {len(self.frozen)}개  ({self.grid.error_message})")
         if not self.frozen:
             print("  깊이가 확보된 검출이 없습니다. 시야·조명을 확인하세요.")
@@ -241,10 +269,44 @@ class Calib(Node):
         except Exception as e:
             print(f"  (그림 저장 실패: {e})")
 
-    def record(self, idx):
+    def _still_there(self, idx, tol=8.0):
+        """고정한 좌표에 **지금도** 교차점이 있는가. (있다, 설명).
+
+        ⚠⚠ 짝은 **고정한 순간의 카메라 좌표**를 쓰는데 건 끝을 맞추는 것은 그
+        **뒤**다. 그 사이에 배근이나 장비가 움직이면 "고정된 좌표" 와 "실제로
+        맞춘 위치" 가 다른 점이 되어 **조용히 오염된다.** 잔차만 보고는 어느
+        짝이 문제인지 알 수 없다 (2026-10-03 에 이전 스냅샷 점들만 4~4.7mm 튀었다).
+
+        그래서 기록 직전에 새로 검출해 그 좌표 근처에 점이 있는지 본다.
+        """
+        want = np.array(self.frozen[idx][:3], dtype=float)
+        self.grid = None
+        self.trig.publish(Empty())
+        t = time.time() + 5.0
+        while rclpy.ok() and self.grid is None and time.time() < t:
+            rclpy.spin_once(self, timeout_sec=0.05)
+        if self.grid is None:
+            return False, "새 검출을 못 받았습니다 — 확인할 수 없습니다"
+        if not self.grid.detections:
+            return False, "지금 검출이 0개입니다"
+        d = min(np.linalg.norm(np.array([q.x, q.y, q.z]) - want)
+                for q in self.grid.detections)
+        if d > tol:
+            return False, (f"그 좌표에 지금 교차점이 없습니다 — 가장 가까운 점이 "
+                           f"{d:.1f}mm 떨어져 있습니다 (허용 {tol:.0f}mm). "
+                           f"배근이나 장비가 움직였다면 `s` 로 다시 고정하세요")
+        return True, f"확인 (가장 가까운 점 {d:.1f}mm)"
+
+    def record(self, idx, check=True):
         if not (0 <= idx < len(self.frozen)):
             print(f"  번호가 범위를 벗어났습니다 (0~{len(self.frozen) - 1})")
             return
+        if check:
+            ok, why = self._still_there(idx)
+            print(f"  고정 좌표 재확인: {why}")
+            if not ok:
+                print("  → **기록하지 않았습니다.** 강행하려면 `r! <n>`")
+                return
         self.spin(0.8)
         p, m = self.pose(), self.mm()
         if p is None:
@@ -255,9 +317,12 @@ class Calib(Node):
             print("  스테이지 mm 를 못 받습니다 — 기록하지 않습니다 (호밍 필요)")
             return
         x, y, z = self.frozen[idx][:3]
+        if self.snap_stage is None:
+            print("  검출 당시 스테이지 위치를 모릅니다 — `s` 로 다시 고정하세요")
+            return
         self.pairs.setdefault(p, []).append(
-            {'cam': [x, y, z], 'stage': m, 'idx': idx,
-             'gun': (self.stage or {}).get('gun_deg'),
+            {'cam': [x, y, z], 'stage': m, 'snap': list(self.snap_stage),
+             'idx': idx, 'gun': (self.stage or {}).get('gun_deg'),
              't': time.strftime('%Y-%m-%d %H:%M:%S')})
         self._save_state()
         print(f"  {p}번 자세 짝 {len(self.pairs[p])} 기록 — "
@@ -279,7 +344,7 @@ class Calib(Node):
             return
         for p in sorted(self.pairs):
             rows = self.pairs[p]
-            zs = [q['cam'][2] for q in rows]
+            zs = [c[2] for c, _ in rows]
             print(f"  {p}번 자세: {len(rows)}개"
                   + (f"  (카메라 z {min(zs):.0f}~{max(zs):.0f}mm)" if rows else ''))
             for i, (c, m) in enumerate(self.rows(p)):
@@ -309,7 +374,7 @@ class Calib(Node):
         크게 나오면 정렬이 자세마다 어긋났다는 뜻이다 (실측 -0.9 / -3.0mm).
         """
         poses = sorted(self.pairs)
-        n = sum(len(v) for v in self.pairs.values())
+        n = sum(len(self.rows(p)) for p in self.pairs)
         if not poses or n < 1:
             return None
         base, extra = poses[0], poses[1:]
@@ -344,8 +409,8 @@ class Calib(Node):
         """(A 3x3, b 3, rms, worst) 또는 None."""
         if len(rows) < 4:
             return None
-        P = np.array([q['cam'] for q in rows], dtype=float)        # (n,3)
-        S = np.array([q['stage'] for q in rows], dtype=float)        # (n,3)
+        P = np.array([c for c, _ in rows], dtype=float)        # (n,3)
+        S = np.array([d for _, d in rows], dtype=float)        # (n,3)
         M = np.hstack([P, np.ones((len(rows), 1))])            # (n,4)
         sol, *_ = np.linalg.lstsq(M, S, rcond=None)            # (4,3)
         A, b = sol[:3, :].T, sol[3, :]
@@ -395,7 +460,7 @@ class Calib(Node):
         done = {}
         print()
         for p in sorted(self.pairs):
-            rows = self.pairs[p]
+            rows = self.rows(p)
             r = self.fit_one(rows)
             if r is None:
                 print(f"■ {p}번 자세 — 짝 {len(rows)}개뿐 (미지수 12개, 최소 4점)")
@@ -404,7 +469,7 @@ class Calib(Node):
             done[p] = (A, b, rms, worst, len(rows))
             print(f"■ {p}번 자세 — 짝 {len(rows)}개   잔차 RMS {rms:.2f}mm  "
                   f"최대 {worst:.2f}mm")
-            zs = [q['cam'][2] for q in rows]
+            zs = [c[2] for c, _ in rows]
             if max(zs) - min(zs) < 30.0:
                 print(f"   ⚠ 카메라 z 범위가 {max(zs)-min(zs):.0f}mm 뿐입니다 — "
                       "A 의 z 열이 결정되지 않아 깊이가 다른 점에서 틀립니다")
@@ -472,25 +537,30 @@ class Calib(Node):
                     f.write(f"      stage: {json.dumps([round(v, 2) for v in m])}\n")
         print(f"\n  저장: {out_path}")
 
-    def predict(self, idx):
-        p = self.pose()
-        rows = self.pairs.get(p) or []
-        r = self.fit_one(rows)
-        if r is None:
-            print(f"  {p}번 자세 짝이 모자랍니다 (최소 4점)")
+    def predict(self, idx, pose=None):
+        """고정한 점을 **기준 모델(공통)** 으로 예측한다. 독립 모델은 자세당 4점이
+        필요하고 그때도 과적합이라 검증용일 뿐이다."""
+        sh = self.fit_shared()
+        if sh is None:
+            print("  아직 변환을 못 풉니다 (짝이 모자라거나 배치가 겹칩니다)")
+            return
+        p = self.pose() if pose is None else pose
+        if p not in sh['off']:
+            print(f"  {p}번 자세 오프셋이 없습니다 — 그 자세 짝이 1점은 있어야 합니다")
             return
         if not (0 <= idx < len(self.frozen)):
             print(f"  번호가 범위를 벗어났습니다 (0~{len(self.frozen) - 1})")
             return
-        A, b, rms, _ = r
         x, y, z = self.frozen[idx][:3]
-        q = A @ np.array([x, y, z]) + b
+        q = sh['A'] @ np.array([x, y, z]) + sh['b'] + sh['off'][p]
+        print(f"  [{idx}] {p}번 자세에서 보낼 위치  "
+              f"X {q[0]:.1f}  Y {q[1]:.1f}  Z {q[2]:.1f} mm   "
+              f"(잔차 RMS {sh['rms']:.2f}mm)")
         m = self.mm()
-        print(f"  [{idx}] 예측 보낼 위치  X {q[0]:.1f}  Y {q[1]:.1f}  Z {q[2]:.1f} mm"
-              f"   (자세 {p}, 잔차 RMS {rms:.2f}mm)")
         if m:
             d = q - np.array(m)
             print(f"       지금 위치와 차이  X {d[0]:+.1f}  Y {d[1]:+.1f}  Z {d[2]:+.1f} mm")
+        return q
 
 
 def run_one(n, cmd):
@@ -499,6 +569,8 @@ def run_one(n, cmd):
         n.snapshot()
     elif c == 'r' and len(cmd) > 1:
         n.record(int(cmd[1]))
+    elif c == 'r!' and len(cmd) > 1:
+        n.record(int(cmd[1]), check=False)       # 재확인 건너뛰기
     elif c == 'p' and len(cmd) > 1:
         n.predict(int(cmd[1]))
     elif c == 'l':
@@ -510,7 +582,7 @@ def run_one(n, cmd):
     elif c == '':
         n.show()
     else:
-        print("  s / r <n> / p <n> / l / u / f / q")
+        print("  s / r <n> / r! <n> / p <n> / l / u / f / q")
         return False
     return True
 
@@ -520,12 +592,17 @@ def main():
     ap = argparse.ArgumentParser()
     # 한 명령만 돌리고 끝낸다. 짝은 STATE 파일에 남아 다음 호출로 이어진다 —
     # 사람이 리모콘으로 맞추는 동안 터미널을 붙잡고 있을 필요가 없다
-    ap.add_argument('--cmd', help='비대화 모드: "s" | "r 3" | "l" | "u" | "f" | "p 3"')
+    ap.add_argument('--cmd',
+                    help='비대화 모드: "s" | "r 3" | "r! 3"(재확인 생략) | '
+                         '"l" | "u" | "f" | "p 3"')
     a = ap.parse_args()
 
     rclpy.init()
     n = Calib()
-    n.spin(2.5)
+    # 상태가 올 때까지 기다린다 — 2.5초로는 모자라 "자세 미확인" 이 잘못 찍혔다
+    t0 = time.time()
+    while time.time() - t0 < 8.0 and (n.stage is None or n.mm() is None):
+        n.spin(0.2)
     if a.cmd is not None:
         n.show()
         run_one(n, a.cmd.strip().split())
