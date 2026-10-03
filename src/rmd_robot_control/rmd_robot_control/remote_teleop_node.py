@@ -12,6 +12,7 @@
   AN4   하부체 좌우회전    AN4+ = CCW,  AN4− = CW     → /cmd_vel angular.z
   AN1   상부체 X축 속도                              → /joint_3/speed (0x145)
   AN2   상부체 Y축 속도                              → /joint_4/speed (0x146)
+        ⚠ X·Y 는 **리미트에 닿은 방향으로 안 나간다** (아래 "리미트 차단" 참고)
 
   AN3/AN4 의 부호가 뒤집힌 것은 좌우 주행모터가 180도 반대로 설치되어서다
   (2차년도와 동일 — 3차년도도 같은 것으로 확인).
@@ -31,6 +32,29 @@
 
 Z축 주의: 리프팅축이라 브레이크를 풀면 자중으로 내려앉을 수 있다. 브레이크 해제는
 이 노드가 하지 않는다 (axes.yaml 의 never_auto_release).
+
+## 리미트 차단 (X·Y)
+
+리모콘 조작은 `stage_node` 를 경유하지 않으므로 자세별 가동범위 검사를 못 받는다.
+최소한 **리미트 센서에 닿은 방향으로는 더 안 나가게** 한다.
+
+센서를 직접 읽지 않는다 — `safety_node` 가 이미 리미트를 축 방향으로 환산해
+`/safety/state` 의 `blocked_axes` 에 담아 발행한다(`x_min` → `'x-'`). 같은 판정을
+여기서 또 만들면 두 곳이 어긋난다.
+
+⚠ **부호 규약이 둘이라 섞이기 쉽다.** `blocked_axes` 는 **mm 증감** 기준이고
+(`'x+'` = mm 증가 = 원점에서 멀어짐), `/joint_N/speed` 는 **모터 dps** 다.
+`axes.yaml` 의 `home_dir` 가 "어느 부호가 원점 방향인가" 를 주므로 그것으로 환산한다:
+
+    mm 방향 = −sign(dps) × home_dir
+
+X·Y 는 `home_dir` 가 +1 이라 **양수 dps 가 원점(x_min/y_min) 방향**이다.
+
+리미트 토픽을 한 번도 못 받았으면(ezi_io 미기동) **막지 않고 한 번 경고**한다.
+조작 자체를 못 하게 만드는 쪽이 더 위험하다.
+
+Z 는 아직 이 차단에 넣지 않았다 — `blocked_axes` 에 `z±` 도 들어오므로 같은 방식으로
+한 줄이면 되지만, 요청 범위가 X·Y 였다. [미적용]
 """
 
 import json
@@ -40,7 +64,9 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Float32, Int32, String
-from rebar_base_interfaces.msg import RemoteControl
+from rebar_base_interfaces.msg import RemoteControl, SafetyState
+
+from .axis_config import load_stage_axes
 
 # RemoteControl.buttons 순서 — remote_bridge 와 같아야 한다
 BUTTON_ORDER = ('S13', 'S14', 'S17', 'S18', 'S21', 'S22', 'S23', 'S24')
@@ -53,7 +79,9 @@ class RemoteTeleop(Node):
         # position_control_node 의 상한과 맞춘다. 더 크게 줘도 노드가 잘라낸다.
         self.declare_parameter('max_linear_vel', 0.25)     # m/s
         self.declare_parameter('max_angular_vel', 0.5)     # rad/s
-        self.declare_parameter('xy_max_dps', 50.0)
+        # [2026-10-03] 50 → 100. 사용자 요청으로 2배. 상부 X·Y 는 리드스크류라
+        # 100dps 도 출력축으로는 X 29mm/s · Y 22mm/s 다 (mm_per_deg 0.2906/0.2227).
+        self.declare_parameter('xy_max_dps', 100.0)
         self.declare_parameter('z_dps', 50.0)
         self.declare_parameter('deadzone', 0.08)
         # /remote_control 을 받는 즉시 처리한다. 타이머는 **끊김 감시용**이다
@@ -87,6 +115,11 @@ class RemoteTeleop(Node):
         # ⚠ 권한을 잃으면 **정지를 한 번만** 보내고 그 뒤로는 조용히 있어야 한다.
         #   계속 0 을 보내는 것이 바로 그 문제의 원인이었다.
         self.create_subscription(String, '/control_mode', self._on_mode, 10)
+        # 리미트 차단 — safety_node 가 환산해 둔 것을 쓴다 (위 "리미트 차단" 참고)
+        self.ax = load_stage_axes(('x', 'y'))
+        self.blocked = None           # None = 한 번도 못 받았다 (막지 않는다)
+        self.create_subscription(SafetyState, '/safety/state', self._on_safety, 1)
+        self._limit_noted = set()
 
         self.remote = None
         self.last_remote = 0.0
@@ -145,6 +178,33 @@ class RemoteTeleop(Node):
         self.lat_busy = False
         self.lat_started = 0.0
         self.get_logger().info(f"횡이동 완료: {msg.data}")
+
+    def _on_safety(self, msg):
+        self.blocked = set(msg.blocked_axes)
+
+    def _limit_clamp(self, axis, dps):
+        """리미트에 닿은 방향이면 0 으로 깎는다. 부호 환산은 모듈 문서 참고."""
+        if not dps:
+            return dps
+        if self.blocked is None:
+            if 'no_safety' not in self._limit_noted:
+                self._limit_noted.add('no_safety')
+                self.get_logger().warning(
+                    "/safety/state 를 못 받고 있다 — X·Y 리미트 차단이 동작하지 않는다 "
+                    "(safety_node 확인). 조작은 그대로 통과시킨다")
+            return dps
+        d = int((self.ax.get(axis) or {}).get('home_dir', 1))
+        mm_dir = '+' if (-1 if dps > 0 else 1) * d > 0 else '-'
+        key = f'{axis}{mm_dir}'
+        if key in self.blocked:
+            if key not in self._limit_noted:
+                self._limit_noted.add(key)
+                self.get_logger().warning(
+                    f"{axis.upper()} {'원점' if mm_dir == '-' else '반대'} 쪽 리미트 — "
+                    f"그 방향 조작을 막는다 ({key})")
+            return 0.0
+        self._limit_noted.discard(key)
+        return dps
 
     def _pub_if_changed(self, pub, key, value, eps, refresh=0.1):
         """값이 바뀔 때만(또는 refresh 주기마다) 발행한다.
@@ -209,8 +269,10 @@ class RemoteTeleop(Node):
             self.cmd_pub.publish(t)
 
         # 상부 X/Y
-        self._pub_if_changed(self.x_pub, 'x', float(an1 * self.xy_max), 0.5)
-        self._pub_if_changed(self.y_pub, 'y', float(an2 * self.xy_max), 0.5)
+        xd = self._limit_clamp('x', float(an1 * self.xy_max))
+        yd = self._limit_clamp('y', float(an2 * self.xy_max))
+        self._pub_if_changed(self.x_pub, 'x', xd, 0.5)
+        self._pub_if_changed(self.y_pub, 'y', yd, 0.5)
 
         # Z축 — 누르고 있는 동안만. 둘 다 눌리면 정지
         z = 0.0 if btn['S13'] == btn['S14'] else (self.z_dps if btn['S13'] else -self.z_dps)
@@ -244,7 +306,8 @@ class RemoteTeleop(Node):
 
         self.prev = btn
         self._note(f"Remote  주행 {lin:+.2f}/{ang:+.2f}  "
-                   f"XY {an1*self.xy_max:+.0f}/{an2*self.xy_max:+.0f}  Z {z:+.0f}")
+                   f"XY {xd:+.0f}/{yd:+.0f}  Z {z:+.0f}"
+                   + (f"  차단 {','.join(sorted(self.blocked))}" if self.blocked else ''))
 
     def _stop(self, reason):
         # 정지는 변화 기반을 거치지 않고 항상 보낸다 — 늦거나 빠지면 안 된다
