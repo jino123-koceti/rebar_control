@@ -238,7 +238,8 @@ class StageNode(Node):
         prev, self._homing_state = self._homing_state, st
         if (st == 'done' and prev not in (None, 'done') and 'yaw' in refs
                 and self.ready_pose is not None and self.yaw_multi is not None):
-            self._anchor(self.ready_pose, '호밍 완료')
+            self._anchor(self.ready_pose, '호밍 완료',
+                         gun=self._measured_gun(self.ready_pose))
 
     def _on_safety(self, msg):
         self.safety = msg
@@ -250,14 +251,23 @@ class StageNode(Node):
             pass
 
     # ---- 자세 --------------------------------------------------------------
-    def _anchor(self, pose, why):
-        """그 자세에 서 있다고 **아는** 순간에 기준점을 잡는다."""
-        g = ((self.pose_id or {}).get('poses') or {}).get(pose, {}).get('gun')
+    def _anchor(self, pose, why, gun=None):
+        """그 자세에 서 있다고 **아는** 순간에 기준점을 잡는다.
+
+        ⚠ `gun` 이 있으면 **그 실측 각도**를 쓴다. 자세의 공칭 각도를 박으면
+        허용오차(±1.5°)만큼 틀어진 채로 고정되고, 그 뒤 모든 각도가 그만큼
+        틀린다 — 2026-10-03 에 12시에서 0.84° 어긋났다. 단회전이 유일하게
+        갈리면 각도를 **정확히** 알 수 있으므로 그 값을 쓰는 것이 맞다.
+        (`yaw_single` 과 `yaw_multi` 는 같은 0x61 응답에서 나와 서로 맞는다 —
+         움직이는 중에 잡아도 어긋나지 않는다.)
+        """
+        g = gun if gun is not None else (
+            ((self.pose_id or {}).get('poses') or {}).get(pose, {}).get('gun'))
         if g is None or self.yaw_multi is None:
             return
         same = (self.yaw_anchor is not None
                 and abs(self.yaw_anchor[0] - self.yaw_multi) < 50
-                and self.yaw_anchor[1] == g)
+                and abs(self.yaw_anchor[1] - g) < 0.01)
         self.yaw_anchor = (self.yaw_multi, float(g))
         self.yaw_anchor_src = why
         if not same:
@@ -275,6 +285,17 @@ class StageNode(Node):
         self._anchor(want, '사람이 선언')
         self._publish_status()
 
+    def _measured_gun(self, pose):
+        """단회전이 유일하게 갈리고 그 자세와 맞으면 **실측 각도**, 아니면 None.
+
+        공칭 각도보다 정확하다 (위 `_anchor` 참고). 자세가 다르게 나오면 쓰지
+        않는다 — 엉뚱한 각도를 기준점으로 박는 것이 더 나쁘다.
+        """
+        got, info = identify_pose(self.pose_id, self.yaw_single)
+        if got == pose and isinstance(info, dict):
+            return info.get('gun_now')
+        return None
+
     def gun_now(self):
         """지금 건 각도 (기준점 기준). 기준점이 없으면 None."""
         return gun_from_anchor(self.pose_id, self.yaw_anchor, self.yaw_multi)
@@ -290,10 +311,11 @@ class StageNode(Node):
             # 기준점이 없어도 **단회전이 유일하게 갈리면** 그걸로 잡는다.
             # `identify_pose` 가 후보를 구동범위로 걸러 모호하면 거부하므로,
             # 성공한 결과는 별칭이 없다 (12시·2번·3번). 1번·4번은 거부된다.
-            got, why = identify_pose(self.pose_id, self.yaw_single)
+            got, det = identify_pose(self.pose_id, self.yaw_single)
             if got is None:
-                return None, f"yaw 자세를 모른다 — {why}"
-            self._anchor(got, '단회전 (별칭 없음)')
+                return None, f"yaw 자세를 모른다 — {det}"
+            # 공칭 각도가 아니라 **단회전에서 나온 실측 각도**로 잡는다
+            self._anchor(got, '단회전 (별칭 없음)', gun=det.get('gun_now'))
             g = self.gun_now()
             if g is None:
                 return None, 'yaw 멀티턴을 못 받고 있다'
@@ -428,7 +450,8 @@ class StageNode(Node):
         # 도달했으면 거기가 곧 기준점이다 — 누적 오차를 끊는다
         if self.yaw_tgt is not None and self.deg.get('yaw') is not None \
                 and abs(self.yaw_tgt - self.deg['yaw']) <= self.yaw_tol:
-            self._anchor(self.yaw_want, '자세 회전 성공')
+            self._anchor(self.yaw_want, '자세 회전 성공',
+                         gun=self._measured_gun(self.yaw_want))
         got, why = self.cur_pose()
         ok = got is not None and got == self.yaw_want
         self.detail = (f'yaw {pose_label(self.yaw_want)} — {reason}'
