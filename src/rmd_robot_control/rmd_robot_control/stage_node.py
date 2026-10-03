@@ -30,6 +30,23 @@ mm 는 **호밍 원점에서의 거리**다. 그래서 호밍이 선행 조건�
         /brake_cmd        String              축별 브레이크
         /stage/status     String(JSON)        현재 mm·목표·도달 여부
 
+## yaw 자세를 어떻게 아는가 — **멀티턴 기준점**
+
+⚠⚠ **단회전만으로는 못 가린다.** 단회전은 모터 1회전(건 28.8°)마다 접히고 yaw
+구동범위는 1.23바퀴라, 별칭이 엉뚱한 자세 옆에 떨어지는 각도가 실제로 존재한다.
+2026-10-03 에 건 +10.80° 를 **1번 자세로 읽었다**(별칭 −18.00° 가 1.26° 차이).
+그 상태에서 회전을 시키면 27.6° 를 지나쳐 밀고, yaw 는 끝 리미트가 없다.
+허용오차를 조여도 그런 구간이 남는다 — 원리적 한계다.
+
+그래서 **각도를 아는 순간에 기준점을 잡고** 그 뒤로는 멀티턴 차이로 추적한다:
+
+  · 호밍 완료 → 준비자세(`ready.yaw_pose`) 에 서 있다
+  · 자세 회전 성공 → 그 자세에 서 있다
+
+기준점이 없으면 **자세를 모르는 것으로 취급한다**(교집합 적용). 단회전 추정은
+참고로만 상태에 싣는다 — 강제에는 쓰지 않는다. 전원이 꺼지면 멀티턴이 날아가
+기준점도 무효이므로 재호밍이 필요하다.
+
 ## 자세별 가동 범위 (2026-10-03)
 
 **yaw 자세에 따라 X·Y 가 갈 수 있는 거리가 다르다** — 결속건이 회전하며 간섭
@@ -82,8 +99,8 @@ from rebar_base_interfaces.msg import SafetyState
 from .axis_config import (envelope_for, envelope_violation, identify_pose,
                           load_axis_motor_ids,
                           load_envelope, load_pose_id, load_pose_select,
-                          load_stage_axes, pose_label, select_pose,
-                          transit_window)
+                          load_ready_yaw_pose, load_stage_axes, gun_from_anchor,
+                          pose_from_gun, pose_label, select_pose, transit_window)
 
 AXES = ('x', 'y', 'z')          # yaw 는 mm 개념이 아니라 여기서 다루지 않는다
 
@@ -153,7 +170,12 @@ class StageNode(Node):
         self.env = load_envelope()
         self.sel = load_pose_select()
         self.pose_id = load_pose_id('yaw')
-        self.yaw_single = None          # yaw 단회전값 (자세 판별용)
+        self.yaw_single = None          # yaw 단회전값 (참고용 — 별칭이 있다)
+        self.yaw_multi = None           # yaw 멀티턴 (기준점과의 차이로 각도를 낸다)
+        self.yaw_anchor = None          # (멀티턴, 건각) — 각도를 아는 순간에 잡는다
+        self.yaw_anchor_src = ''
+        self._homing_state = None       # 전이 판정용 (None = 아직 못 봤다)
+        self.ready_pose = load_ready_yaw_pose()
         self.yaw_brake = None           # 0x9A DATA[3] — 해제 확인 전엔 안 움직인다
         yaw_mid = load_axis_motor_ids(('yaw',)).get('yaw')
         if yaw_mid:
@@ -161,9 +183,16 @@ class StageNode(Node):
                 Int32, f"/motor_{yaw_mid}/encoder_single",
                 lambda m: setattr(self, 'yaw_single', m.data), 10)
             self.create_subscription(
+                Int32, f"/motor_{yaw_mid}/encoder_multi",
+                lambda m: setattr(self, 'yaw_multi', m.data), 10)
+            self.create_subscription(
                 Bool, f"/motor_{yaw_mid}/brake",
                 lambda m: setattr(self, 'yaw_brake', m.data), 10)
         self.create_subscription(Int32, '/stage/yaw_pose', self._on_yaw_pose, 10)
+        # 사람이 "지금 눈으로 보니 N번 자세다" 를 알려주는 경로. 재시작으로 기준점을
+        # 잃었을 때 재호밍(64초) 없이 복구한다. ⚠ 사람이 틀리면 그대로 틀린다 —
+        # 자동으로는 절대 보내지 않는다 (ros2 topic pub 전용).
+        self.create_subscription(Int32, '/stage/yaw_declare', self._on_declare, 10)
         self.yaw_moving = False
         self.yaw_tgt = None
         self.yaw_want = None
@@ -200,6 +229,16 @@ class StageNode(Node):
         for k, v in refs.items():
             if v is not None:
                 self.refs[k] = float(v)
+        # 호밍이 끝나면 yaw 는 준비자세에 서 있다 — **각도를 아는 순간**이다.
+        # ⚠ `done` 은 그 뒤로도 계속 발행된다(상태이지 사건이 아니다). 보이는
+        #   대로 잡으면, 호밍 뒤 yaw 가 움직인 다음 재시작한 노드가 "지금 준비
+        #   자세" 로 **틀리게** 고정한다. 그래서 **전이에서만** 잡는다. 첫 관측은
+        #   이전 상태를 모르므로 잡지 않는다 — 그때는 기준점 없음(= 모름)이 맞다.
+        st = d.get('state')
+        prev, self._homing_state = self._homing_state, st
+        if (st == 'done' and prev not in (None, 'done') and 'yaw' in refs
+                and self.ready_pose is not None and self.yaw_multi is not None):
+            self._anchor(self.ready_pose, '호밍 완료')
 
     def _on_safety(self, msg):
         self.safety = msg
@@ -211,10 +250,51 @@ class StageNode(Node):
             pass
 
     # ---- 자세 --------------------------------------------------------------
+    def _anchor(self, pose, why):
+        """그 자세에 서 있다고 **아는** 순간에 기준점을 잡는다."""
+        g = ((self.pose_id or {}).get('poses') or {}).get(pose, {}).get('gun')
+        if g is None or self.yaw_multi is None:
+            return
+        same = (self.yaw_anchor is not None
+                and abs(self.yaw_anchor[0] - self.yaw_multi) < 50
+                and self.yaw_anchor[1] == g)
+        self.yaw_anchor = (self.yaw_multi, float(g))
+        self.yaw_anchor_src = why
+        if not same:
+            self.get_logger().info(
+                f"yaw 기준점 — {pose_label(pose)} (건 {g:+.2f}°, "
+                f"멀티턴 {self.yaw_multi}) · {why}")
+
+    def _on_declare(self, msg):
+        """사람이 현재 자세를 선언한다 → 기준점으로 잡는다."""
+        want = int(msg.data)
+        if ((self.pose_id or {}).get('poses') or {}).get(want) is None:
+            return self._reject(f'모르는 자세 {want}')
+        if self.yaw_multi is None:
+            return self._reject('yaw 멀티턴을 못 받고 있다')
+        self._anchor(want, '사람이 선언')
+        self._publish_status()
+
+    def gun_now(self):
+        """지금 건 각도 (기준점 기준). 기준점이 없으면 None."""
+        return gun_from_anchor(self.pose_id, self.yaw_anchor, self.yaw_multi)
+
     def cur_pose(self):
-        """지금 yaw 자세. (번호|None, 설명). None 이면 자세 사이거나 값이 없다."""
-        pose, detail = identify_pose(self.pose_id, self.yaw_single)
-        return pose, (pose_label(pose) if pose is not None else str(detail))
+        """지금 yaw 자세. (번호|None, 설명).
+
+        **기준점이 없으면 모르는 것으로 둔다** — 단회전 추정은 별칭 때문에
+        틀릴 수 있어 강제에 쓰지 않는다 (모듈 문서 참고).
+        """
+        g = self.gun_now()
+        if g is None:
+            guess, _ = identify_pose(self.pose_id, self.yaw_single)
+            hint = f" (단회전 추정 {pose_label(guess)} — 별칭 가능)" if guess is not None else ''
+            return None, ("yaw 멀티턴 기준점이 없다 — 호밍하거나 "
+                          "/stage/yaw_pose 로 자세를 한 번 맞추세요" + hint)
+        pose, detail = pose_from_gun(self.pose_id, g)
+        if pose is None:
+            return None, str(detail)
+        return pose, f"{pose_label(pose)} (건 {g:+.2f}°, 오차 {detail['err_gun']:+.2f}°)"
 
     def _envelope_check(self, want_mm):
         """목표 mm 가 현재 자세의 가동 범위 안인가. 밖이면 사유, 안이면 None.
@@ -264,9 +344,13 @@ class StageNode(Node):
             return self._reject(bad)
 
         g = info['poses']
+        # 기동 때 한 번만 읽으면 런타임 변경이 안 먹는다 — 명령마다 다시 읽는다
+        self.yaw_speed = float(self.get_parameter('yaw_speed_dps').value)
         self.yaw_want = want
+        # ⚠ 현재 건 각도는 **기준점**에서 낸다. 위치 토픽(0x92)은 멈추면 묵고,
+        #   단회전은 별칭이 있다 — 둘 다 여기서 쓰면 안 된다.
         self.yaw_tgt = (self.deg['yaw']
-                        + (g[cur]['gun'] - g[want]['gun']) * info['gear'])
+                        + (self.gun_now() - g[want]['gun']) * info['gear'])
         self.yaw_moving = True
         self.t_start = self.t_arm = time.time()
         self._yaw_sent = 0.0
@@ -289,7 +373,7 @@ class StageNode(Node):
         win, passed = transit_window(self.env, self.pose_id, cur, want)
         if not win:
             return None
-        names = ', '.join(pose_label(n) for n in passed)
+        names = ', '.join(passed)        # transit_window 가 라벨로 돌려준다
         for ax in ('x', 'y'):
             v = self.mm_of(ax)
             if v is None:
@@ -323,12 +407,20 @@ class StageNode(Node):
             self._yaw_sent = time.time()
             self.pos_pubs['yaw'].publish(
                 Float64MultiArray(data=[self.yaw_tgt, self.yaw_speed]))
+            g = self.gun_now()
+            self.detail = (f"{pose_label(self.yaw_want)} 로 회전 중"
+                           + (f" (건 {g:+.2f}°, 남은 모터축 {err:+.1f}°)"
+                              if g is not None else ''))
 
     def _yaw_done(self, reason):
         """멈추고 **잠그고 0x80 까지** 보낸다 — 0x78 만으로는 전류가 계속 흐른다."""
         self.spd_pubs['yaw'].publish(Float32(data=0.0))
         self._brake('lock', 'yaw')
         self._brake('shutdown', 'yaw')
+        # 도달했으면 거기가 곧 기준점이다 — 누적 오차를 끊는다
+        if self.yaw_tgt is not None and self.deg.get('yaw') is not None \
+                and abs(self.yaw_tgt - self.deg['yaw']) <= self.yaw_tol:
+            self._anchor(self.yaw_want, '자세 회전 성공')
         got, why = self.cur_pose()
         ok = got is not None and got == self.yaw_want
         self.detail = (f'yaw {pose_label(self.yaw_want)} — {reason}'
@@ -561,8 +653,11 @@ class StageNode(Node):
             'current_deg': {k: (round(v, 2) if v is not None else None)
                             for k, v in self.deg.items()},
             'homed': sorted(self.refs),
-            'pose': pose,                 # 지금 yaw 자세 (None = 자세 사이)
+            'pose': pose,                 # 지금 yaw 자세 (None = 모름/자세 사이)
             'pose_detail': pose_detail,
+            'gun_deg': (round(self.gun_now(), 2)
+                        if self.gun_now() is not None else None),
+            'yaw_anchor': self.yaw_anchor_src or None,
             'pose_want': want,            # 지금 위치에서 결속할 자세
             'pose_want_why': want_why,
             'limit_mm': lim,              # 지금 자세에서 갈 수 있는 X·Y 범위

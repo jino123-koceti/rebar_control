@@ -105,7 +105,7 @@ class FakeStage(Node):
         win, passed = transit_window(self.env, self.info, self.pose, want)
         for ax, v in (('x', self.x), ('y', self.y)):
             if not (win[ax][0] <= v <= win[ax][1]):
-                names = ', '.join(pose_label(n) for n in passed)
+                names = ', '.join(passed)
                 return self._reject(
                     f'{pose_label(self.pose)}→{pose_label(want)} 회전은 [{names}] 를 '
                     f'지난다 — 지금 {ax}={v:.1f}mm 가 그 교집합 '

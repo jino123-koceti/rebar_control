@@ -377,6 +377,14 @@ class PositionControlNode(Node):
         self.encoder_single_pubs = {
             mid: self.create_publisher(Int32, f"motor_{hex(mid)}/encoder_single", 10)
             for mid in self.motor_ids}
+        # ⚠ **멀티턴도 같이 발행한다.** 위치 토픽(0x92)은 `is_moving` 인 모터만
+        # 폴링해서 **멈추면 묵는다** — 그걸 믿고 각도를 역산하면 틀린다
+        # (2026-10-03 에 yaw 를 27.6° 틀리게 봤다). 0x61 응답에 멀티턴이 이미
+        # 들어 있으므로 CAN 트래픽이 늘지 않는다. 전원마다 영점이 달라 **절대값은
+        # 세션 한정**이지만, 기준점과의 **차이**는 그 안에서 정확하다.
+        self.encoder_multi_pubs = {
+            mid: self.create_publisher(Int32, f"motor_{hex(mid)}/encoder_multi", 10)
+            for mid in self.motor_ids}
         self.encoder_single = {}
 
         # 브레이크 해제 상태 — 0x9A DATA[3] (0x01 = 해제). **호밍이 이것을 기다린다.**
@@ -1882,6 +1890,13 @@ class PositionControlNode(Node):
                         m = Int32()
                         m.data = int(single)
                         pub.publish(m)
+                    # 멀티턴 원값. 단회전은 28.8°(모터 1회전) 주기로 접혀 자세
+                    # 판별이 뚫린다 — 멀티턴은 세션 안에서 접히지 않는다
+                    mpub = self.encoder_multi_pubs.get(motor_id)
+                    if mpub is not None:
+                        mm = Int32()
+                        mm.data = int(raw)
+                        mpub.publish(mm)
             elif command == 0x9A:
                 # 에러 상태 읽기 응답 (0x9A)
                 if len(data) >= 4:

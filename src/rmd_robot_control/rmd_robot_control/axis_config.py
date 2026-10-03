@@ -264,6 +264,52 @@ def load_pose_id(name='yaw'):
         return None
 
 
+def load_ready_yaw_pose():
+    """준비자세의 yaw 자세 번호 — 호밍이 끝나면 yaw 가 서는 자세. 없으면 None."""
+    try:
+        v = (_stage().get('ready') or {}).get('yaw_pose')
+        return None if v is None else int(v)
+    except Exception:
+        return None
+
+
+def gun_from_anchor(info, anchor, multi):
+    """기준점 `(멀티턴, 건각)` + 지금 멀티턴 → 지금 건 각도. 못 구하면 None.
+
+    ⚠⚠ **단회전만으로는 자세를 못 가린다.** 단회전은 모터 1회전(건 28.8°)마다
+    접히고 yaw 구동범위는 1.23바퀴라, **별칭이 엉뚱한 자세 옆에 떨어지는 각도가
+    실제로 존재한다.** 2026-10-03 에 건 +10.80° 를 1번 자세(−16.74°)로 읽었다 —
+    별칭 −18.00° 가 1번에서 1.26° 떨어져 허용오차 1.5° 안에 들었다. 그 상태로
+    회전을 시키면 27.6° 를 지나쳐 밀고, yaw 는 끝 리미트가 없다.
+    허용오차를 0.4° 까지 조여도 그런 구간이 남는다 — **원리적 한계다.**
+
+    멀티턴은 전원 세션 안에서 접히지 않는다. 기준점 하나만 있으면 유일하다.
+    기준점은 **각도를 아는 순간**에 잡는다: 호밍 완료(준비자세) 또는 자세 회전 성공.
+    (전원이 꺼지면 멀티턴이 날아가므로 기준점도 무효다 → 재호밍.)
+    """
+    if not info or not anchor or multi is None:
+        return None
+    m0, g0 = anchor
+    return g0 + (multi - m0) / info['cpg']
+
+
+def pose_from_gun(info, gun):
+    """건 각도 → (자세번호, 상세) 또는 (None, 사유). **별칭이 없다.**"""
+    if not info or gun is None:
+        return None, '건 각도를 모른다 (멀티턴 기준점이 없다)'
+    best, bd = None, None
+    for n, p in info['poses'].items():
+        d = gun - p['gun']
+        if bd is None or abs(d) < abs(bd):
+            best, bd = n, d
+    if abs(bd) > info['tol_gun']:
+        return None, (f"자세 사이다 — 건 {gun:+.2f}°, 가장 가까운 {pose_label(best)} "
+                      f"에서 {bd:+.2f}° (허용 ±{info['tol_gun']:.2f}°)")
+    out = dict(info['poses'][best])
+    out['err_gun'], out['gun_now'] = bd, gun
+    return best, out
+
+
 def pose_label(n):
     return '12시' if n == 0 else f'{n}번 자세'
 
@@ -383,8 +429,14 @@ def load_envelope():
     **yaw 자세에 따라 X·Y 가동 범위가 다르다** — 결속건이 회전하며 간섭 방향이
     바뀐다. 이 표가 없으면 검출 지점으로 보낼 때 프레임을 친다.
 
-    `margin_mm` 을 양쪽에서 깎아 돌려준다. `any` 는 네 자세의 **교집합**이고,
-    자세를 못 가릴 때(자세 사이) 쓰는 보수적 범위다 — 어느 자세에서든 안전하다.
+    `margin_mm` 을 양쪽에서 깎아 돌려준다. `any` 는 자세와 **표본**을 모두 겹친
+    교집합이고, 자세를 못 가릴 때 쓰는 보수적 범위다 — 어느 각도에서든 안전하다.
+
+    `samples` 는 자세 **사이** 각도의 실측이다. 결속에 쓰는 자세가 아니므로
+    `poses` 와 섞지 않고(자세별 강제·자세 선택에는 안 들어간다) 회전 안전창과
+    `any` 에만 쓴다. ⚠ **가동범위는 자세 사이에서 단조롭지 않다** — 양 끝만
+    재서 추정하면 틀린다 (12시 X 22mm, 건 +10.8° Y 65mm 차이가 실측됐다).
+    표본은 **잰 축만** 제약한다.
     """
     try:
         env = (_stage().get('envelope') or {})
@@ -396,12 +448,20 @@ def load_envelope():
         for n, axes in poses.items():
             out[int(n)] = {a: (float(v[0]) + m, float(v[1]) - m)
                            for a, v in axes.items()}
+        samples = []
+        for sm in (env.get('samples') or []):
+            rng = {a: (float(v[0]) + m, float(v[1]) - m)
+                   for a, v in sm.items() if a in ('x', 'y')}
+            if rng:
+                samples.append({'gun': float(sm['gun']), 'range': rng,
+                                'note': str(sm.get('note', ''))})
+        # 교집합은 자세 + 표본 전부를 겹친다 — 자세를 모르면 그 사이일 수도 있다
+        pools = list(out.values()) + [sm['range'] for sm in samples]
         any_ = {}
-        for a in set().union(*(set(v) for v in out.values())):
-            lo = max(v[a][0] for v in out.values() if a in v)
-            hi = min(v[a][1] for v in out.values() if a in v)
-            any_[a] = (lo, hi)
-        return {'poses': out, 'any': any_, 'margin': m}
+        for a in set().union(*(set(v) for v in pools)):
+            any_[a] = (max(v[a][0] for v in pools if a in v),
+                       min(v[a][1] for v in pools if a in v))
+        return {'poses': out, 'any': any_, 'margin': m, 'samples': samples}
     except Exception:
         return None
 
@@ -454,13 +514,23 @@ def transit_window(env, info, a, b):
     if a not in gun or b not in gun:
         return env['any'], []
     lo, hi = sorted((gun[a], gun[b]))
-    passed = [n for n, g in gun.items() if lo <= g <= hi and n in env['poses']]
-    if not passed:
+    pools, labels = [], []
+    for n, g in sorted(gun.items(), key=lambda kv: kv[1]):
+        if lo <= g <= hi and n in env['poses']:
+            pools.append(env['poses'][n])
+            labels.append(pose_label(n))
+    # 자세 사이 표본도 지나간다 — 이게 빠지면 양 끝만 보고 추정하는 셈이다
+    for sm in env.get('samples') or []:
+        if lo <= sm['gun'] <= hi:
+            pools.append(sm['range'])
+            labels.append(f"건 {sm['gun']:+.1f}°")
+    if not pools:
         return env['any'], []
-    win = {ax: (max(env['poses'][n][ax][0] for n in passed),
-                min(env['poses'][n][ax][1] for n in passed))
-           for ax in ('x', 'y')}
-    return win, sorted(passed)
+    win = {}
+    for ax in ('x', 'y'):
+        vals = [p[ax] for p in pools if ax in p]
+        win[ax] = (max(v[0] for v in vals), min(v[1] for v in vals))
+    return win, labels
 
 
 def load_pose_select():

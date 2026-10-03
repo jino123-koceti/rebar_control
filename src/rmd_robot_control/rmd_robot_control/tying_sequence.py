@@ -259,7 +259,7 @@ class TyingSequence(Node):
                 return self._fail('회전 안전창을 계산할 수 없다')
             self._passed = passed
             if tgt is None:
-                names = ', '.join(pose_label(n) for n in passed)
+                names = ', '.join(passed)
                 return self._enter(Step.ROTATE,
                                    f'[{names}] 교집합 안 — 후퇴 불필요, 회전')
             if self._stage_busy():
@@ -276,7 +276,7 @@ class TyingSequence(Node):
         off = {ax: cur[ax] - v for ax, v in self._retract_tgt.items()
                if cur[ax] is None or abs(cur[ax] - v) > self.tol}
         if not off:
-            names = ', '.join(pose_label(n) for n in self._passed)
+            names = ', '.join(self._passed)
             return self._enter(Step.ROTATE, f'후퇴 완료 — [{names}] 안에서 회전')
         # 멈췄는데 목표에 못 닿았다 — 안전 차단이나 리미트다. 다시 보내지 않는다
         return self._fail(
