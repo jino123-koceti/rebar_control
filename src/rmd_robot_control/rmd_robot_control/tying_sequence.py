@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """L4 — 결속 지점 하나를 "자세 선택 → 회전 → XY 이동" 으로 묶는다.
 
+⚠ 후퇴 목표는 창 **경계에서 `transit_pad_mm` 안쪽**이다. 경계에 붙여 놓고 돌리면
+여유가 0 이고, 자세 사이 범위는 표본 몇 점으로 가늠한 것이라 그 사이에 더 나쁜
+각도가 있을 수 있다 (실측 셋 다 양 끝보다 나빴다).
+
 `stage_node` 는 "축을 목표까지 어떻게 보내나" 만 안다. 이 노드는 그 위에서
 **순서**를 정한다 (YEAR3_ARCHITECTURE.md §4 L4). 축도 CAN 도 직접 건드리지
 않는다 — `/stage/*` 로만 명령한다.
@@ -74,8 +78,15 @@ class TyingSequence(Node):
 
         self.declare_parameter('step_timeout_sec', 45.0)
         self.declare_parameter('arrive_tol_mm', 2.0)
+        # 후퇴 목표를 회전 안전창 **경계에서 이만큼 안쪽**으로 잡는다.
+        # 경계에 딱 붙여 놓고 회전하면 여유가 0 이다 — 도달 판정이 ±2mm 고,
+        # 자세 사이 범위는 표본 몇 점으로 가늠한 것이라 그 사이에 더 나쁜 각도가
+        # 있을 수 있다 (실측 셋 다 양 끝보다 나빴다). `envelope.margin_mm` 은
+        # 센서·측정 오차용이고, 이것은 **회전 중 자세 변화분**을 위한 별도 여유다.
+        self.declare_parameter('transit_pad_mm', 15.0)
         self.step_timeout = float(self.get_parameter('step_timeout_sec').value)
         self.tol = float(self.get_parameter('arrive_tol_mm').value)
+        self.pad = float(self.get_parameter('transit_pad_mm').value)
 
         self.env = load_envelope()
         self.sel = load_pose_select()
@@ -241,9 +252,20 @@ class TyingSequence(Node):
         cur = dict(zip(('x', 'y'), self._mm()))
         if all(win[ax][0] <= cur[ax] <= win[ax][1] for ax in ('x', 'y')):
             return None, passed, win
-        tgt = {ax: min(max(g, win[ax][0]), win[ax][1])
+        tgt = {ax: self._inside(g, win[ax])
                for ax, g in zip(('x', 'y'), self.goal)}
         return tgt, passed, win
+
+    def _inside(self, v, rng):
+        """창 안으로 끼우되 **경계에 붙이지 않는다** (`transit_pad_mm` 만큼 안쪽).
+
+        창이 여유 두 배보다 좁으면 **중앙**을 쓴다 — 그때는 어느 쪽 경계에서도
+        최대한 떨어지는 것이 최선이다.
+        """
+        lo, hi = rng
+        if hi - lo <= 2 * self.pad:
+            return (lo + hi) / 2.0
+        return min(max(v, lo + self.pad), hi - self.pad)
 
     def _do_retract(self):
         """후퇴를 **끝까지 기다린 뒤** 회전으로 넘어간다.
