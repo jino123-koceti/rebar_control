@@ -208,6 +208,10 @@ class HomingNode(Node):
         self._ready_queue = []
         self._ready_sent = 0.0
         self.create_subscription(String, '/homing_cmd', self._on_cmd, 10)
+        # yaw 건 각도 — `stage_node` 가 멀티턴 기준점으로 낸다. 단회전으로는
+        # 1번·4번을 가릴 수 없어서 이것이 필요하다 (위 `_precheck_failed` 참고)
+        self.yaw_gun = None
+        self.create_subscription(String, '/stage/status', self._on_stage, 10)
 
         self.phase = Phase.IDLE
         self.axis = None
@@ -355,23 +359,42 @@ class HomingNode(Node):
             self.axis = None
 
     def _precheck_failed(self):
-        """호밍 시작 전제 — yaw 는 **자세 판별**로 본다.
+        """호밍 시작 전제 — yaw 의 **건 각도를 알아야** 탐색 방향이 정해진다.
 
-        옛 전제 "사용자가 12시 ±3° 에 놓는다" 는 운용 현실(전원 차단 시 1~4번 중
-        하나)과 맞지 않았다. 단회전값이 자세마다 건 4.54° 이상 떨어져 유일하게
-        갈리므로 손으로 맞출 필요가 없다. 판별된 자세로 **탐색 방향까지** 정한다 —
-        에지가 자세 범위 안쪽이라 방향이 ± 두 가지이고 틀리면 끝단으로 달린다.
+        에지가 자세 범위 **안쪽**(건 -5.8°)이라 방향이 ± 두 가지다. 틀리면
+        **기계 끝단으로 달린다** — yaw 는 끝 리미트가 없고 전행정이 자세 범위보다
+        1~2° 밖에 넓지 않다 (2026-09-30 에 그렇게 10.7A/86°C 까지 갔다).
+
+        ⚠⚠ **단회전만으로는 못 알 때가 있다.** 단회전은 모터 1회전(건 28.8°)마다
+        접히고 전행정이 그보다 넓어서, 1번·4번 자세는 구동범위 안에 후보가 둘이다
+        (1번 ↔ +12.06° / 4번 ↔ -12.11°). `identify_pose` 가 그 경우를 거부한다.
+
+        그래서 **멀티턴 기준점을 먼저 쓴다** — `stage_node` 가 `/stage/status` 의
+        `gun_deg` 로 발행한다. 기준점은 호밍 완료·자세 회전 성공·사람의 선언
+        (`/stage/yaw_declare`) 에서 선다. 둘 다 없으면 **거부하고 방법을 알린다.**
         """
         if self.pose_id and 'yaw' in AXES:
-            n, info = identify_pose(self.pose_id, self.single.get('yaw'))
-            if n is None:
-                return f"yaw {info}"
-            AXES['yaw']['dir'] = int(info['dir'])
+            g, src = self.yaw_gun, '멀티턴 기준점'
+            if g is None:
+                n, info = identify_pose(self.pose_id, self.single.get('yaw'))
+                if n is None:
+                    # 안내는 `identify_pose` 가 경우별로 낸다 (별칭이면 선언,
+                    # 자세 사이면 자세로 옮기기) — 여기서 덧붙이면 중복된다
+                    return f"yaw {info}"
+                g, src = info['gun'], f"단회전 {pose_label(n)}"
+            d = 1 if g < self.pose_id['edge_gun'] else -1
+            AXES['yaw']['dir'] = d
             self.get_logger().info(
-                f"yaw 자세 판별: {pose_label(n)} (오차 건 {info['err_gun']:+.2f}°) "
-                f"→ 탐색 방향 {info['dir']:+d}, 에지까지 건 {info['to_edge_gun']:+.2f}°")
+                f"yaw {src} — 건 {g:+.2f}° → 탐색 방향 {d:+d}, "
+                f"에지까지 건 {self.pose_id['edge_gun'] - g:+.2f}°")
             return None
         return precheck_violation(self.precheck, self.single)
+
+    def _on_stage(self, msg):
+        try:
+            self.yaw_gun = (json.loads(msg.data) or {}).get('gun_deg')
+        except ValueError:
+            pass
 
     def _on_mode(self, msg):
         try:

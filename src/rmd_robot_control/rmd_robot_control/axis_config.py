@@ -257,8 +257,15 @@ def load_pose_id(name='yaw'):
             out[n] = dict(gun=g,
                           single=int(round((noon + g * cpg) % cpr)),
                           dir=1 if g < edge_gun else -1)
+        # 후보를 걸러낼 구동범위 — 자세 범위 양쪽으로 여유를 둔다.
+        # ⚠ 기계 끝단은 미측정이다. **크게 잡으면 거부가 늘어 안전**하고, 작게
+        #   잡으면 진짜 후보를 버려 틀린 쪽을 받아들인다.
+        pad = float(enc.get('gun_range_pad_deg', 3.0))
+        gs = [p['gun'] for p in out.values()]
         return dict(poses=out, cpr=cpr, cpg=cpg, noon=int(noon), gear=gear,
                     edge_gun=edge_gun, tol_gun=tol_gun, tol=tol_gun * cpg,
+                    gun_lo=min(gs) - pad, gun_hi=max(gs) + pad, pad=pad,
+                    period=360.0 / gear,          # 단회전이 접히는 주기 (건 28.8°)
                     limit_gun=float(enc.get('search_limit_gun_deg', 26.0)))
     except Exception:
         return None
@@ -317,27 +324,52 @@ def pose_label(n):
 def identify_pose(info, single):
     """단회전값 → (자세번호, 상세) 또는 (None, 거부 사유).
 
-    자세 사이에 있으면 **거부한다.** 모터 1회전(건 28.8°) 떨어진 두 후보가 생겨
-    모호해지는데, 모르는 채로 탐색하면 끝단에 박을 수 있다.
+    ⚠⚠ **단회전은 모터 1회전(건 28.8°)마다 접히고 yaw 전행정은 그보다 넓다.**
+    그래서 한 단회전값에 **구동범위 안의 후보가 둘** 생기는 각도가 있다:
+    1번(−16.74°)↔+12.06° · 4번(+16.69°)↔−12.11°. 2026-10-03 에 건 +10.80° 를
+    1번으로, 건 −11.71° 를 4번으로 읽었다. 그대로 돌리면 20~28° 를 지나쳐 밀고
+    yaw 는 끝 리미트가 없다. **허용오차를 조여도 그 구간은 남는다.**
+
+    그래서 후보를 구동범위로 걸러내고 **둘 남으면 거부한다.** 12시·2번·3번은
+    별칭이 범위 밖이라 유일하게 갈리고 1번·4번만 거부된다. 확실히 알아야 하면
+    멀티턴 기준점을 쓴다 (`gun_from_anchor`).
+
+    자세 사이에 있어도 거부한다 — 모르는 채로 탐색하면 끝단에 박는다.
     """
     if not info:
         return None, "자세 판별 정보가 없다 (axes.yaml 의 noon_single / pose_offset 확인)"
     if single is None:
         return None, ("단회전값을 못 받고 있다 — "
                       "/motor_*/encoder_single 이 발행되는지 확인하세요")
-    cpr, half = info['cpr'], info['cpr'] // 2
+    # 이 단회전값이 가리킬 수 있는 건 각도 후보들 (28.8° 주기)
+    cpr, per = info['cpr'], info['period']
+    base = ((single - info['noon'] + cpr // 2) % cpr - cpr // 2) / info['cpg']
+    cands = [base + k * per for k in (-2, -1, 0, 1, 2)]
+    cands = [g for g in cands if info['gun_lo'] <= g <= info['gun_hi']]
+    if not cands:
+        return None, (f"단회전 {single} 이 구동범위 밖을 가리킨다 "
+                      f"(건 {base:+.2f}°, 범위 {info['gun_lo']:+.1f}~"
+                      f"{info['gun_hi']:+.1f}°) — 기구나 기준값을 확인하세요")
+    if len(cands) > 1:
+        return None, ("단회전만으로는 자세를 가릴 수 없다 — 후보가 "
+                      + " / ".join(f"건 {g:+.2f}°" for g in sorted(cands))
+                      + f" 둘 다 구동범위 안이다 (별칭 주기 {per:.1f}°). "
+                      "12시·2번·3번 자세로 옮긴 뒤 다시 하거나, "
+                      "/stage/yaw_declare 로 지금 자세를 알려주세요")
+    gun = cands[0]
     best, bd = None, None
     for n, p in info['poses'].items():
-        d = (single - p['single'] + half) % cpr - half
+        d = gun - p['gun']
         if bd is None or abs(d) < abs(bd):
             best, bd = n, d
-    err = bd / info['cpg']
-    if abs(bd) > info['tol']:
-        return None, (f"어느 자세에도 맞지 않는다 — 가장 가까운 {pose_label(best)} 에서 "
-                      f"건 {err:+.2f}° (허용 ±{info['tol_gun']:.2f}°). "
+    if abs(bd) > info['tol_gun']:
+        return None, (f"어느 자세에도 맞지 않는다 — 건 {gun:+.2f}°, 가장 가까운 "
+                      f"{pose_label(best)} 에서 {bd:+.2f}° "
+                      f"(허용 ±{info['tol_gun']:.2f}°). "
                       f"1~4번 자세나 12시로 옮긴 뒤 다시 시작하세요")
     p = dict(info['poses'][best])
-    p['err_gun'] = err
+    p['err_gun'] = bd
+    p['gun_now'] = gun
     p['to_edge_gun'] = info['edge_gun'] - p['gun']
     return best, p
 

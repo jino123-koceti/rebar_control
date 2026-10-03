@@ -287,10 +287,17 @@ class StageNode(Node):
         """
         g = self.gun_now()
         if g is None:
-            guess, _ = identify_pose(self.pose_id, self.yaw_single)
-            hint = f" (단회전 추정 {pose_label(guess)} — 별칭 가능)" if guess is not None else ''
-            return None, ("yaw 멀티턴 기준점이 없다 — 호밍하거나 "
-                          "/stage/yaw_pose 로 자세를 한 번 맞추세요" + hint)
+            # 기준점이 없어도 **단회전이 유일하게 갈리면** 그걸로 잡는다.
+            # `identify_pose` 가 후보를 구동범위로 걸러 모호하면 거부하므로,
+            # 성공한 결과는 별칭이 없다 (12시·2번·3번). 1번·4번은 거부된다.
+            got, why = identify_pose(self.pose_id, self.yaw_single)
+            if got is None:
+                return None, f"yaw 자세를 모른다 — {why}"
+            self._anchor(got, '단회전 (별칭 없음)')
+            g = self.gun_now()
+            if g is None:
+                return None, 'yaw 멀티턴을 못 받고 있다'
+            return got, f"{pose_label(got)} (건 {g:+.2f}°, 단회전으로 확정)"
         pose, detail = pose_from_gun(self.pose_id, g)
         if pose is None:
             return None, str(detail)
