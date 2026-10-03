@@ -90,19 +90,54 @@ class Calib(Node):
         self._load_state()
 
     # ---- 중간 상태 ---------------------------------------------------------
+    # 짝 하나: {'cam':[3], 'stage':[3], 'gun':건각도, 'idx':교차점번호, 't':시각}
+    # ⚠ **`gun` 이 핵심이다.** 자세 번호만으로는 모자란다 — 자세의 건 각도를
+    #   재조정하면(오늘 3번 +6.81→+4.00, 4번 +18.80→+16.69 처럼) 번호는 같은데
+    #   실제 각도가 달라져 **예전 짝이 조용히 틀린 데이터가 된다.** 기록해 두면
+    #   불러올 때 설정값과 대조해 걸러낼 수 있다.
     def _load_state(self):
         try:
             d = json.load(open(STATE, encoding='utf-8'))
-            self.pairs = {int(k): [(c, m) for c, m in v]
-                          for k, v in (d.get('pairs') or {}).items()}
+            out = {}
+            for k, v in (d.get('pairs') or {}).items():
+                rows = []
+                for q in v:
+                    if isinstance(q, dict):
+                        rows.append(q)
+                    else:                       # 옛 형식 [cam, stage] — gun 없음
+                        rows.append({'cam': q[0], 'stage': q[1], 'gun': None,
+                                     'idx': None, 't': None})
+                out[int(k)] = rows
+            self.pairs = out
             self.frozen = [tuple(f) for f in (d.get('frozen') or [])]
         except Exception:
             pass
 
+    def stale(self):
+        """설정된 자세 각도와 **기록 당시 각도**가 다른 짝. {자세: [(i, 기록각, 설정각)]}"""
+        try:
+            from rmd_robot_control.axis_config import load_pose_id
+            info = load_pose_id('yaw')
+        except Exception:
+            return {}
+        if not info:
+            return {}
+        bad = {}
+        for p, rows in self.pairs.items():
+            want = (info['poses'].get(p) or {}).get('gun')
+            if want is None:
+                continue
+            for i, q in enumerate(rows):
+                g = q.get('gun')
+                if g is not None and abs(g - want) > 1.0:
+                    bad.setdefault(p, []).append((i, g, want))
+        return bad
+
     def _save_state(self):
         os.makedirs(os.path.dirname(STATE), exist_ok=True)
         json.dump({'pairs': {str(k): v for k, v in self.pairs.items()},
-                   'frozen': [list(f) for f in self.frozen]},
+                   'frozen': [list(f) for f in self.frozen],
+                   'saved': time.strftime('%Y-%m-%d %H:%M:%S')},
                   open(STATE, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
 
     def _on_stage(self, msg):
@@ -116,6 +151,10 @@ class Calib(Node):
 
     def _on_color(self, msg):
         self.color = msg
+
+    def rows(self, p):
+        """(cam, stage) 짝만 뽑는다 — 수식 쪽이 형식을 몰라도 되게."""
+        return [(q['cam'], q['stage']) for q in self.pairs.get(p, [])]
 
     def spin(self, sec):
         end = time.time() + sec
@@ -216,7 +255,10 @@ class Calib(Node):
             print("  스테이지 mm 를 못 받습니다 — 기록하지 않습니다 (호밍 필요)")
             return
         x, y, z = self.frozen[idx][:3]
-        self.pairs.setdefault(p, []).append(([x, y, z], m))
+        self.pairs.setdefault(p, []).append(
+            {'cam': [x, y, z], 'stage': m, 'idx': idx,
+             'gun': (self.stage or {}).get('gun_deg'),
+             't': time.strftime('%Y-%m-%d %H:%M:%S')})
         self._save_state()
         print(f"  {p}번 자세 짝 {len(self.pairs[p])} 기록 — "
               f"카메라 ({x:+.1f},{y:+.1f},{z:.1f}) ↔ "
@@ -237,10 +279,10 @@ class Calib(Node):
             return
         for p in sorted(self.pairs):
             rows = self.pairs[p]
-            zs = [q[0][2] for q in rows]
+            zs = [q['cam'][2] for q in rows]
             print(f"  {p}번 자세: {len(rows)}개"
                   + (f"  (카메라 z {min(zs):.0f}~{max(zs):.0f}mm)" if rows else ''))
-            for i, (c, m) in enumerate(rows):
+            for i, (c, m) in enumerate(self.rows(p)):
                 print(f"     {i} cam({c[0]:+7.1f},{c[1]:+7.1f},{c[2]:7.1f})"
                       f" → stage({m[0]:7.1f},{m[1]:7.1f},{m[2]:7.1f})")
 
@@ -278,7 +320,7 @@ class Calib(Node):
         r = np.zeros(n * 3)
         row = 0
         for p in poses:
-            for cam, st in self.pairs[p]:
+            for cam, st in self.rows(p):
                 P = np.array(cam, dtype=float)
                 for k in range(3):
                     M[row + k, k * 3:(k + 1) * 3] = P
@@ -302,8 +344,8 @@ class Calib(Node):
         """(A 3x3, b 3, rms, worst) 또는 None."""
         if len(rows) < 4:
             return None
-        P = np.array([c for c, _ in rows], dtype=float)        # (n,3)
-        S = np.array([m for _, m in rows], dtype=float)        # (n,3)
+        P = np.array([q['cam'] for q in rows], dtype=float)        # (n,3)
+        S = np.array([q['stage'] for q in rows], dtype=float)        # (n,3)
         M = np.hstack([P, np.ones((len(rows), 1))])            # (n,4)
         sol, *_ = np.linalg.lstsq(M, S, rcond=None)            # (4,3)
         A, b = sol[:3, :].T, sol[3, :]
@@ -321,6 +363,15 @@ class Calib(Node):
         독립이 확실히 더 좋으면(점이 넉넉하고 잔차가 뚜렷이 작으면) 그게 기구에
         공통 모델로 설명 안 되는 것이 있다는 신호다 — 그때 사람이 판단한다.
         """
+        bad = self.stale()
+        if bad:
+            print("\n  ⚠⚠ **자세 각도가 재조정된 뒤의 짝이 섞여 있습니다.**")
+            for p, items in sorted(bad.items()):
+                for i, g, want in items:
+                    print(f"     {p}번 자세 짝 {i}: 기록 당시 건 {g:+.2f}° / "
+                          f"지금 설정 {want:+.2f}°")
+            print("     그 짝들은 **다른 자세의 데이터**입니다 — 빼고 다시 받으세요")
+            print("     (`u` 로 취소하거나 pairs.json 에서 지우면 됩니다)")
         sh = self.fit_shared()
         print()
         if sh:
@@ -353,7 +404,7 @@ class Calib(Node):
             done[p] = (A, b, rms, worst, len(rows))
             print(f"■ {p}번 자세 — 짝 {len(rows)}개   잔차 RMS {rms:.2f}mm  "
                   f"최대 {worst:.2f}mm")
-            zs = [q[0][2] for q in rows]
+            zs = [q['cam'][2] for q in rows]
             if max(zs) - min(zs) < 30.0:
                 print(f"   ⚠ 카메라 z 범위가 {max(zs)-min(zs):.0f}mm 뿐입니다 — "
                       "A 의 z 열이 결정되지 않아 깊이가 다른 점에서 틀립니다")
@@ -416,7 +467,7 @@ class Calib(Node):
             f.write("raw:\n")
             for p in sorted(self.pairs):
                 f.write(f"  {p}:\n")
-                for c, m in self.pairs[p]:
+                for c, m in self.rows(p):
                     f.write(f"    - cam: {json.dumps([round(v, 2) for v in c])}\n")
                     f.write(f"      stage: {json.dumps([round(v, 2) for v in m])}\n")
         print(f"\n  저장: {out_path}")
