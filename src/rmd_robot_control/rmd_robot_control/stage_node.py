@@ -438,7 +438,7 @@ class StageNode(Node):
             self.pos_pubs['yaw'].publish(
                 Float64MultiArray(data=[self.yaw_tgt, self.yaw_speed]))
             g = self.gun_now()
-            self.detail = (f"{pose_label(self.yaw_want)} 로 회전 중"
+            self.detail = (f"{pose_label(self.yaw_want)}로 회전 중"
                            + (f" (건 {g:+.2f}°, 남은 모터축 {err:+.1f}°)"
                               if g is not None else ''))
 
@@ -456,7 +456,14 @@ class StageNode(Node):
         ok = got is not None and got == self.yaw_want
         self.detail = (f'yaw {pose_label(self.yaw_want)} — {reason}'
                        + ('' if ok else f' ⚠ 도착 자세 {why}'))
-        (self.get_logger().info if ok else self.get_logger().warning)(self.detail)
+        # ⚠ `(logger.info if ok else logger.warning)(msg)` 로 쓰면 안 된다 —
+        #   rclpy 는 **호출 지점별로** 로깅 상태를 캐시해서, 한 줄에서 심각도를
+        #   바꿔 부르면 `ValueError: Logger severity cannot be changed between
+        #   calls.` 로 죽는다. 2026-10-03 에 회전이 끝날 때마다 노드가 죽었다.
+        if ok:
+            self.get_logger().info(self.detail)
+        else:
+            self.get_logger().warning(self.detail)
         self.yaw_moving = False
         self.yaw_tgt = None
         self._request_control('release')

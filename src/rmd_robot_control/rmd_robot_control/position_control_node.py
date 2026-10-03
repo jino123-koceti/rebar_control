@@ -706,14 +706,29 @@ class PositionControlNode(Node):
     ENCODER_CPR = 262144            # 18bit. 0x61 을 이 값으로 나눈 나머지가 단회전 절대값
 
     def _read_encoder_single(self):
-        """상부 축의 0x61 을 읽어 단회전 절대값을 발행한다."""
+        """상부 축의 0x61(단회전·멀티턴)과 **멈춰 있을 때의 0x92(위치)** 를 읽는다.
+
+        ⚠⚠ `position_control_loop` 의 0x92 폴링은 **`is_moving` 인 모터만** 한다.
+        그래서 멈추면 `/motor_*_position` 이 **묵는다.** 그 값을 믿고 각도를
+        역산하면 틀리고(2026-10-03 에 yaw 를 27.6° 틀리게 봤다), 노드가 재시작
+        되면 아예 **한 번도 못 받아** "현재 위치가 없다" 로 이동이 거부된다
+        (같은 날 자세 변경이 그래서 막혔다).
+
+        그래서 상부 축은 멈춰 있을 때도 **2Hz 로** 위치를 읽는다. 움직이는
+        모터는 제어 루프가 이미 10Hz 로 읽으므로 중복해서 보내지 않는다.
+        """
         frame = bytearray(8)
         frame[0] = 0x61
+        self._idle_pos_n = getattr(self, '_idle_pos_n', 0) + 1
+        idle_turn = (self._idle_pos_n % 5 == 0)        # 10Hz 중 2Hz
         for mid in self.motor_ids:
             if mid in (self.left_motor_id, self.right_motor_id):
                 continue                # 주행은 이 값이 의미 없다
             self.can_manager.send_frame(mid, bytes(frame))
             time.sleep(0.002)
+            if idle_turn and not self.motor_states.get(mid, {}).get('is_moving'):
+                self.can_manager.send_frame(mid, bytes([0x92, 0, 0, 0, 0, 0, 0, 0]))
+                time.sleep(0.002)
 
     def _read_brake_state(self):
         """상부 축의 0x9A 를 읽어 브레이크 해제 상태를 발행한다.
