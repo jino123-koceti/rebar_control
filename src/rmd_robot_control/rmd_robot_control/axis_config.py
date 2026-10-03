@@ -406,17 +406,28 @@ def load_envelope():
         return None
 
 
-def envelope_violation(env, pose, want):
-    """목표가 가동 범위를 벗어나는가. 벗어나면 사유 문자열, 괜찮으면 None.
+def envelope_for(env, pose):
+    """그 자세에서 적용할 X·Y 범위와 설명. (범위, 설명).
 
-    `pose` 가 None(자세 판별 실패)이면 **교집합**으로 본다 — 모르면 좁게 잡는다.
+    표에 없는 자세(판별 실패, 또는 12시처럼 안 잰 자세)는 **교집합**으로 본다 —
+    모르면 좁게 잡는다. ⚠ 강제와 표시가 **반드시 같은 값**을 써야 한다. 따로
+    계산했다가 12시에서 표시만 빈 값이 나온 일이 있다 (2026-10-03).
     """
     if not env:
+        return None, '범위 표 없음'
+    lim = env['poses'].get(pose) if pose is not None else None
+    if lim is not None:
+        return lim, pose_label(pose)
+    why = ('자세 미확인' if pose is None
+           else f'{pose_label(pose)} 는 범위 미측정')
+    return env['any'], f'{why} → 교집합'
+
+
+def envelope_violation(env, pose, want):
+    """목표가 가동 범위를 벗어나는가. 벗어나면 사유 문자열, 괜찮으면 None."""
+    if not env:
         return None
-    lim = env['poses'].get(pose) if pose is not None else env['any']
-    if lim is None:
-        lim = env['any']
-    where = f"{pose}번 자세" if pose is not None else "자세 미확인 → 교집합"
+    lim, where = envelope_for(env, pose)
     for a, v in want.items():
         rng = lim.get(a)
         if rng is None:

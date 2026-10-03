@@ -66,7 +66,8 @@ from rclpy.node import Node
 from std_msgs.msg import Empty, Float32, Float64MultiArray, Int32, String
 from rebar_base_interfaces.msg import SafetyState
 
-from .axis_config import (envelope_violation, identify_pose, load_axis_motor_ids,
+from .axis_config import (envelope_for, envelope_violation, identify_pose,
+                          load_axis_motor_ids,
                           load_envelope, load_pose_id, load_pose_select,
                           load_stage_axes, pose_label, select_pose)
 
@@ -399,10 +400,11 @@ class StageNode(Node):
         # 지금 위치에서 결속한다면 어느 자세여야 하는가. 상위가 이걸 보고 yaw 를 돌린다
         want, want_why = (select_pose(self.sel, cur['x'], cur['y'], pose)
                           if self.sel else (None, '선택 규칙 없음'))
-        lim = None
-        if self.env is not None:
-            r = self.env['poses'].get(pose) if pose is not None else self.env['any']
-            lim = {k: [round(v[0], 1), round(v[1], 1)] for k, v in (r or {}).items()}
+        # ⚠ 강제(`envelope_violation`)와 **같은 함수**로 구한다. 따로 계산했다가
+        # 12시에서 표시만 빈 값이 나왔다 (2026-10-03)
+        r, lim_why = envelope_for(self.env, pose)
+        lim = ({k: [round(v[0], 1), round(v[1], 1)] for k, v in r.items()}
+               if r else None)
         self.status_pub.publish(String(data=json.dumps({
             'moving': self.moving,
             'current_mm': cur,
@@ -416,6 +418,7 @@ class StageNode(Node):
             'pose_want': want,            # 지금 위치에서 결속할 자세
             'pose_want_why': want_why,
             'limit_mm': lim,              # 지금 자세에서 갈 수 있는 X·Y 범위
+            'limit_why': lim_why,         # 그 범위가 어디서 왔는가
             'enforce_envelope': self.enforce,
             'detail': self.detail,
         }, ensure_ascii=False)))
