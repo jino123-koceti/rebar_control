@@ -332,6 +332,7 @@ class StageNode(Node):
         if cur is None:
             return self._reject(f'현재 yaw 자세를 못 가린다 — {why}')
         if cur == want:
+            # 한도 때문에 지웠다가 되돌림 (2026-10-03) — 상태에도 남아야 상위가 본다
             self.detail = f'{pose_label(want)} — 이미 그 자세다'
             self.get_logger().info(self.detail)
             return self._publish_status()
@@ -484,10 +485,9 @@ class StageNode(Node):
                 return self._reject(f"{name}: 현재 위치를 못 받고 있다")
         # 각도 목표도 mm 로 환산되면 같이 검사한다. 원점·환산값이 없으면 못 한다 —
         # 캘리브레이션 도구용 경로라 그때는 통과시킨다 (사람이 보며 쓰는 경로다).
-        mm = {}
-        for name in ('x', 'y'):
-            if name in want and name in self.refs and self.ax[name]['mm_per_deg']:
-                mm[name] = (want[name] - self.refs[name]) * self.ax[name]['mm_per_deg']
+        mm = {n: (want[n] - self.refs[n]) * self.ax[n]['mm_per_deg']
+              for n in ('x', 'y')
+              if n in want and n in self.refs and self.ax[n]['mm_per_deg']}
         bad = self._envelope_check(mm) if mm else None
         if bad:
             return self._reject(bad)

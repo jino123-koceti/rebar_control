@@ -79,38 +79,59 @@ R3_PLANNED = {
                   ' (ros2 topic pub). 발행 노드가 있으면 안 된다',
 }
 
-# R4 — 아키텍처 문서 §4 의 규모 상한
+# R4 — 규모 상한.
+#
+# ## 이 숫자의 목적
+#
+# 2차년도 실패(`joint_controller` 1,772줄 · `position_control_node` 1,960줄)가
+# 반복되는 것을 막는 **래칫**이다. "커지면 대화를 하게 만드는" 장치이고,
+# **주석을 깎게 만드는 장치가 아니다.** 2026-10-03 에 stage_node 가 한도를 2줄
+# 넘겨서 설명을 지웠는데, 그게 정확히 막으려던 실패다 — 이 파일들의 주석은
+# 부호 규약·기구 간섭 순서·브레이크 타이밍처럼 **실측으로만 얻은 지식**이고
+# 지우면 다시 알아내야 한다.
+#
+# 그래서 3차년도에 실제로 만드는 노드에는 **현재 크기의 30% 가량 여유**를 둔다.
+# 한도의 90% 를 넘으면 아래에서 "한도 임박" 으로 알린다 — 막기 전에 보인다.
+#
+# ## 2차년도 유산은 올리지 않는다
+#
+# position_control_node(2,487) · rebar_controller(1,528) · navigator(1,458) ·
+# tying_orchestrator_node(2,103) · joint_controller(1,186) 등은 이미 초과
+# 상태로 baseline 에 기록돼 있다. 한도를 올려 "통과" 로 만들면 **줄이려던 목표가
+# 사라진다** (아키텍처 S4 는 position_control_node 를 600 으로 줄이는 것이다).
+# 지금 그대로 두어 초과로 남겨 둔다.
 R4_LIMITS = {
-    'motor_bridge': 600, 'position_control_node': 600, 'remote_bridge': 200,
-    'ezi_io_node': 300, 'gripper_node': 300, 'seengrip_node': 300,
-    'trigger_node': 150, 'pololu_node': 150, 'safety_node': 400,
-    'drive_node': 400, 'drive_controller': 400,
-    # stage_node 500 → 620 (2026-10-03). 아키텍처 §4 는 stage_node 에 "상부 X/Y/Z/
-    # **Yaw** 축 동작" 을 맡기는데, 500 은 X/Y/Z 만 보고 잡은 값이었다. yaw 가
-    # 더해지며 들어온 것은 줄 수가 아니라 **별개의 이동 방식**이다: mm 가 아니라
-    # 자세 번호로 받고, 도달을 단회전 자세 재판별로 확인하고, 회전이 지나가는
-    # 중간 자세들의 교집합을 먼저 검사해야 한다(12시를 안 재서 22mm 과했던 일이
-    # 여기서 막힌다). 그리고 자세별 가동 범위 강제가 함께 들어왔다.
-    # 이 파일의 주석은 방향 부호·전환 안전창·브레이크 타이밍처럼 실측으로만 얻은
-    # 지식이라 한도를 지키려고 깎으면 다시 알아내야 한다 (homing_node 와 같은 이유).
-    # 620 → 690 (2026-10-03). yaw 자세 판별이 **단회전만으로는 원리적으로
-    # 불가능**하다는 것이 실측으로 드러나(건 +10.80° 를 1번 자세로 읽었다 —
-    # 별칭 −18.00° 가 1.26° 차이) 멀티턴 기준점 경로를 넣었다. 기준점을 언제
-    # 잡는가·왜 단회전을 강제에 쓰면 안 되는가가 이 파일 주석의 핵심이고,
-    # 지우면 다시 같은 함정에 빠진다 (그 주석 없이 1.5° 허용오차를 믿었다).
-    'stage_node': 690,
-    # homing_node 600 → 700 (2026-10-03). 아키텍처 §4 의 600 은 2차년도
-    # homing_controller 이식분만 보고 잡은 값이었다. 3차년도에 **yaw 자세 판별+탐색
-    # 방향 유도**, **브레이크 해제 확인**, **준비자세(READY)** 가 더해졌다. 한도를
-    # 지키려고 주석을 깎는 쪽이 더 나쁘다 — 이 파일의 주석은 방향 부호 규약·기구
-    # 간섭 순서·브레이크 타이밍처럼 **실측으로만 얻은 지식**이고, 지우면 다시
-    # 알아내야 한다. 700 도 2차년도 실패 사례(joint_controller 1772)와는 멀다.
-    'joint_controller': 500, 'lateral_node': 300, 'homing_node': 700,
-    'homing_controller': 600, 'mode_arbiter': 300, 'navigator': 500,
-    'path_follower': 400, 'rebar_controller': 400, 'rebar_drive_node': 800,
+    'motor_bridge': 600, 'remote_bridge': 200,
+    'trigger_node': 150, 'pololu_node': 150,
+    'gripper_node': 300, 'seengrip_node': 300,
+    # ── 3차년도에 만드는 노드 — 현재 크기에 여유를 둔다 (2026-10-03) ──────
+    'ezi_io_node': 400,        # 270
+    'lateral_node': 400,       # 217
+    'mode_arbiter': 400,       # 180
+    'safety_node': 500,        # 217
+    'drive_node': 500,
+    'path_follower': 500,
+    'tying_sequence': 550,     # 372 — 결속 시퀀스. 단계가 더 붙는다
+    'navigator': 500,
+    # stage_node 500 → 620 → 690 → **900**. 아키텍처 §4 가 상부 X/Y/Z/**Yaw** 를
+    #   맡기는데 500 은 X/Y/Z 만 보고 잡은 값이었다. 들어온 것은 줄 수가 아니라
+    #   별개의 이동 방식이다 — 자세 번호로 받고, 도달을 자세 재판별로 확인하고,
+    #   회전이 지나가는 중간 자세들의 교집합을 먼저 검사한다. 거기에 자세별
+    #   가동범위 강제와 **멀티턴 기준점**(단회전만으로는 자세를 못 가린다)이
+    #   더해졌다. 690 은 실제 크기와 같아 여유가 0 이었다.
+    'stage_node': 900,         # 690
+    # homing_node 600 → 700 → **900**. §4 의 600 은 2차년도 homing_controller
+    #   이식분만 보고 잡은 값이었다. yaw 자세 판별+탐색 방향 유도, 브레이크 해제
+    #   확인, 준비자세(READY)가 더해졌고 700 도 여유가 0 이 됐다.
+    #   아직 할 일이 남아 있다: 멀티턴 기준점으로 탐색 방향을 정하는 것 [미해결].
+    'homing_node': 900,        # 700
+    # ── 2차년도 유산 — 올리지 않는다 (위 설명 참고) ──────────────────────
+    'position_control_node': 600, 'joint_controller': 500,
+    'homing_controller': 600, 'rebar_controller': 400,
+    'drive_controller': 400, 'rebar_drive_node': 800,
     'tying_orchestrator_node': 800, 'sequence_controller': 400,
-    'tying_sequence': 400,
 }
+
 
 # R5 — 같은 기능이 여러 파일에 구현된 것
 R5_GROUPS = {
@@ -231,6 +252,25 @@ def r3_topic_contract():
     return out
 
 
+def r4_near_limit(ratio=0.9):
+    """한도의 90% 를 넘은 노드 — **막기 전에** 알린다.
+
+    한도는 "커지면 대화를 하게 만드는" 장치다. 넘은 뒤에 막으면 그 자리에서
+    주석을 깎게 되고(2026-10-03 에 그랬다) 그게 막으려던 실패다. 미리 보이면
+    한도를 올릴지 쪼갤지 **미리** 결정할 수 있다.
+    """
+    out = []
+    for p in py_files():
+        limit = R4_LIMITS.get(os.path.basename(p)[:-3])
+        if limit is None:
+            continue
+        n = sum(1 for _ in open(p, encoding='utf-8', errors='replace'))
+        if limit * ratio <= n <= limit:
+            out.append(f"{rel(p)} {n}/{limit}줄 ({n / limit * 100:.0f}%)"
+                       f" — 한도 임박, 올릴지 쪼갤지 지금 정할 것")
+    return out
+
+
 def r4_node_size():
     out = []
     for p in py_files():
@@ -328,6 +368,8 @@ def main():
         print(f"\n기준선 갱신: {BASELINE} (총 {total}건)")
         return 0
 
+    for line in r4_near_limit():
+        print(f"   (참고) {line}")
     for line in r2_info():
         print(f"   (참고) {line}")
 
