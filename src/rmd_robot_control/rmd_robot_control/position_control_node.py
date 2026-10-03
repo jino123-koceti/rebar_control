@@ -419,7 +419,11 @@ class PositionControlNode(Node):
         self.joint_watchdog_timer = self.create_timer(0.05, self.joint_watchdog_tick)
         self.drive_latch_timer = self.create_timer(0.5, self.drive_latch_tick)
         # 1Hz 면 충분하다 — 사람이 축을 옮기는 속도에 비하면 빠르고, CAN 부담도 작다
-        self.encoder_single_timer = self.create_timer(1.0, self._read_encoder_single)
+        # 10Hz. **1Hz 는 느리다** — 호밍이 이 값으로 yaw 자세를 판별하고 로그를 찍는데,
+        # 1초 묵으면 30dps 에서 모터축 30°(건 2.4°) 어긋난다. 2026-10-03 에 이 묵은
+        # 값으로 "FINE 이 원점을 엉뚱한 곳에 적는다" 고 오진했다.
+        # 4축 × 10Hz = 40프레임/초, 1Mbps 버스에서 무시할 수 있는 부하다.
+        self.encoder_single_timer = self.create_timer(0.1, self._read_encoder_single)
         # 2Hz. 호밍의 ARM 단계가 이 값을 보고 넘어간다 — 느리면 호밍이 그만큼 기다린다.
         self.brake_state_timer = self.create_timer(0.5, self._read_brake_state)
         

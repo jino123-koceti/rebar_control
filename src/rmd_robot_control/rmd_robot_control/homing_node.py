@@ -51,7 +51,7 @@ from rclpy.node import Node
 from .axis_config import (load_axis_motor_ids, load_home_offsets,
                           load_precheck, load_seek_dirs, precheck_violation,
                           load_pose_id, identify_pose, pose_label,
-                          load_search_limit, load_ready_pose)
+                          load_search_limit, load_ready_pose, ready_target)
 from .axis_config import HOMING_AXES as AXES
 from std_msgs.msg import Bool, Float32, Float64, Float64MultiArray, Int32, String
 
@@ -109,16 +109,15 @@ class HomingNode(Node):
         # 확실히 보내고 기다리면 3.2A 로 떨어지고 명령의 88% 가 나온다.
         self.declare_parameter('arm_sec', 1.0)
         self.declare_parameter('ready_tol_deg', 3.0)      # 준비자세 도달 판정 (모터축)
-        # yaw 스톨 시 방향 반전을 쓸지. **현재 위치를 알고 있으면 꺼야 한다.**
-        # 2026-09-30: 반전이 걸려 1번 자세(구동범위 하한)를 지나쳤다. 홈이 어느 쪽인지
-        # 아는 상황에서는 반전이 도움이 아니라 위험이다.
-        self.declare_parameter('yaw_sweep', True)
         # 이탈(breakaway): 출발 직후 이 시간 안에 안 움직이면 더 센 속도로 민다
         # 권한 요청 후 이 시간까지 못 받으면 실패한다 (중재기가 있는 경우에만 적용)
         self.declare_parameter('grant_timeout', 3.0)
         # 스톨 감지 — 명령을 보내는데 엔코더가 안 변하면 기계 끝에 닿은 것이다.
         # yaw 는 끝 리미트가 아예 없어서 이것이 **유일한 보호 수단**이다.
-        self.declare_parameter('stall_sec', 2.0)
+        # ⚠ **정지마찰 돌파보다 길어야 한다.** 2026-10-03 실측: 정지 상태에서 속도
+        # 명령을 주면 전류가 0.22→5.41A 로 오르며 **2.4초간 거의 안 움직이다** 풀린다
+        # (풀린 뒤는 1.2A). 2.0초로 두면 그 돌파를 스톨로 오판한다.
+        self.declare_parameter('stall_sec', 4.0)
         self.declare_parameter('stall_deg', 0.8)      # 모터축 도
         # 축별 원점 방향 부호. **실측 전이므로 기본값을 믿지 말 것.**
         for name, cfg in AXES.items():
@@ -137,8 +136,6 @@ class HomingNode(Node):
         self.grant_timeout = float(g('grant_timeout').value)
         for name in AXES:
             AXES[name]['dir'] = int(g(f'{name}_dir').value)
-        if not bool(g('yaw_sweep').value):
-            AXES['yaw']['sweep'] = False
 
         self.speed_pubs = {n: self.create_publisher(Float32, f"/joint_{c['joint']}/speed", 10)
                            for n, c in AXES.items()}
@@ -173,11 +170,13 @@ class HomingNode(Node):
                 AXES[name]['dir'] = d          # axes.yaml 이 코드 기본값을 덮는다
         self.precheck = load_precheck()
         self.single = {}                   # 축 → 단회전 절대값
+        # {축: {탐색방향: 모터축 도}} — 접근 방향마다 다르다 (감지판 폭 때문)
         self.offsets = load_home_offsets()
         if self.offsets:
             self.get_logger().info(
-                "원점 후 오프셋 이동: "
-                + ", ".join(f"{k} {v:+.2f}°" for k, v in self.offsets.items()))
+                "원점 후 오프셋 (탐색방향별): " + ", ".join(
+                    f"{k} " + "/".join(f"{d:+d}→{v:+.2f}°" for d, v in sorted(o.items()))
+                    for k, o in self.offsets.items()))
         motor_ids = load_axis_motor_ids()
         if not motor_ids:
             self.get_logger().warning(
@@ -203,7 +202,9 @@ class HomingNode(Node):
                 (lambda k: (lambda m: self.brake_ok.__setitem__(k, m.data)))(name), 10)
         self.pose_id = load_pose_id('yaw')       # yaw 자세 판별 (12시 ±3° 전제를 대체)
         self.search_limit = load_search_limit('yaw')
-        self.ready_order, self.ready_off, self.ready_speed = load_ready_pose()
+        (self.ready_order, self.ready_off,
+         self.ready_yaw_motor, self.ready_speed) = load_ready_pose()
+        self._off_used = {}            # 축 → OFFSET 에서 실제 적용한 오프셋
         self._ready_queue = []
         self._ready_sent = 0.0
         self.create_subscription(String, '/homing_cmd', self._on_cmd, 10)
@@ -291,7 +292,7 @@ class HomingNode(Node):
         Y 를 먼저 옮기는 쪽이 안전하다.
         """
         self._ready_queue = [a for a in self.ready_order
-                             if a in self.refs and a in self.ready_off]
+                             if self._ready_target(a) is not None]
         skip = [a for a in self.ready_order if a not in self._ready_queue]
         if skip:
             self.get_logger().warning(
@@ -314,8 +315,13 @@ class HomingNode(Node):
             self._brake('shutdown', prev)
         self._brake('release', self.axis)
         self._ready_sent = 0.0
-        tgt = self.refs[self.axis] + self.ready_off[self.axis]
+        tgt = self._ready_target(self.axis)
         self._enter(Phase.READY, f"{self.axis} → {tgt:+.1f}°")
+
+    def _ready_target(self, axis):
+        return ready_target(axis, self.refs.get(axis), self.ready_off,
+                            self.ready_yaw_motor,
+                            self._off_used.get(axis) or self._offset_of(axis))
 
     def _cmd_pos(self, axis, deg, speed):
         self.pos_pubs[axis].publish(
@@ -406,6 +412,19 @@ class HomingNode(Node):
             self._cmd_speed(a, 0.0)          # 먼저 명령을 거둔다
             self._brake('shutdown', a)
 
+    def _offset_of(self, axis):
+        """이 축에 지금 쓸 오프셋 (모터축 도, 명령 부호).
+
+        **탐색 방향에 따라 다르다.** 감지판에 폭이 있어서 증가 방향으로 접근하면
+        아래 경계, 감소 방향이면 위 경계에서 켜진다. 방향을 무시하고 한 값만 쓰면
+        그 차이만큼 작업 위치를 비껴간다 (2026-10-03 실장비에서 그렇게 틀어졌다).
+        """
+        per = self.offsets.get(axis)
+        if not per:
+            return 0.0
+        d = int(AXES[axis]['dir'])
+        return float(per.get(d, per.get(-d, 0.0)))
+
     def _fine_of(self, axis):
         """축별 정밀 속도. 없으면 공통값."""
         return float(AXES[axis].get('fine', self.fine_speed))
@@ -491,7 +510,7 @@ class HomingNode(Node):
                 if elapsed > self.arm_sec * 6:
                     self._fail(f"{self.axis}: 준비자세 전 브레이크가 풀리지 않았다")
                 return
-            tgt = self.refs[self.axis] + self.ready_off[self.axis]
+            tgt = self._ready_target(self.axis)
             p = self.pos.get(self.axis)
             if p is not None and abs(p - tgt) <= self.ready_tol:
                 self.get_logger().info(
@@ -550,33 +569,22 @@ class HomingNode(Node):
                 self._stall_pos = p
                 self._stall_t = time.time()
             elif time.time() - self._stall_t > self.stall_sec:
-                if self.phase is Phase.FINE and cfg.get('fine_stall_ok'):
-                    # 홈 쪽으로 갈수록 부하가 커지는 축이 있다 (yaw: 12시 근처).
-                    # 정밀 재접근에서 못 밀면 **이미 홈 직전**이라는 뜻이므로,
-                    # SEEK 에서 잡은 에지를 원점으로 인정하고 넘어간다.
-                    self._stop_axis(self.axis)
-                    p = self.pos.get(self.axis)
-                    self.refs[self.axis] = p
-                    self.get_logger().warning(
-                        f"{self.axis}: 정밀 재접근이 밀리지 않는다 — SEEK 에지를 원점으로 "
-                        f"인정한다" + (f" (위치 {p:.2f}°)" if p is not None else ""))
-                    if self.offsets.get(self.axis):
-                        self._enter(Phase.OFFSET,
-                                    f"작업 위치까지 {self.offsets[self.axis]:.2f}° 더")
-                    else:
-                        self._next_axis()
-                    return
-                else:
-                    self._stop_axis(self.axis)
-                    self._fail(f"{self.axis}: 스톨 — {self.stall_sec:.1f}초 동안 "
-                               f"{self.stall_deg:.1f}° 도 못 움직였다 "
-                               f"(기계 끝·브레이크 미해제·과부하 확인)")
-                    return
+                # ~~fine_stall_ok: 못 밀면 SEEK 에지를 원점으로 인정~~ → 2026-10-03
+                # 제거. "홈 쪽이 무거워서 못 민다" 가 아니라 **정지마찰 돌파**였다
+                # (실측: 0.22→5.41A 로 2.4초 버틴 뒤 풀리고, 그 뒤 1.2A). 그 2.4초
+                # 동안 더 나쁜 레퍼런스를 받아들이면 정밀 재접근의 의미가 없다.
+                # stall_sec 을 돌파 시간보다 넉넉히 두는 것이 옳은 대처다.
+                self._stop_axis(self.axis)
+                self._fail(f"{self.axis}: 스톨 — {self.stall_sec:.1f}초 동안 "
+                           f"{self.stall_deg:.1f}° 도 못 움직였다 "
+                           f"(기계 끝·브레이크 미해제·과부하 확인)")
+                return
 
         if self.phase is Phase.SEEK:
             if at_home:
                 self._stop_axis(self.axis)
-                self.get_logger().info(f"{self.axis}: {cfg['home_limit']} 도달 → 후퇴")
+                self.get_logger().info(f"{self.axis}: {cfg['home_limit']} 도달 "
+                                       f"(단 {self.single.get(self.axis)}) → 후퇴")
                 self._enter(Phase.BACK_OFF, '리미트 도달')
             else:
                 self._cmd_speed(self.axis, cfg['dir'] * self._seek_of(self.axis))
@@ -595,8 +603,8 @@ class HomingNode(Node):
             else:
                 if self._off_since is None:
                     self._off_since = time.time()
-                    self.get_logger().info(
-                        f"{self.axis}: {cfg['home_limit']} 해제됨 ({elapsed:.1f}초 걸림)")
+                    self.get_logger().info(f"{self.axis}: {cfg['home_limit']} 해제됨 "
+                                           f"({elapsed:.1f}초, 단 {self.single.get(self.axis)})")
                 if time.time() - self._off_since < self.back_off_sec:
                     self._cmd_speed(self.axis, -cfg['dir'] * self._backoff_of(self.axis))
                 else:
@@ -605,42 +613,47 @@ class HomingNode(Node):
                     self._enter(Phase.FINE, '정밀 재접근')
 
         elif self.phase is Phase.OFFSET:
-            # 에지에서 작업 위치까지 **탐색 방향 그대로** 더 간다 (백래시 회피).
-            off = self.offsets.get(self.axis, 0.0)
-            p = self.pos.get(self.axis)
-            ref = self.refs.get(self.axis)
+            # 에지 → 작업 위치는 **거리가 알려진 이동**이다 → 위치 제어.
+            # 속도로 밀며 진행량을 지켜보면 **감속 구간이 그대로 오버슈트**로 남는다
+            # (2026-10-03 실측: +71.82° 명령에 실제 +78.53°, 모터축 6.71° 초과).
+            # 그 오차가 12시 기준과 준비자세로 그대로 전파됐다.
+            # 오프셋은 **명령 부호** 기준이고 토픽은 counts 와 반대이므로(토픽 =
+            # −counts/728), 목표 토픽각 = ref − off 다.
+            off = self._off_used.get(self.axis) or self._offset_of(self.axis)
+            ref, p = self.refs.get(self.axis), self.pos.get(self.axis)
             if p is None or ref is None:
                 self._stop_axis(self.axis)
                 self.get_logger().warning(f"{self.axis}: 위치를 몰라 오프셋 이동 생략")
                 self._next_axis()
                 return
-            # 오프셋은 **명령 부호 기준의 부호 있는 값**이다 — 탐색 방향과 반대일 수
-            # 있다. yaw 가 그렇다: 12시가 감지 구간보다 위라, 감소 방향으로 에지를
-            # 찾은 뒤 **증가 방향으로 되돌아** 12시에 간다.
-            # 위치 토픽은 counts 부호와 반대이므로(토픽 = -counts/728), 명령 부호가
-            # 양수면 토픽은 **감소**한다. 그래서 진행량을 부호까지 보고 판단한다.
-            sign = 1.0 if off >= 0 else -1.0
-            progress = (ref - p) * sign            # 명령 방향으로 얼마나 갔나
-            if progress >= abs(off):
+            tgt = ref - off
+            if abs(p - tgt) <= self.ready_tol:
                 self._stop_axis(self.axis)
                 self.get_logger().info(
-                    f"{self.axis}: 오프셋 {off:+.2f}° 이동 완료 (실제 {progress:+.2f}°) "
-                    f"→ 작업 위치")
+                    f"{self.axis}: 오프셋 {off:+.2f}° 완료 "
+                    f"(실제 {ref - p:+.2f}°, 목표오차 {p - tgt:+.2f}°) → 작업 위치")
                 self._next_axis()
-            else:
-                self._cmd_speed(self.axis, sign * self._fine_of(self.axis))
+            elif time.time() - self._ready_sent > 0.5:
+                # 0xA4 는 명령의 일부만 가는 경우가 있다 → 같은 절대목표를 다시 보낸다
+                self._ready_sent = time.time()
+                self._cmd_pos(self.axis, tgt, self._fine_of(self.axis))
 
         elif self.phase is Phase.FINE:
             if at_home:
                 self._stop_axis(self.axis)
                 p = self.pos.get(self.axis)
                 self.refs[self.axis] = p
+                # **단회전값을 같이 찍는다.** 위치 토픽은 전원 세션마다 기준이 달라져
+                # 기록된 에지값과 비교할 수 없다. 단회전은 전원과 무관해서, 원점이
+                # 실제로 에지에 잡혔는지 바로 대조된다 (2026-10-03: 에지보다 건 1.2°
+                # 아래에 잡히는 것 같았는데 역산으로는 확정할 수 없었다).
                 self.get_logger().info(
-                    f"{self.axis}: 원점 확정" + (f" (위치 {p:.2f}°)" if p is not None else
-                                              " (위치 토픽 없음)"))
-                if self.offsets.get(self.axis):
-                    self._enter(Phase.OFFSET,
-                                f"작업 위치까지 {self.offsets[self.axis]:.2f}° 더")
+                    f"{self.axis}: 원점 확정 (위치 {p}, 단 {self.single.get(self.axis)})")
+                off = self._offset_of(self.axis)
+                if off:
+                    self._off_used[self.axis] = off
+                    self._ready_sent = 0.0
+                    self._enter(Phase.OFFSET, f"작업 위치까지 {off:+.2f}° 더")
                 else:
                     self._next_axis()
             else:

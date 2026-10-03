@@ -27,20 +27,22 @@ HOMING_AXES = {
     # ⚠ z_min 센서는 **위쪽**에 있다. 이름과 물리 방향이 반대다 (axes.yaml 참조).
     #   음수 명령 → 엔코더 증가 → 상승 → z_min. 중력 반대라 호밍 방향으로 안전하다.
     'z':   dict(joint=5, home_limit='z_min', far_limit='z_max', dir=-1),
-    # yaw 는 홈이 **구동범위 한가운데**라 고정 부호가 의미 없다. 끝 리미트도 없다.
-    # 한 방향으로 쓸다가 스톨(기계 끝)이 나면 반대로 뒤집는다 — 전 구간이 건 35°뿐이라
-    # 최악이어도 금방 찾는다.
-    # ⚠ yaw 는 **저속에서 정지마찰을 못 이긴다.** 2026-09-30 실측:
-    #   15dps → 3% 밖에 안 움직이고, 30dps → 정상. 탐색(30)은 되는데 후퇴·정밀(15)에서
-    #   스톨로 실패했다. 그래서 이 축만 느린 단계도 30dps 로 올린다.
-    'yaw': dict(joint=6, home_limit='yaw_home', far_limit=None, dir=+1, sweep=True,
-    #   또 하나: **정지 상태에서 출발할 때만** 세게 밀어야 한다. 속도 제어기가 명령
-    #   속도에 비례해서만 전류를 올려서 (30dps→2.2A, 50→3.1A, 80→3.7A), 낮은 속도로는
-    #   정지마찰을 못 깬다. 한 번 움직이면 30dps 로도 유지된다 → breakaway 로 처리한다.
-    #   ⚠ 이탈 속도는 **홈 근처 기준**으로 정해야 한다. 홈에서 먼 곳은 80dps 에 풀리지만
-    #     홈 근처(건 2° 이내)는 80·120 에서 전류가 1.98A 에 머물며 꿈쩍도 안 하고,
-    #     160dps 에서 4.46A 로 올라가며 풀린다 (2026-09-30 실측, 정격 6.1A 이내).
-                fine=30.0, back_off=30.0, fine_stall_ok=True, breakaway=160.0),
+    # yaw 는 홈이 **구동범위 한가운데**이고 끝 리미트가 없다. 그래서 `dir` 은 고정값이
+    # 의미 없고 **자세 판별로 매번 정한다** (load_pose_id). 방향을 틀리면 에지를 못
+    # 만나고 기계 끝단으로 달리므로, 거리 상한(search_limit_gun_deg)으로 막는다.
+    # ~~sweep: 스톨 나면 방향 뒤집어 재탐색~~ → 2026-10-03 제거. 그건 **이미 박은 뒤**의
+    #   동작이다 (2026-09-30 에 그렇게 10.7A/86°C 까지 갔다).
+    # ~~breakaway: 160dps 로 밀어붙이기~~ → 2026-10-03 제거. "저속에서 정지마찰을 못
+    #   이긴다" 는 관측은 맞지만 원인 진단이 틀렸다. 속도 제어기는 **명령 속도가
+    #   낮아도 오차를 적분해 전류를 올린다** — 12dps 로도 5.4A 까지 올라가 2.4초 뒤
+    #   풀리고, 풀린 뒤는 1.2A 다. 필요한 것은 더 센 명령이 아니라 **기다림**
+    #   (stall_sec > 돌파 시간)과 **브레이크 해제 확인**이다.
+    # ⚠ fine 은 **에지 실측 속도와 같아야 한다.** 검출 지연이 속도에 비례하므로,
+    #   에지를 12dps 로 재놓고 FINE 을 30dps 로 돌리면 FINE 이 2.5배 더 지나친 자리를
+    #   원점으로 적는다. 그 오차가 오프셋·준비자세로 전파됐다.
+    #   seek 과 같은 값이면 애초에 '정밀' 재접근이 아니다.
+    'yaw': dict(joint=6, home_limit='yaw_home', far_limit=None, dir=+1,
+                fine=12.0, back_off=30.0),
 }
 
 
@@ -71,20 +73,49 @@ def load_axis_motor_ids(names=AXIS_NAMES):
         return {}
 
 
-def load_home_offsets(names=AXIS_NAMES):
-    """축별 "에지 도달 후 탐색 방향으로 더 갈 각도"(모터축 도).
+def _edges(name):
+    """감지 경계 단회전값 → (아래 경계, 위 경계). 없으면 (None, None)."""
+    enc = ((_stage().get(name) or {}).get('encoder') or {})
+    return (enc.get('edge_single_from_low'), enc.get('edge_single_from_high'))
 
-    스위치는 **기준점**이지 작업 위치가 아니다. yaw 는 감지판이 2번 자세 쪽으로
-    옮겨져 12시에서 센서가 안 켜진다 — 에지에서 멈추면 12시가 아니다. 그대로 Y 를
-    호밍하면 상부 프레임을 친다 (Y 는 yaw 12시에서만 리미트에 닿는다).
+
+def load_home_offsets(names=AXIS_NAMES):
+    """축별 "에지 도달 후 **탐색 방향별로** 더 갈 각도" — {축: {dir: 모터축 도}}.
+
+    스위치는 **기준점**이지 작업 위치가 아니다. yaw 는 감지 구간이 12시보다 아래라
+    에지에서 멈추면 12시가 아니고, 그대로 Y 를 호밍하면 상부 프레임을 친다.
+
+    ⚠⚠ **오프셋은 접근 방향마다 다르다.** 감지판에 폭이 있어서 켜지는 지점이
+    다르다 — 건 각도 **증가** 방향으로 접근하면 아래 경계에서, **감소** 방향이면
+    위 경계에서 켜진다. 2026-10-03 실장비 실행에서 1번 자세(증가 방향)로 접근했는데
+    한 값만 써서 그만큼 비껴갔다.
+
+    손으로 계산한 상수를 두지 않고 **경계 단회전값에서 유도한다** (상수를 두면
+    감지판이 움직일 때 또 어긋난다 — 실제로 그렇게 어긋났다):
+
+        offset(모터축) = wrap(noon_single − edge_single) / (cpr/360)
+
+    명령 부호 규약: 명령 + → counts 증가 → 건 각도 증가. wrap 이 양수면 counts 를
+    키워야 하므로 오프셋도 양수다.
     """
     try:
         stage = _stage()
         out = {}
         for name in names:
-            v = (((stage.get(name) or {}).get('encoder') or {})).get('home_offset_deg')
-            if v:
-                out[name] = float(v)
+            enc = ((stage.get(name) or {}).get('encoder') or {})
+            noon = enc.get('noon_single')
+            if noon is None:
+                continue
+            cpr = int(enc.get('cpr', 262144))
+            cpd = cpr / 360.0
+            lo, hi = enc.get('edge_single_from_low'), enc.get('edge_single_from_high')
+            per = {}
+            for d, edge in ((1, lo), (-1, hi)):
+                if edge is None:
+                    continue
+                per[d] = ((int(noon) - int(edge) + cpr // 2) % cpr - cpr // 2) / cpd
+            if per:
+                out[name] = per
         return out
     except Exception:
         return {}
@@ -181,9 +212,14 @@ def load_pose_id(name='yaw'):
         cpr = int(enc.get('cpr', 262144))
         gear = float(stage.get('gear', 12.5))
         cpg = (cpr / 360.0) * gear               # counts / 건 1도
-        # 에지는 12시에서 home_offset_deg(모터축, **명령 부호**) 만큼 떨어져 있다.
-        # 명령 + 는 건 각도 증가 방향이므로, 에지는 12시보다 그만큼 **아래**다.
-        edge_gun = -float(enc.get('home_offset_deg', 0.0)) / gear
+        # 에지가 12시 기준 건 몇 도인가 — **두 경계의 중앙**을 쓴다. 자세가 에지보다
+        # 위/아래인지만 보면 되므로 판 폭(건 0.45°)은 판정에 영향이 없다.
+        lo, hi = enc.get('edge_single_from_low'), enc.get('edge_single_from_high')
+        es = [int(x) for x in (lo, hi) if x is not None]
+        if not es:
+            return None
+        edge_gun = sum(((e - int(noon) + cpr // 2) % cpr - cpr // 2)
+                       for e in es) / len(es) / cpg
         tol_gun = float(enc.get('pose_id_tolerance_gun_deg', 2.0))
         cand = {0: 0.0}                          # 0 = 12시 (호밍 직후 자세)
         cand.update({int(k): float(v) for k, v in poses.items()})
@@ -258,12 +294,12 @@ def load_ready_pose():
 
     · Y: mm 는 원점(y_min) 기준이고 `mm_per_deg` 가 부호를 흡수한다 →
          `ref + mm / mm_per_deg`. stage_node 의 `deg_of()` 와 같은 식이다.
-    · yaw: 레퍼런스는 **에지**에 기록된다(12시가 아니다). 에지는 12시보다 건 4.62°
-         아래이고 1번 자세는 12시보다 건 16.52° 아래이므로, 에지→1번은 건 −11.90°.
-         건 각도가 줄면 토픽은 커진다 → `ref + 11.90 * gear`.
-         (12시를 경유해 계산해도 `-57.70 + 16.52*12.5 = +148.80` 으로 일치한다.)
+    · yaw: 레퍼런스는 **에지**에 기록되고, 에지→12시 오프셋은 **접근 방향마다 다르다.**
+         그래서 여기서 숫자를 못 낸다 — 자세의 건 각도만 돌려주고, 호밍 노드가
+         **실제 적용한 오프셋**과 합친다:
+             토픽차 = −(적용 오프셋) − (자세 건각도 × gear)
 
-    돌려주는 것: (순서 리스트, {축: 토픽각도차}, 속도dps)
+    돌려주는 것: (순서 리스트, {선형축: 토픽각도차}, yaw 자세 **모터축** 각도, 속도dps)
     """
     try:
         stage = _stage()
@@ -277,20 +313,39 @@ def load_ready_pose():
                 order.remove('y')        # 환산을 모르면 Y 는 건너뛴다
             else:
                 out['y'] = float(r['y_mm']) / float(mpd)
+        yaw_gun = None
         if 'yaw' in order:
             enc = ((stage.get('yaw') or {}).get('encoder') or {})
             poses = enc.get('pose_offset_from_noon_gun_deg') or {}
             key = r.get('yaw_pose')
-            gun = poses.get(key, poses.get(str(key)))
-            off_motor = float(enc.get('home_offset_deg', 0.0))
-            if gun is None:
+            g = poses.get(key, poses.get(str(key)))
+            if g is None:
                 order.remove('yaw')
             else:
-                # 에지 기준: (12시까지) + (12시→자세). 둘 다 토픽 부호로 바꾼다.
-                out['yaw'] = -off_motor + (-float(gun)) * gear
-        return order, out, float(r.get('speed_dps', 60))
+                yaw_gun = float(g) * gear          # 모터축으로 환산해 넘긴다
+        return order, out, yaw_gun, float(r.get('speed_dps', 60))
     except Exception:
-        return [], {}, 60.0
+        return [], {}, None, 60.0
+
+
+def ready_target(axis, ref, lin_off, yaw_motor, off_used):
+    """준비자세 목표 (위치 토픽 각도). 못 구하면 None.
+
+    선형축은 `ref + 토픽각도차` 로 끝난다. yaw 는 레퍼런스가 **에지**에 기록되고
+    에지→12시 오프셋이 **접근 방향마다 다르므로**, 실제 적용한 오프셋에서
+    거꾸로 계산한다:
+
+        목표 = ref − (적용 오프셋) − (자세 모터축 각도)
+
+    명령 + 는 토픽을 줄이므로 둘 다 부호를 뒤집어 더한다.
+    """
+    if ref is None:
+        return None
+    if axis in lin_off:
+        return ref + lin_off[axis]
+    if axis == 'yaw' and yaw_motor is not None and off_used is not None:
+        return ref - off_used - yaw_motor
+    return None
 
 
 def load_stage_axes(names=('x', 'y', 'z')):
