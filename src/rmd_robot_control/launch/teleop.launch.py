@@ -62,6 +62,7 @@ def generate_launch_description():
         parameters=[params, {'safety_timeout': safety_timeout}],
         remappings=[('cmd_vel', '/cmd_vel'), ('joint_states', '/joint_states'),
                     ('motor_status', '/motor_status')],
+        respawn=True, respawn_delay=2.0,
     )
     lateral = Node(
         package='rmd_robot_control', executable='lateral_node',
@@ -71,32 +72,69 @@ def generate_launch_description():
             'i_hard_a': LaunchConfiguration('lateral_i_hard_a'),
             'max_torque': LaunchConfiguration('lateral_max_torque'),
         }],
+        respawn=True, respawn_delay=2.0,
     )
     remote_bridge = Node(
         package='rebar_base_control', executable='remote_bridge.py',
         name='remote_bridge', output='screen',
+        respawn=True, respawn_delay=2.0,
     )
     remote_teleop = Node(
         package='rmd_robot_control', executable='remote_teleop_node',
         name='remote_teleop_node', output='screen',
+        respawn=True, respawn_delay=2.0,
     )
     ezi_io = Node(
         package='ezi_io_ros2', executable='ezi_io_node',
         name='ezi_io_node', output='screen',
         parameters=[ezi_params] if ezi_params else [],
+        respawn=True, respawn_delay=2.0,
     )
     safety = Node(
         package='rebar_base_control', executable='safety_node.py',
         name='safety_node', output='screen',
+        respawn=True, respawn_delay=2.0,
     )
     # L4 권한 중재. 이게 없으면 호밍과 리모콘이 같은 축 토픽에 동시에 써서
     # 축이 툭툭 끊긴다 (2026-09-30 실측, mode_arbiter.py 주석 참고).
     mode_arbiter = Node(
         package='rebar_base_control', executable='mode_arbiter.py',
         name='mode_arbiter', output='screen',
+        respawn=True, respawn_delay=2.0,
+    )
+
+    # ── 상부 스테이지 (L3·L4) ────────────────────────────────────────────
+    # ⚠ **호밍 원점의 보유자는 `homing_node` 하나다.** refs 를 2Hz 로 계속
+    #   재발행하므로 `stage_node`·`tying_sequence` 는 죽어도 0.5초 안에 원점을
+    #   다시 받는다. 반대로 `homing_node` 가 죽으면 원점이 사라져 **재호밍이
+    #   필요하다** — 멀티턴은 전원 세션 안에서만 유효하지만 refs 자체는 그
+    #   노드의 메모리에만 있기 때문이다.
+    # ⚠⚠ **자동 호밍은 넣지 않는다.** 호밍은 전 축을 리미트까지 크게 쓸어가는
+    #   동작이라, 되살아난 즉시 자동으로 돌면 아무도 시키지 않았는데 장비가
+    #   움직인다. `respawn` 과 겹치면 크래시 루프가 재호밍 루프가 된다.
+    #   원점이 없으면 `stage_node` 가 모든 이동을 거부하는 것이 안전망이다
+    #   ("호밍 원점이 없다 — 먼저 호밍하세요"). 호밍은 `/homing_cmd` 로만 시작한다.
+    # 파라미터: robot_control.yaml 에는 이 세 노드 섹션이 없다. 넘기면 조용히
+    #   무시되지만(섹션 이름이 안 맞으면 적용 안 된다) 혼동을 피해 안 넘긴다.
+    homing = Node(
+        package='rmd_robot_control', executable='homing_node',
+        name='homing_node', output='screen',
+        respawn=True, respawn_delay=2.0,
+    )
+    stage = Node(
+        package='rmd_robot_control', executable='stage_node',
+        name='stage_node', output='screen',
+        respawn=True, respawn_delay=2.0,
+    )
+    tying = Node(
+        package='rmd_robot_control', executable='tying_sequence',
+        name='tying_sequence', output='screen',
+        respawn=True, respawn_delay=2.0,
     )
 
     return LaunchDescription(args + [
-        LogInfo(msg=['리모콘 조작 구성 기동 — 안전 차단: ', use_safety]),
+        LogInfo(msg=['리모콘 조작 구성 기동 — 안전 차단: ', use_safety,
+                     ' / 호밍은 자동으로 돌지 않는다 (/homing_cmd 로 시작)']),
         motor, lateral, remote_bridge, remote_teleop, ezi_io, safety, mode_arbiter,
+        homing, stage, tying,
     ])
