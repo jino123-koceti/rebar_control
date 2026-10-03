@@ -189,6 +189,32 @@ def precheck_violation(precheck, single, gear=12.5):
     return None
 
 
+def load_max_torque(names=AXIS_NAMES, default=100):
+    """축별 `0xA2`/`0xA4` DATA[1] maxTorque. {CAN ID: 값}.
+
+    **정격 전류의 백분율**이다 (1 LSB = 1%). 0 이거나 스톨 전류보다 크면 힘 제어가
+    비활성되고 모터 자체 한계만 남는다 — 횡이동이 255 를 쓰는 이유다.
+
+    상부축 기본은 100 인데, yaw 는 2·3번 자세 사이에서 그 상한에 걸려 못 지난다
+    (7.6~7.8A 에 막혀 건 0.1°). 그래서 축별로 올릴 수 있게 한다.
+    ⚠ **상부축에는 전류 보호(Protection)가 없다** — 이 값이 유일한 상한이므로
+    255 로 풀지 말 것.
+    """
+    try:
+        stage = _stage()
+        out = {}
+        for name in names:
+            c = stage.get(name) or {}
+            cid = c.get('can_id')
+            if cid is None:
+                continue
+            v = c.get('max_torque', default)
+            out[int(cid)] = max(0, min(255, int(v)))
+        return out
+    except Exception:
+        return {}
+
+
 def load_pose_id(name='yaw'):
     """자세 판별 정보. 없으면 None.
 

@@ -389,6 +389,16 @@ class PositionControlNode(Node):
             if mid not in (self.left_motor_id, self.right_motor_id)}
         self.brake_state = {}
 
+        # 축별 maxTorque (0xA2/0xA4 DATA[1]) — **정격 전류의 백분율**.
+        # 상부축 기본 100 은 yaw 가 2·3번 자세 사이를 못 지난다. axes.yaml 에서 올린다.
+        # ⚠ 상부축에는 Protection 이 없어 이 값이 유일한 상한이다 (255 금지).
+        from .axis_config import load_max_torque
+        self.max_torque = load_max_torque()
+        if self.max_torque:
+            self.get_logger().info(
+                "축별 maxTorque: " + ", ".join(
+                    f"0x{m:03X}={v}" for m, v in sorted(self.max_torque.items())))
+
         # 엔코더 명령 진단. 어떤 읽기 명령이 이 모터에서 실제로 동작하는지 확인한다.
         #   ros2 topic pub --once /encoder_probe std_msgs/String "{data: 'yaw'}"
         # 멀티턴(0x92)은 전원을 내리면 사라진다. 자세를 저장해 두려면 **싱글턴
@@ -1779,6 +1789,25 @@ class PositionControlNode(Node):
                     )
                 else:
                     self.get_logger().warning(f"모터 0x{motor_id:03X} 응답 데이터 길이 부족: {len(data)} bytes")
+            elif command == CommandType.SET_MOTOR_SPEED:
+                # 0xA2 응답도 0x9C 와 같은 자리배치다: [cmd][temp][current][speed][angle]
+                # **이 분기가 없어서 속도 제어 이동에는 전류 보호가 걸리지 않았다.**
+                # 0xA4(위치 제어)는 걸려 있었는데 0xA2 만 비어 있었다 — 호밍의
+                # SEEK/BACK_OFF/FINE 과 리모콘 조작이 전부 그 구멍에 있었다.
+                # 상부축은 0x9C 를 폴링하지 않으므로, 이 응답이 유일한 전류 창구다.
+                if len(data) >= 8:
+                    temperature = struct.unpack('<b', data[1:2])[0]
+                    current = struct.unpack('<h', data[2:4])[0] * 0.01
+                    speed = struct.unpack('<h', data[4:6])[0]
+                    st = self.motor_states.setdefault(motor_id, {})
+                    st['velocity'] = float(speed)
+                    st['torque'] = current
+                    # **주행은 건드리지 않는다** — 이미 전용 경로(drive_protect)가
+                    # 적산 중이고, 여기서 또 부르면 중복 집계가 된다.
+                    if motor_id not in self.drive_prot:
+                        lvl = self.check_motor_current_safety(
+                            motor_id, current, temperature)
+                        self.apply_current_protection_action(motor_id, lvl)
             elif command == CommandType.SET_MOTOR_POSITION:
                 # 0xA4 명령 응답 파싱: [cmd][temp(1)][current(2)][speed(2)][angle(2)] = 8바이트
                 # 주의: angle은 단일 회전 각도(-180~+180)이므로 절대 위치 업데이트에 사용하지 않음!
@@ -2104,8 +2133,8 @@ class PositionControlNode(Node):
         data = bytearray(8)
         data[0] = 0xA2  # Speed Control Command
 
-        # 토크 100% (토크 부족 방지)
-        data[1] = 0x64  # 100% of rated current
+        # maxTorque = 정격 전류의 백분율. 축별로 axes.yaml 에서 읽는다 (기본 100).
+        data[1] = self.max_torque.get(motor_id, 100)
 
         data[2] = 0x00
         data[3] = 0x00
@@ -2154,8 +2183,8 @@ class PositionControlNode(Node):
         data = bytearray(8)
         data[0] = 0xA2  # Speed Control Command
 
-        # 토크 100% (토크 부족 방지)
-        data[1] = 0x64  # 100% of rated current
+        # maxTorque = 정격 전류의 백분율. 축별로 axes.yaml 에서 읽는다 (기본 100).
+        data[1] = self.max_torque.get(motor_id, 100)
 
         data[2] = 0x00
         data[3] = 0x00
