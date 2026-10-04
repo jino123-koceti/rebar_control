@@ -59,8 +59,10 @@ def generate_launch_description():
     motor = Node(
         package='rmd_robot_control', executable='position_control_node',
         name='position_control_node', output='screen',
+        # ⚠ `stage_accel_dpss` 는 **쓰지 않는다**(0). 전 축에 같은 값을 넣으면
+        #   X 가 망가진다 — 축별 값은 `stage_node` 의 `accel_dpss_*` 가 보낸다.
         parameters=[params, {'safety_timeout': safety_timeout,
-                             'stage_accel_dpss': 12000.0}],
+                             'stage_accel_dpss': 0.0}],
         remappings=[('cmd_vel', '/cmd_vel'), ('joint_states', '/joint_states'),
                     ('motor_status', '/motor_status')],
         # ⚠⚠ 상부축 가감속. **0x43 은 ROM 에 남지 않아 매 기동 재적용이 필수**라

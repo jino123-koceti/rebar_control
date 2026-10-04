@@ -202,6 +202,20 @@ class StageNode(Node):
         # ⚠ 리스트가 아니라 **문자열**이다 — 이유는 `_axis_list` 주석 참조
         self.declare_parameter('brake_hold_axes', 'x,y')
         self.declare_parameter('brake_hold_sec', 2.5)
+        # ── 축별 가감속 (모터축 dps/s, 0x43) ───────────────────────────────
+        # ⚠⚠ **축마다 최적값이 다르다.** 2026-10-04 에 전 축에 12000 을 넣었더니
+        #   X 가 망가졌다 — 감속 구간 전류가 10.66A 까지 뛰어 **충돌 감지가
+        #   헛트립**했고, 결속점이 "이동만 하고 하강 없이 패스" 됐다. 실측(X 240mm):
+        #       가속 12000 → 53.2mm/s, 전류 10.66A, 트립 발생
+        #       가속  3000 → 56.3mm/s, 전류  4.57A, 정상  ← 더 빠르고 전류 절반
+        #       가속  1000 → 36.7mm/s, 전류  4.38A, 정상
+        #   Z 는 반대로 12000 에서 가장 빠르다 (18.4mm/s, 3000 은 16.0).
+        #   ⚠ `0x43` 은 ROM 에 남지 않아 **기동마다** 다시 넣어야 한다.
+        #   ⚠ 0 인 축은 건드리지 않는다 (모터 기본값을 그대로 둔다).
+        self.declare_parameter('accel_dpss_x', 5000.0)
+        self.declare_parameter('accel_dpss_y', 5000.0)
+        self.declare_parameter('accel_dpss_z', 12000.0)
+        self.declare_parameter('accel_dpss_yaw', 0.0)   # 가속에 둔감 — 손대지 않는다
         # 중재기에서 권한을 받기까지 기다리는 시간. ⚠ 0 이면 **요청 직후 50ms 에**
         # "권한 없음" 으로 판단해 중단한다 — 리모콘을 쓴 뒤에는 모드가 manual 로
         # 돌아가 있어 항상 그렇게 된다 (2026-10-04 에 yaw 회전이 그래서 죽었다).
@@ -354,6 +368,9 @@ class StageNode(Node):
         self.rejects = 0          # 거부 횟수. 상위가 "내 명령이 거부됐나" 를 가린다
         self.detail = '대기'
 
+        # 축별 가감속을 기동 때 한 번 넣는다. CAN 이 열린 뒤여야 하므로 늦게 부른다.
+        self.accel_pub = self.create_publisher(String, '/motor_accel', 10)
+        self._accel_timer = self.create_timer(4.0, self._apply_accel)
         self.create_timer(0.05, self.tick)
         # 유예가 끝난 축의 브레이크를 잠근다 (`brake_hold_axes`)
         self.create_timer(0.2, self._lock_tick)
@@ -921,6 +938,21 @@ class StageNode(Node):
             f"이동 취소하고 {cur:.1f} → {back:.1f}mm 로 후퇴")
         self._begin({name: back}, 'mm')
         self.detail = f'충돌 후퇴 — {name} {back:.1f}mm (전류 {a:.2f}A)'
+
+    def _apply_accel(self):
+        """축별 가감속을 `/motor_accel` 로 보낸다 (모터 ID 는 axes.yaml 에서 온다)."""
+        self._accel_timer.cancel()
+        g = self.get_parameter
+        for name in AXES + ('yaw',):
+            try:
+                v = float(g(f'accel_dpss_{name}').value)
+            except Exception:
+                continue
+            mid = (self.ax.get(name) or {}).get('motor')
+            if v <= 0 or not mid:
+                continue
+            self.accel_pub.publish(String(data=f'{mid} {int(v)}'))
+            self.get_logger().info(f"{name} 가감속 {int(v)} dps/s 요청 ({mid})")
 
     def _axis_armed(self, name):
         """그 축의 브레이크 해제가 확인됐는가. **축별로 본다.**
