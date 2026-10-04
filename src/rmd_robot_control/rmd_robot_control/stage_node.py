@@ -116,6 +116,17 @@ class StageNode(Node):
         #   한 점 41초 중 Z 하강·상승이 32초). `move_speed_mm_s` 를 0 보다 크게
         #   주면 축마다 환산해 **세 축을 같은 선속도**로 맞춘다.
         self.declare_parameter('move_speed_mm_s', 0.0)
+        # ⚠⚠ **축별로 달라야 한다.** 2026-10-04 실측:
+        #   · X·Y 는 80mm/s 까지 올려도 전류가 4.45→4.72A 로 거의 안 늘고
+        #     도달오차도 ≤0.89mm 다 (속도가 아니라 정지마찰·하중이 전류를 정한다).
+        #   · Z 는 행정이 80mm 뿐이라 **설정을 올려도 안 빨라진다** — 30 에서
+        #     11.4mm/s, 60 에서 10.3mm/s 로 가속 한계다.
+        #   · 그런데 **속도를 올리면 충돌이 세진다** — 같은 접촉인데 30mm/s 에서
+        #     4.67A, 60mm/s 에서 5.93A 였다. Z 는 교차점이 아닌 곳에서 철근을
+        #     찍는 축이라 느린 쪽이 안전하다.
+        self.declare_parameter('move_speed_mm_s_x', 0.0)   # 0 = 공통값 사용
+        self.declare_parameter('move_speed_mm_s_y', 0.0)
+        self.declare_parameter('move_speed_mm_s_z', 0.0)
         # 환산한 dps 의 상한. Z 는 mm/도가 가장 촘촘해서(0.0906) 같은 mm/s 에
         # 가장 큰 dps 를 요구한다 — 상한이 없으면 Z 만 과속한다.
         self.declare_parameter('max_speed_dps', 150.0)
@@ -135,13 +146,45 @@ class StageNode(Node):
         self.declare_parameter('collide_current_a_x', 0.0)      # 0 = 공통값 사용
         self.declare_parameter('collide_current_a_y', 0.0)
         self.declare_parameter('collide_current_a_z', 0.0)
-        self.declare_parameter('collide_samples', 3)       # 연속 표본
+        self.declare_parameter('collide_samples', 3)       # 절대 문턱용 연속 표본
+        # ── 상승분 감지 ────────────────────────────────────────────────────
+        # ⚠⚠ **절대 문턱만 보면 늦다.** 2026-10-04 실측: 접촉 후 전류가
+        #   1.19 → 2.03A 로 오르는 데 250ms, 거기서 문턱 2.5A 를 3표본 연속
+        #   넘는 데 100ms 가 더 걸렸다 — 상승이 거의 끝날 때까지 기다린 것이다.
+        #   접촉은 **급히** 오르고 정상 주행의 변동은 느리다. 그래서 이동 중
+        #   전류의 느린 평균(기준선)을 따라가며 그보다 `rise` 만큼 튀면 끊는다.
+        #   절대 문턱은 **느린 접촉**(기준선이 같이 올라가는 경우)용 백스톱이다.
+        # 실측 정상 변동폭(2026-10-04) 위로 잡아야 한다 — Z 하강은 중력으로
+        # 내려가서 전류가 0 근처에서 튀고 폭이 0.9A 다 (평균 0.4 · 최대 1.3A).
+        # X 는 평균 3.9 · 최대 4.7A 로 폭이 0.8A 다.
+        self.declare_parameter('collide_rise_a', 1.2)
+        self.declare_parameter('collide_rise_a_x', 0.0)    # 0 = 공통값
+        self.declare_parameter('collide_rise_a_y', 0.0)
+        self.declare_parameter('collide_rise_a_z', 0.0)
+        self.declare_parameter('collide_rise_samples', 2)
+        # 기준선 시간상수. 짧으면 기준선이 접촉을 따라가 버리고, 길면 가속
+        # 전류를 오래 물고 있어 헛걸린다.
+        self.declare_parameter('collide_base_tau_sec', 0.6)
+        # ⚠⚠ **내려갈 때만 보는 축.** 2026-10-04: Z 를 올릴 때도 감지가 걸려
+        #   결속점 3개가 전부 실패했다. 위에는 부딪힐 것이 없고, 건이 철근에
+        #   걸려 빠져나올 때 전류가 오르는 것은 정상이다. 보호의 목적은
+        #   **교차점이 아닌 곳으로 내려가 철근을 찍는 것**을 막는 것이다.
+        self.declare_parameter('collide_down_only_axes', ['z'])
         self.declare_parameter('collide_backoff_mm', 15.0)
         # 기동 직후에는 가속 전류가 뜬다 — 그 구간은 보지 않는다
         self.declare_parameter('collide_grace_sec', 0.7)
         self.declare_parameter('tolerance_mm', 1.0)
         self.declare_parameter('move_timeout_sec', 30.0)
-        self.declare_parameter('arm_sec', 1.0)        # 브레이크 해제 후 대기
+        # ⚠ **브레이크 해제 확인이 오면 바로 출발한다.** 이 값은 확인이 안 올 때의
+        #   한계시간이다 (옛 동작은 늘 이만큼 기다렸다). 한 점에 구간이 셋이라
+        #   (XY·Z하강·Z상승) 고정 1초면 점당 3초가 순수 대기였고, 동작이 뚝뚝
+        #   끊겨 보이는 주된 원인이었다 (2026-10-04 사용자 지적).
+        self.declare_parameter('arm_sec', 1.0)
+        # 도착해도 **곧바로 잠그지 않는** 축. 다음 구간이 바로 오면 해제 대기가
+        # 아예 없어진다. ⚠ Z 는 넣지 않는다 — 리프팅축이라 자중 낙하한다
+        # (브레이크 해제 시 출력축 12.7° 낙하 실측). yaw 도 빼 둔다.
+        self.declare_parameter('brake_hold_axes', ['x', 'y'])
+        self.declare_parameter('brake_hold_sec', 2.5)
         # 중재기에서 권한을 받기까지 기다리는 시간. ⚠ 0 이면 **요청 직후 50ms 에**
         # "권한 없음" 으로 판단해 중단한다 — 리모콘을 쓴 뒤에는 모드가 manual 로
         # 돌아가 있어 항상 그렇게 된다 (2026-10-04 에 yaw 회전이 그래서 죽었다).
@@ -154,12 +197,23 @@ class StageNode(Node):
         g = self.get_parameter
         self.speed = float(g('move_speed_dps').value)
         self.speed_mm_s = float(g('move_speed_mm_s').value)
+        self.speed_ax = {ax: float(g(f'move_speed_mm_s_{ax}').value)
+                         for ax in ('x', 'y', 'z')}
         self.max_dps = float(g('max_speed_dps').value)
         self.hit_on = bool(g('collide_detect').value)
         self.hit_a = float(g('collide_current_a').value)
         self.hit_a_ax = {ax: float(g(f'collide_current_a_{ax}').value)
                          for ax in ('x', 'y', 'z')}
         self.hit_n = int(g('collide_samples').value)
+        self.rise_a = float(g('collide_rise_a').value)
+        self.rise_ax = {ax: float(g(f'collide_rise_a_{ax}').value)
+                        for ax in ('x', 'y', 'z')}
+        self.rise_n = int(g('collide_rise_samples').value)
+        self.base_tau = float(g('collide_base_tau_sec').value)
+        self.down_only = tuple(g('collide_down_only_axes').value or ())
+        self.base_a = {}           # 축 → 전류 기준선(A). 이동 중에만 갱신한다
+        self.rise_cnt = {}         # 축 → 상승분 초과 연속 횟수
+        self._base_t = {}          # 축 → 기준선 갱신 시각
         self.hit_back = float(g('collide_backoff_mm').value)
         self.hit_grace = float(g('collide_grace_sec').value)
         self.cur_a = {}            # 축 → 최근 전류(A). 표본이 없으면 키가 없다
@@ -168,6 +222,10 @@ class StageNode(Node):
         self.tol_mm = float(g('tolerance_mm').value)
         self.timeout = float(g('move_timeout_sec').value)
         self.arm_sec = float(g('arm_sec').value)
+        self.hold_axes = tuple(g('brake_hold_axes').value or ())
+        self.hold_sec = float(g('brake_hold_sec').value)
+        self.brake_rel = {}        # 축 → 브레이크 해제 확인 (None = 모름)
+        self._lock_at = {}         # 축 → 이 시각 뒤에 잠근다 (유예 중)
         self.grant_wait = float(g('grant_wait_sec').value)
         self.enforce = bool(g('enforce_envelope').value)
         self.yaw_speed = float(g('yaw_speed_dps').value)
@@ -223,6 +281,12 @@ class StageNode(Node):
         self._homing_state = None       # 전이 판정용 (None = 아직 못 봤다)
         self.ready_pose = load_ready_yaw_pose()
         self.yaw_brake = None           # 0x9A DATA[3] — 해제 확인 전엔 안 움직인다
+        for _n, _c in self.ax.items():
+            if _c.get('motor'):
+                self.create_subscription(
+                    Bool, f"/motor_{_c['motor']}/brake",
+                    (lambda k: (lambda m: self.brake_rel.__setitem__(
+                        k, bool(m.data))))(_n), 10)
         yaw_mid = load_axis_motor_ids(('yaw',)).get('yaw')
         if yaw_mid:
             self.create_subscription(
@@ -269,6 +333,8 @@ class StageNode(Node):
         self.detail = '대기'
 
         self.create_timer(0.05, self.tick)
+        # 유예가 끝난 축의 브레이크를 잠근다 (`brake_hold_axes`)
+        self.create_timer(0.2, self._lock_tick)
         self.create_timer(0.5, self._publish_status)
         self.get_logger().info(
             "스테이지 노드 시작 — /stage/goal (mm) 로 목표를 준다. "
@@ -625,17 +691,24 @@ class StageNode(Node):
         g = self.get_parameter
         self.speed = float(g('move_speed_dps').value)
         self.speed_mm_s = float(g('move_speed_mm_s').value)
+        self.speed_ax = {ax: float(g(f'move_speed_mm_s_{ax}').value)
+                         for ax in ('x', 'y', 'z')}
         self.max_dps = float(g('max_speed_dps').value)
         self.timeout = float(g('move_timeout_sec').value)
         self.hit_on = bool(g('collide_detect').value)
         self.hit_a = float(g('collide_current_a').value)
         self.hit_a_ax = {ax: float(g(f'collide_current_a_{ax}').value)
                          for ax in ('x', 'y', 'z')}
+        self.rise_a = float(g('collide_rise_a').value)
+        self.rise_ax = {ax: float(g(f'collide_rise_a_{ax}').value)
+                        for ax in ('x', 'y', 'z')}
 
         self.target = want
         self.target_unit = unit
         self.t_start = time.time()
         self.t_arm = time.time()
+        for name in want:
+            self._lock_at.pop(name, None)      # 유예 중이면 취소 — 계속 쓴다
         self.moving = True
         self.detail = '브레이크 해제 대기'
         for name in want:
@@ -656,7 +729,7 @@ class StageNode(Node):
             return '안전 입력 두절'
         return None
 
-    def _hit(self, name):
+    def _hit(self, name, err=None):
         """그 축이 **무언가에 닿았는가.** 전류가 문턱을 연속으로 넘으면 참.
 
         ⚠ 전류 표본은 `0xA4` 응답으로만 온다 — 명령을 보내는 동안만 갱신된다.
@@ -666,16 +739,51 @@ class StageNode(Node):
         """
         if not self.hit_on or self.retreating is not None:
             return False
+        # 내려갈 때만 보는 축 — 올라가는 중이면 판정하지 않는다. 기준선도
+        # 쌓지 않는다 (상승 전류가 섞이면 다음 하강 판정이 틀어진다).
+        if name in self.down_only and err is not None and err > 0:
+            self.rise_cnt[name] = 0
+            self.hit_cnt[name] = 0
+            return False
         if time.time() - self.t_arm < self.arm_sec + self.hit_grace:
             return False
         a = self.cur_a.get(name)
         if a is None:
             return False
-        if abs(a) < self._hit_limit(name):
+        a = abs(a)
+        rise = self._rise_limit(name)
+        base = self.base_a.get(name)
+        # 기준선은 **튀지 않는 동안만** 갱신한다 — 접촉을 따라가면 감지가 죽는다
+        now = time.time()
+        dt = now - self._base_t.get(name, now)
+        self._base_t[name] = now
+        if base is None:
+            self.base_a[name] = a
+        elif a < base + rise * 0.5:
+            k = min(1.0, dt / max(self.base_tau, 1e-3))
+            self.base_a[name] = base + (a - base) * k
+        # 1) 상승분 — 접촉은 급히 오른다
+        if base is not None and a - base >= rise:
+            self.rise_cnt[name] = self.rise_cnt.get(name, 0) + 1
+            if self.rise_cnt[name] >= self.rise_n:
+                self.hit_why = (f'상승 {a - base:+.2f}A '
+                                f'(기준선 {base:.2f} → {a:.2f}A)')
+                return True
+        else:
+            self.rise_cnt[name] = 0
+        # 2) 절대 문턱 — 느린 접촉용 백스톱
+        if a < self._hit_limit(name):
             self.hit_cnt[name] = 0
             return False
         self.hit_cnt[name] = self.hit_cnt.get(name, 0) + 1
-        return self.hit_cnt[name] >= self.hit_n
+        if self.hit_cnt[name] >= self.hit_n:
+            self.hit_why = f'절대 {a:.2f}A (문턱 {self._hit_limit(name):.1f}A)'
+            return True
+        return False
+
+    def _rise_limit(self, name):
+        """그 축의 상승분 문턱(A). 축별 값이 0 이면 공통값을 쓴다."""
+        return self.rise_ax.get(name) or self.rise_a
 
     def _hit_limit(self, name):
         """그 축의 충돌 문턱(A). 축별 값이 0 이면 공통값을 쓴다."""
@@ -704,12 +812,46 @@ class StageNode(Node):
             lo, hi = r[name]
             back = min(max(back, lo), hi)
         self.hit_cnt[name] = 0
+        self.rise_cnt[name] = 0
         self.retreating = name
         self.get_logger().error(
-            f"충돌 감지 — {name} 전류 {a:.2f}A (문턱 {self._hit_limit(name):.1f}A, "
-            f"{self.hit_n}회 연속). 이동 취소하고 {cur:.1f} → {back:.1f}mm 로 후퇴")
+            f"충돌 감지 — {name} {getattr(self, 'hit_why', f'{a:.2f}A')}. "
+            f"이동 취소하고 {cur:.1f} → {back:.1f}mm 로 후퇴")
         self._begin({name: back}, 'mm')
         self.detail = f'충돌 후퇴 — {name} {back:.1f}mm (전류 {a:.2f}A)'
+
+    def _armed(self):
+        """목표 축들의 브레이크 해제가 확인됐는가.
+
+        확인이 오면 **즉시** 참이다. 확인이 안 오는 축(브레이크 토픽이 없거나
+        늦는 경우)은 `arm_sec` 이 지나면 통과시킨다 — 옛 동작과 같은 최악값이다.
+        """
+        if time.time() - self.t_arm >= self.arm_sec:
+            return True
+        return all(self.brake_rel.get(n) for n in self.target)
+
+    def _lock_later(self, name):
+        """도착한 축의 브레이크를 잠근다. `brake_hold_axes` 는 유예를 둔다.
+
+        유예를 두는 이유: 다음 구간이 바로 오면 해제 대기가 아예 없어져 동작이
+        이어진다. ⚠ Z 는 유예를 주면 그 사이 자중으로 내려간다.
+        """
+        if name in self.hold_axes and self.hold_sec > 0:
+            self._lock_at[name] = time.time() + self.hold_sec
+        else:
+            self._lock_at.pop(name, None)
+            self._brake('lock', name)
+
+    def _lock_tick(self):
+        """유예가 끝난 축을 잠근다. 움직이는 축은 건드리지 않는다."""
+        now = time.time()
+        for name, t in list(self._lock_at.items()):
+            if name in self.target:
+                self._lock_at.pop(name, None)      # 다시 쓰고 있다
+                continue
+            if now >= t:
+                self._lock_at.pop(name, None)
+                self._brake('lock', name)
 
     def _speed_for(self, name):
         """그 축에 보낼 최대속도(모터축 dps).
@@ -718,12 +860,13 @@ class StageNode(Node):
         mm/도가 달라서 같은 dps 로는 Z 가 X 의 1/3 속도가 된다. 환산값은
         `max_speed_dps` 로 자른다.
         """
-        if self.speed_mm_s <= 0:
+        mm_s = self.speed_ax.get(name) or self.speed_mm_s
+        if mm_s <= 0:
             return self.speed
         mmpd = (self.ax.get(name) or {}).get('mm_per_deg')
         if not mmpd:
             return self.speed            # 환산값이 없는 축(yaw)은 그대로
-        return min(self.speed_mm_s / mmpd, self.max_dps)
+        return min(mm_s / mmpd, self.max_dps)
 
     def _blocked(self, name, direction):
         s = self.safety
@@ -757,12 +900,16 @@ class StageNode(Node):
     def _stop(self, reason):
         self.retreating = None
         self.hit_cnt.clear()
+        self.rise_cnt.clear()
+        # 기준선은 이동마다 새로 잡는다 — 축마다·방향마다 정상 전류가 다르다
+        self.base_a.clear()
+        self._base_t.clear()
         if self.yaw_moving:
             return self._yaw_done(reason)
         for name in list(self.target):
             self.spd_pubs[name].publish(Float32(data=0.0))
         for name in list(self.target):
-            self._brake('lock', name)
+            self._lock_later(name)
         if self.moving:
             self.get_logger().info(f"이동 종료 — {reason}")
         self.moving = False
@@ -787,8 +934,9 @@ class StageNode(Node):
         if time.time() - self.t_start > self.timeout:
             return self._stop(f"타임아웃 {self.timeout:.0f}s")
 
-        # 브레이크 해제가 명령보다 먼저 도착해야 한다 (homing_node 와 같은 이유)
-        if time.time() - self.t_arm < self.arm_sec:
+        # 브레이크 해제가 명령보다 먼저 도착해야 한다 (homing_node 와 같은 이유).
+        # **확인이 오면 바로 출발한다** — 고정 대기는 확인이 안 올 때의 한계다.
+        if not self._armed():
             for name in self.target:
                 self._brake('release', name)
             return
@@ -812,14 +960,14 @@ class StageNode(Node):
                 self.get_logger().warning(f"{name}: 안전 차단으로 그 방향 이동 불가")
                 done.append(name)
                 continue
-            if self._hit(name):
+            if self._hit(name, err):
                 return self._retreat(name, err)
             self.pos_pubs[name].publish(
                 Float64MultiArray(data=[goal_deg, self._speed_for(name)]))
 
         for name in done:
             self.spd_pubs[name].publish(Float32(data=0.0))
-            self._brake('lock', name)
+            self._lock_later(name)
             self.target.pop(name, None)
         if not self.target:
             self._stop('목표 도달')
