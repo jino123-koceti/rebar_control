@@ -110,6 +110,35 @@ class StageNode(Node):
         super().__init__('stage_node')
 
         self.declare_parameter('move_speed_dps', 30.0)
+        # ⚠ **같은 dps 는 축마다 다른 mm/s 다** — 감속비가 다르다
+        #   (X 0.2906 / Y 0.2227 / Z 0.0906 mm/도). 60dps 면 X 17.4 · Y 13.4 ·
+        #   **Z 5.4** mm/s 가 되어 Z 가 사이클 시간을 지배했다 (2026-10-04 실측:
+        #   한 점 41초 중 Z 하강·상승이 32초). `move_speed_mm_s` 를 0 보다 크게
+        #   주면 축마다 환산해 **세 축을 같은 선속도**로 맞춘다.
+        self.declare_parameter('move_speed_mm_s', 0.0)
+        # 환산한 dps 의 상한. Z 는 mm/도가 가장 촘촘해서(0.0906) 같은 mm/s 에
+        # 가장 큰 dps 를 요구한다 — 상한이 없으면 Z 만 과속한다.
+        self.declare_parameter('max_speed_dps', 150.0)
+        # ── 충돌 감지 ──────────────────────────────────────────────────────
+        # 교차점이 아닌 곳에서 Z 를 내리면 건이 **철근을 찍는다.** 작업영역
+        # 검사(X·Y)로는 막을 수 없다 — 작업영역 안이어도 그 자리에 철근이 있다.
+        # 그래서 전류가 뛰면 이동을 **취소하고 반대 방향으로 물러난다.**
+        # ⚠ 전류는 `0xA4` 응답에 실려 오므로 **명령을 보내는 동안만** 갱신된다.
+        #   표본이 안 오면 판정하지 않는다 (없는 것을 0 으로 보면 안 된다).
+        self.declare_parameter('collide_detect', True)
+        # ⚠⚠ **문턱은 축마다 달라야 한다.** 2026-10-04 에 Z 기준 3.0A 를 세 축에
+        #   같이 썼더니 X 가 정상 이동에서 헛걸렸다 — 실측 정상 이동 전류가
+        #   X 최대 3.09A·평균 2.66A, Z 최대 1.87A·평균 0.72A 로 3배 넘게 다르다
+        #   (X 는 행정이 길고 질량이 크다). 속도를 올리면 전류도 오르므로
+        #   **최종 속도에서 다시 재서** 넣어야 한다.
+        self.declare_parameter('collide_current_a', 3.0)        # 축별 값이 없을 때
+        self.declare_parameter('collide_current_a_x', 0.0)      # 0 = 공통값 사용
+        self.declare_parameter('collide_current_a_y', 0.0)
+        self.declare_parameter('collide_current_a_z', 0.0)
+        self.declare_parameter('collide_samples', 3)       # 연속 표본
+        self.declare_parameter('collide_backoff_mm', 15.0)
+        # 기동 직후에는 가속 전류가 뜬다 — 그 구간은 보지 않는다
+        self.declare_parameter('collide_grace_sec', 0.7)
         self.declare_parameter('tolerance_mm', 1.0)
         self.declare_parameter('move_timeout_sec', 30.0)
         self.declare_parameter('arm_sec', 1.0)        # 브레이크 해제 후 대기
@@ -124,6 +153,18 @@ class StageNode(Node):
 
         g = self.get_parameter
         self.speed = float(g('move_speed_dps').value)
+        self.speed_mm_s = float(g('move_speed_mm_s').value)
+        self.max_dps = float(g('max_speed_dps').value)
+        self.hit_on = bool(g('collide_detect').value)
+        self.hit_a = float(g('collide_current_a').value)
+        self.hit_a_ax = {ax: float(g(f'collide_current_a_{ax}').value)
+                         for ax in ('x', 'y', 'z')}
+        self.hit_n = int(g('collide_samples').value)
+        self.hit_back = float(g('collide_backoff_mm').value)
+        self.hit_grace = float(g('collide_grace_sec').value)
+        self.cur_a = {}            # 축 → 최근 전류(A). 표본이 없으면 키가 없다
+        self.hit_cnt = {}          # 축 → 문턱 초과 연속 횟수
+        self.retreating = None     # 후퇴 중인 축 (그 동안 다시 판정하지 않는다)
         self.tol_mm = float(g('tolerance_mm').value)
         self.timeout = float(g('move_timeout_sec').value)
         self.arm_sec = float(g('arm_sec').value)
@@ -193,6 +234,15 @@ class StageNode(Node):
             self.create_subscription(
                 Bool, f"/motor_{yaw_mid}/brake",
                 lambda m: setattr(self, 'yaw_brake', m.data), 10)
+        for _n, _c in self.ax.items():
+            if _c.get('motor') and _c.get('mm_per_deg'):
+                self.create_subscription(
+                    # ⚠ `motor` 는 이미 "0x147" 꼴의 **문자열**이다 (axis_config
+                    #   가 그렇게 만든다) — hex() 를 씌우면 TypeError 로 노드가
+                    #   아예 못 뜬다. 위 위치 토픽도 같은 형식을 쓴다.
+                    Float32, f"/motor_{_c['motor']}/current",
+                    (lambda nm: (lambda m: self.cur_a.__setitem__(nm, float(m.data))))(_n),
+                    10)
         self.create_subscription(Int32, '/stage/yaw_pose', self._on_yaw_pose, 10)
         # 사람이 "지금 눈으로 보니 N번 자세다" 를 알려주는 경로. 재시작으로 기준점을
         # 잃었을 때 재호밍(64초) 없이 복구한다. ⚠ 사람이 틀리면 그대로 틀린다 —
@@ -574,7 +624,13 @@ class StageNode(Node):
         # 인자를 다시 쓴다). 이동마다 다시 읽어 `ros2 param set` 으로 조정 가능하게.
         g = self.get_parameter
         self.speed = float(g('move_speed_dps').value)
+        self.speed_mm_s = float(g('move_speed_mm_s').value)
+        self.max_dps = float(g('max_speed_dps').value)
         self.timeout = float(g('move_timeout_sec').value)
+        self.hit_on = bool(g('collide_detect').value)
+        self.hit_a = float(g('collide_current_a').value)
+        self.hit_a_ax = {ax: float(g(f'collide_current_a_{ax}').value)
+                         for ax in ('x', 'y', 'z')}
 
         self.target = want
         self.target_unit = unit
@@ -599,6 +655,75 @@ class StageNode(Node):
         if s.inputs_stale:
             return '안전 입력 두절'
         return None
+
+    def _hit(self, name):
+        """그 축이 **무언가에 닿았는가.** 전류가 문턱을 연속으로 넘으면 참.
+
+        ⚠ 전류 표본은 `0xA4` 응답으로만 온다 — 명령을 보내는 동안만 갱신된다.
+          표본이 아예 없으면 **판정하지 않는다** (없는 것을 0 으로 보면 보호가
+          조용히 꺼진 것과 같다).
+        ⚠ 기동 직후 `collide_grace_sec` 은 보지 않는다 — 가속 전류가 뜬다.
+        """
+        if not self.hit_on or self.retreating is not None:
+            return False
+        if time.time() - self.t_arm < self.arm_sec + self.hit_grace:
+            return False
+        a = self.cur_a.get(name)
+        if a is None:
+            return False
+        if abs(a) < self._hit_limit(name):
+            self.hit_cnt[name] = 0
+            return False
+        self.hit_cnt[name] = self.hit_cnt.get(name, 0) + 1
+        return self.hit_cnt[name] >= self.hit_n
+
+    def _hit_limit(self, name):
+        """그 축의 충돌 문턱(A). 축별 값이 0 이면 공통값을 쓴다."""
+        return self.hit_a_ax.get(name) or self.hit_a
+
+    def _retreat(self, name, err):
+        """충돌 — 이동을 **전부 취소하고** 그 축만 반대 방향으로 물러난다.
+
+        err = 목표 − 현재 이므로 가던 방향은 sign(err) 다. 반대로 `backoff` 만큼
+        간다. 작업영역 밖으로 나가지 않게 자른다 (Z 는 작업영역 표가 없다).
+        """
+        a = self.cur_a.get(name)
+        cur = self.mm_of(name)
+        self.rejects += 1
+        for n2 in list(self.target):
+            self.spd_pubs[n2].publish(Float32(data=0.0))
+        self.target.clear()
+        if cur is None:
+            self._brake('lock', name)
+            self.detail = f'충돌: {name} 전류 {a:.2f}A — 현재 위치를 몰라 후퇴 못 함'
+            self.get_logger().error(self.detail)
+            return self._stop(self.detail)
+        back = cur - math.copysign(self.hit_back, err)
+        r, _why = envelope_for(self.env, self.cur_pose()[0])
+        if r and name in r:
+            lo, hi = r[name]
+            back = min(max(back, lo), hi)
+        self.hit_cnt[name] = 0
+        self.retreating = name
+        self.get_logger().error(
+            f"충돌 감지 — {name} 전류 {a:.2f}A (문턱 {self._hit_limit(name):.1f}A, "
+            f"{self.hit_n}회 연속). 이동 취소하고 {cur:.1f} → {back:.1f}mm 로 후퇴")
+        self._begin({name: back}, 'mm')
+        self.detail = f'충돌 후퇴 — {name} {back:.1f}mm (전류 {a:.2f}A)'
+
+    def _speed_for(self, name):
+        """그 축에 보낼 최대속도(모터축 dps).
+
+        `move_speed_mm_s` 가 0 보다 크면 **선속도 기준**으로 환산한다 — 축마다
+        mm/도가 달라서 같은 dps 로는 Z 가 X 의 1/3 속도가 된다. 환산값은
+        `max_speed_dps` 로 자른다.
+        """
+        if self.speed_mm_s <= 0:
+            return self.speed
+        mmpd = (self.ax.get(name) or {}).get('mm_per_deg')
+        if not mmpd:
+            return self.speed            # 환산값이 없는 축(yaw)은 그대로
+        return min(self.speed_mm_s / mmpd, self.max_dps)
 
     def _blocked(self, name, direction):
         s = self.safety
@@ -630,6 +755,8 @@ class StageNode(Node):
         return (time.time() - self.t_start) < self.grant_wait
 
     def _stop(self, reason):
+        self.retreating = None
+        self.hit_cnt.clear()
         if self.yaw_moving:
             return self._yaw_done(reason)
         for name in list(self.target):
@@ -685,7 +812,10 @@ class StageNode(Node):
                 self.get_logger().warning(f"{name}: 안전 차단으로 그 방향 이동 불가")
                 done.append(name)
                 continue
-            self.pos_pubs[name].publish(Float64MultiArray(data=[goal_deg, self.speed]))
+            if self._hit(name):
+                return self._retreat(name, err)
+            self.pos_pubs[name].publish(
+                Float64MultiArray(data=[goal_deg, self._speed_for(name)]))
 
         for name in done:
             self.spd_pubs[name].publish(Float32(data=0.0))

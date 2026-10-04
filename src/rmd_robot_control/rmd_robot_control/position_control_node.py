@@ -382,6 +382,18 @@ class PositionControlNode(Node):
         # (2026-10-03 에 yaw 를 27.6° 틀리게 봤다). 0x61 응답에 멀티턴이 이미
         # 들어 있으므로 CAN 트래픽이 늘지 않는다. 전원마다 영점이 달라 **절대값은
         # 세션 한정**이지만, 기준점과의 **차이**는 그 안에서 정확하다.
+        # 토크전류(A). **이미 파싱해 쓰는 값을 그대로 내보낸다** — 0xA4/0xA2
+        # 응답에 온도·전류·속도가 실려 오므로 CAN 트래픽이 늘지 않는다.
+        # ⚠ `/motor_status` 로도 나가지만 그건 **모터당 5필드를 이어붙인 배열**이라
+        #   `motor_ids` 순서를 알아야 집을 수 있다 (2026-10-04 에 0x141 부터로
+        #   가정해 두 칸 틀렸고, Z 전류를 0 으로 오진했다). 축별 소비자는 이
+        #   토픽을 쓴다.
+        # ⚠ 0x145(X) 는 온도 필드가 0xEC 고정인 불량 개체다 — 전류는 쓸 수 있으나
+        #   0.9A 오프셋이 있다. 절대값보다 **증가분**으로 판단해야 한다.
+        self.current_pubs = {
+            mid: self.create_publisher(Float32, f"motor_{hex(mid)}/current", 10)
+            for mid in self.motor_ids
+            if mid not in (self.left_motor_id, self.right_motor_id)}
         self.encoder_multi_pubs = {
             mid: self.create_publisher(Int32, f"motor_{hex(mid)}/encoder_multi", 10)
             for mid in self.motor_ids}
@@ -1856,6 +1868,11 @@ class PositionControlNode(Node):
                                     self.get_logger().warning(f"0x{motor_id:03X} 위치 발행 오류: {pub_error}")
                     self.motor_states[motor_id]['velocity'] = float(speed)
                     self.motor_states[motor_id]['torque'] = current
+                    cpub = self.current_pubs.get(motor_id)
+                    if cpub is not None:
+                        cm = Float32()
+                        cm.data = float(current)
+                        cpub.publish(cm)
 
                     # 전류 보호 체크
                     safety_level = self.check_motor_current_safety(motor_id, current, temperature)
