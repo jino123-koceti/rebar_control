@@ -44,8 +44,20 @@
         /tying/abort      std_msgs/Empty  중단 전파
         /plan/status      String(JSON)    계획·진행·사유
 
+## 흐름
+
+    ready → detect → (plan) → run(점마다) → park → done
+
+**시작과 끝이 모두 검출 자세다** (`park_pose` = 1번, X 뺀 상태, Z 올림). 주행과
+이어지기 위한 것이다 — 다음 웨이포인트에 도착하면 곧바로 검출·결속으로 들어갈 수
+있게 끝 상태를 늘 같게 만든다 (사용자 지정, 2026-10-04).
+
 ⚠ 검출은 **X 를 뺀 상태**에서 해야 한다. X 가 380mm 를 넘으면 건이 카메라를
-가린다 (2026-10-04 실측: X 395mm 에서 검출 2개, 389mm 에서 0개).
+가린다 (2026-10-04 실측: X 395mm 에서 검출 2개, 389mm 에서 0개). 문서에만 적어
+두었더니 X 273mm·Z -77mm 에서 검출해 6점이 3점으로 줄었다 — 이제 코드가 지킨다.
+
+⚠ 검출 자세로 가는 것도 **`tying_sequence` 를 쓴다.** 축에 직접 명령하지 않는다 —
+회전 안전창 검사(지나가는 자세들의 교집합)가 거기에 들어 있다.
 """
 
 import json
@@ -113,13 +125,20 @@ class TyingPlanner(Node):
         # ⚠⚠ **검출 자세를 코드가 지킨다.** 건이 내려가 있거나 X 가 앞으로
         #   나와 있으면 건이 카메라를 가려 먼 교차점이 안 잡힌다. 2026-10-04 에
         #   X 273mm·Z -77mm 에서 검출해 8점 중 3점만 계획됐다 — 문서에만 적어
-        #   두었더니 그대로 당했다. 그래서 검출 전에 **직접 빼낸다.**
+        #   두었더니 그대로 당했다. 그래서 검출 전에 반드시 검출 자세로 간다.
+        #   Z 올림은 `tying_sequence` 의 `z_safe_mm` 이 맡는다 — 회전·이동 전에
+        #   Z 를 올리는 것이 거기 들어 있다.
         self.declare_parameter('detect_x_mm', 0.0)
-        self.declare_parameter('detect_z_mm', 0.0)
-        self.declare_parameter('detect_tol_mm', 5.0)
+        # 검출 자세의 Y. **네 자세 모두에서 닿는 값**이어야 한다 — 교집합이
+        # 64.2~275.1mm 라 175 는 중앙 쯤이다. 호밍이 Y 174.4 로 끝나는 것과도 맞다.
+        self.declare_parameter('detect_y_mm', 175.0)
+        # 검출·종료 자세. **주행과 이어지려면 끝 상태가 늘 같아야 한다** —
+        # 다음 웨이포인트에 도착하면 곧바로 검출·결속으로 들어갈 수 있게
+        # 1번 자세·X 뺀 상태로 끝낸다 (사용자 지정, 2026-10-04).
+        self.declare_parameter('park_pose', 1)
         self.detect_x = float(self.get_parameter('detect_x_mm').value)
-        self.detect_z = float(self.get_parameter('detect_z_mm').value)
-        self.detect_tol = float(self.get_parameter('detect_tol_mm').value)
+        self.detect_y = float(self.get_parameter('detect_y_mm').value)
+        self.park_pose = int(self.get_parameter('park_pose').value)
         self.wait_sec = float(self.get_parameter('detect_wait_sec').value)
         self.pt_timeout = float(self.get_parameter('point_timeout_sec').value)
         self.min_conf = float(self.get_parameter('min_confidence').value)
@@ -129,11 +148,6 @@ class TyingPlanner(Node):
         self.model = self._load_model(str(self.get_parameter('model_yaml').value))
 
         self.detect_pub = self.create_publisher(Empty, '/rebar/detect', 10)
-        # ⚠ L5 가 L3 에 직접 명령하는 **유일한 경우**다. 검출 자세로 빼내는
-        #   것은 결속 지점 이동이 아니라서 `tying_sequence` 의 일이 아니고,
-        #   이 노드만이 "이제 검출한다" 를 안다. 시퀀스가 멈춰 있을 때만
-        #   보내므로 두 commander 가 겹치지 않는다.
-        self.stage_pub = self.create_publisher(Point, '/stage/goal', 10)
         self.pose_pub = self.create_publisher(Int32, '/tying/goal_pose', 10)
         self.goal_pub = self.create_publisher(Point, '/tying/goal', 10)
         self.abort_pub = self.create_publisher(Empty, '/tying/abort', 10)
@@ -223,10 +237,7 @@ class TyingPlanner(Node):
         self.grid = None
         self._sent = 0.0
         self.phase, self.t_phase = 'ready', time.time()
-        self.detail = '검출 자세로 빼내는 중'
-        self.get_logger().info(
-            f'[ready] 검출 자세로 — X {self.detect_x:.0f}mm, Z {self.detect_z:.0f}mm '
-            f'(건이 카메라를 가리면 먼 교차점이 안 잡힌다)')
+        self.detail = '검출 자세로'
         self._publish()
 
     def _fail(self, why):
@@ -249,41 +260,87 @@ class TyingPlanner(Node):
             return self._stop('안전 정지')
         if self.phase == 'ready':
             return self._do_ready()
+        if self.phase == 'park':
+            return self._do_park()
         if self.phase == 'detect':
             return self._do_detect()
         self._do_run()
 
+    def _send_seq(self, x, y, pose, z=None):
+        """`tying_sequence` 에 목표를 보낸다. 자세가 **먼저** 가야 한다."""
+        self._sent = time.time()
+        self._seq_seen = False
+        self.pose_pub.publish(Int32(data=int(pose)))
+        self.goal_pub.publish(Point(
+            x=float(x), y=float(y),
+            z=float('nan') if z is None else float(z)))
+
+    def _seq_state(self):
+        """시퀀스 결과 — 'done' / 'failed' / None(진행 중) / 'stuck'.
+
+        ⚠ **움직이기 시작하는 것을 먼저 본다.** 바로 `step` 을 보면 직전 명령의
+          묵은 'done' 에 걸려 도착한 줄로 안다 (2026-10-04 에 그렇게 당했다).
+        """
+        step = (self.seq or {}).get('step')
+        if not self._seq_seen:
+            if step not in (None, 'idle', 'done', 'failed'):
+                self._seq_seen = True
+            elif time.time() - self._sent > 5.0:
+                return 'stuck'
+            return None
+        return step if step in ('done', 'failed') else None
+
     def _do_ready(self):
-        """검출 자세로 빼낸다 — 건이 카메라를 가리지 않는 X·Z."""
-        m = (self.stage or {}).get('current_mm') or {}
-        x, z = m.get('x'), m.get('z')
-        if x is None or z is None:
-            if time.time() - self.t_phase > 10.0:
-                return self._fail('/stage/status 에 X·Z 가 없다 — 호밍했는가')
-            return
-        if abs(x - self.detect_x) <= self.detect_tol \
-                and abs(z - self.detect_z) <= self.detect_tol:
-            self.phase, self.t_phase = 'detect', time.time()
-            self.detail = '검출 요청'
+        """검출 자세로 — `park_pose`, X 뺀 상태, Z 올림.
+
+        `tying_sequence` 를 그대로 쓴다 (Z 올림 → XY 후퇴 → 회전 → 이동). 축에
+        직접 명령하지 않는다 — 회전 안전창 검사가 거기에 들어 있다.
+        """
+        if self._sent == 0.0:
+            if self.seq is None:
+                self.detail = '/tying/status 를 기다린다'
+                return
             self.get_logger().info(
-                f'[detect] 검출 자세 확보 (X {x:.1f}, Z {z:.1f}) — 교차점 검출 요청')
-            self.detect_pub.publish(Empty())
-            return self._publish()
-        if time.time() - self.t_phase > 90.0:
-            return self._fail(
-                f'검출 자세로 못 갔다 (X {x:.1f}→{self.detect_x:.0f}, '
-                f'Z {z:.1f}→{self.detect_z:.0f}) — stage_node 를 보라')
-        if (self.stage or {}).get('moving'):
+                f'[ready] 검출 자세로 — {pose_label(self.park_pose)}, '
+                f'X {self.detect_x:.0f} Y {self.detect_y:.0f}mm, '
+                f'Z 는 시퀀스가 올린다 (건이 카메라를 가리면 먼 교차점이 안 잡힌다)')
+            return self._send_seq(self.detect_x, self.detect_y, self.park_pose)
+        r = self._seq_state()
+        if r is None:
+            self.detail = f"검출 자세로 — {(self.seq or {}).get('detail', '')}"
             return
-        if time.time() - self._sent > 2.0:
-            self._sent = time.time()
-            # ⚠ **Z 를 먼저 올린다.** 건이 내려간 채로 X 를 빼면 철근을 긁는다
-            if abs(z - self.detect_z) > self.detect_tol:
-                self.stage_pub.publish(Point(x=NAN, y=NAN, z=self.detect_z))
-                self.detail = f'Z 를 {self.detect_z:.0f}mm 로'
-            else:
-                self.stage_pub.publish(Point(x=self.detect_x, y=NAN, z=NAN))
-                self.detail = f'X 를 {self.detect_x:.0f}mm 로'
+        if r != 'done':
+            return self._fail(
+                f"검출 자세로 못 갔다 ({r}) — {(self.seq or {}).get('detail', '')}")
+        self.phase, self.t_phase = 'detect', time.time()
+        self.detail = '검출 요청'
+        self.get_logger().info('[detect] 검출 자세 확보 — 교차점 검출 요청')
+        self.detect_pub.publish(Empty())
+        self._publish()
+
+    def _do_park(self):
+        """결속을 다 끝내고 **검출 자세로 복귀**한다.
+
+        주행과 이어지기 위한 것이다 — 다음 웨이포인트에 도착하면 곧바로
+        검출·결속으로 들어갈 수 있게 끝 상태를 늘 같게 만든다. 실패해도
+        결속 결과는 그대로 보고한다 (복귀 실패가 결속을 무효로 만들지 않는다).
+        """
+        if self._sent == 0.0:
+            self.get_logger().info(
+                f'[park] 검출 자세로 복귀 — {pose_label(self.park_pose)}, '
+                f'X {self.detect_x:.0f} Y {self.detect_y:.0f}mm')
+            return self._send_seq(self.detect_x, self.detect_y, self.park_pose)
+        r = self._seq_state()
+        if r is None:
+            self.detail = f"복귀 중 — {(self.seq or {}).get('detail', '')}"
+            return
+        ok = sum(1 for p in self.plans if p.state == '완료')
+        self.phase = 'done'
+        self.detail = (f'{ok}/{len(self.plans)}점 완료, 검출 자세 복귀'
+                       + ('' if r == 'done' else f' 실패({r})'))
+        (self.get_logger().info if r == 'done'
+         else self.get_logger().warning)(f'[done] {self.detail}')
+        self._publish()
 
     def _do_detect(self):
         if self.grid is None or self.grid_t < self.t_phase:
@@ -493,16 +550,16 @@ class TyingPlanner(Node):
     def _next(self):
         self.cur += 1
         if self.cur >= len(self.plans):
+            # 끝났으면 **검출 자세로 돌아간다** — 주행과 이어지기 위해서다
             ok = sum(1 for p in self.plans if p.state == '완료')
-            self.phase = 'done'
-            self.detail = f'{ok}/{len(self.plans)}점 완료'
-            self.get_logger().info(f"[done] {self.detail}")
+            self.phase, self.t_phase = 'park', time.time()
+            self._sent = 0.0
+            self.detail = f'{ok}/{len(self.plans)}점 완료 — 검출 자세로 복귀'
             return self._publish()
         p = self.plans[self.cur]
         p.state = '진행'
         self.t_point = time.time()
         self._sent = 0.0
-        self._seq_seen = False
         self.detail = (f'{self.cur + 1}/{len(self.plans)} — {p.idx}번 교차점 '
                        f'{pose_label(p.pose)} ({p.xyz[0]:.1f}, {p.xyz[1]:.1f}, '
                        f'{p.xyz[2]:.1f})')
@@ -521,31 +578,23 @@ class TyingPlanner(Node):
             if self.seq is None:
                 self.detail = '/tying/status 를 기다린다 — tying_sequence 가 떠 있는가'
                 return
-            self._sent = time.time()
-            self.pose_pub.publish(Int32(data=int(p.pose)))
-            self.goal_pub.publish(Point(
-                x=p.xyz[0], y=p.xyz[1],
-                z=p.xyz[2] if self.send_z else float('nan')))
-            return
-        step = (self.seq or {}).get('step')
-        if not self._seq_seen:
-            # 묵은 상태를 보고 바로 넘어가지 않도록 **움직이기 시작**을 먼저 본다
-            if step not in (None, 'idle', 'done', 'failed'):
-                self._seq_seen = True
-            elif time.time() - self._sent > 5.0:
-                p.state = '시퀀스가 시작하지 않았다'
-                self.get_logger().warning(f"{p.idx}번 {p.state} — 건너뛴다")
-                return self._next()
-            return
-        if step == 'done':
+            return self._send_seq(p.xyz[0], p.xyz[1], p.pose,
+                                  p.xyz[2] if self.send_z else None)
+        r = self._seq_state()
+        if r == 'stuck':
+            p.state = '시퀀스가 시작하지 않았다'
+            self.get_logger().warning(f"{p.idx}번 {p.state} — 건너뛴다")
+            return self._next()
+        if r == 'done':
             p.state = '완료'
             return self._next()
-        if step == 'failed':
+        if r == 'failed':
             p.state = f"실패: {(self.seq or {}).get('detail', '')}"
             self.get_logger().warning(f"{p.idx}번 {p.state} — 건너뛴다")
             return self._next()
         self.detail = (f"{self.cur + 1}/{len(self.plans)} — {p.idx}번 "
-                       f"[{step}] {(self.seq or {}).get('detail', '')}")
+                       f"[{(self.seq or {}).get('step')}] "
+                       f"{(self.seq or {}).get('detail', '')}")
 
     # ---- 발행 --------------------------------------------------------------
     def _publish(self):
