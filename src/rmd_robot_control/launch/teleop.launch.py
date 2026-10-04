@@ -124,6 +124,15 @@ def generate_launch_description():
     stage = Node(
         package='rmd_robot_control', executable='stage_node',
         name='stage_node', output='screen',
+        parameters=[{
+            # [2026-10-04] 30 → 60 dps. 30dps 는 출력축 8.7mm/s 라 X 전 행정
+            # (453mm)에 52초다. 리모콘이 이미 100dps 로 도는 축이므로 60 은 보수적이다.
+            'move_speed_dps': 60.0,
+            # [2026-10-04] 30 → 120초. X 405mm 이동이 30초에 끊겨 153mm 에서
+            # 멈췄다. 전 행정을 60dps 로 가도 26초이고, 브레이크 해제 대기와
+            # 리미트 접근 감속까지 보면 여유가 필요하다.
+            'move_timeout_sec': 120.0,
+        }],
         respawn=True, respawn_delay=2.0,
     )
     tying = Node(

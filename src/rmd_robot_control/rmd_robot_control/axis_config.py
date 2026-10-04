@@ -480,15 +480,20 @@ def load_envelope():
         #   리미트 스위치가 지키는 하드 스톱이지 실측한 간섭선이 아니다. 거기서
         #   10mm 를 깎으면 안전에 기여하지 않고 정상 동작만 막는다 —
         #   2026-10-03 에 호밍 직후 X=-3mm(원점)에서 자세 변경이 거부됐다.
-        #   끝단 쪽은 **제약 없음(±inf)** 으로 둔다.
+        #
+        # ⚠⚠ 그렇다고 **제약 없음(±inf)으로 두면 안 된다** (2026-10-03 에 그렇게
+        #   했다가 2026-10-04 에 드러났다). 축은 끝단 밖으로 못 간다 — 음수 X
+        #   목표가 통과해 리미트로 밀 뻔했다. 끝단은 **여유를 빼지 않고 그대로**
+        #   쓰되, 원점 반복오차만큼(`origin_tol_mm`) 넓혀 호밍 직후 위치가
+        #   걸리지 않게 한다 (y_min 은 ±1.95mm 흔들린다).
         stage = _stage()
         stroke = {a: (stage.get(a) or {}).get('stroke_mm') for a in ('x', 'y', 'z')}
-        INF = float('inf')
+        otol = float(env.get('origin_tol_mm', 5.0))
 
         def bound(a, lo, hi):
-            lo2 = -INF if lo <= 0.0 else lo + m
+            lo2 = lo - otol if lo <= 0.0 else lo + m
             st = stroke.get(a)
-            hi2 = INF if (st and hi >= float(st) - 0.5) else hi - m
+            hi2 = (float(st) + otol if (st and hi >= float(st) - 0.5) else hi - m)
             return (lo2, hi2)
 
         out = {}

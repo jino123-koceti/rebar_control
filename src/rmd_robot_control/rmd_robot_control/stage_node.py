@@ -563,6 +563,11 @@ class StageNode(Node):
         stop = self._safety_stop()
         if stop:
             return self._reject(stop)
+        # 기동 때 한 번만 읽으면 런타임·런치 변경이 안 먹는다 (respawn 은 기동 당시
+        # 인자를 다시 쓴다). 이동마다 다시 읽어 `ros2 param set` 으로 조정 가능하게.
+        g = self.get_parameter
+        self.speed = float(g('move_speed_dps').value)
+        self.timeout = float(g('move_timeout_sec').value)
 
         self.target = want
         self.target_unit = unit

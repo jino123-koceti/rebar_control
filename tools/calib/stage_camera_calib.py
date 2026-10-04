@@ -297,7 +297,7 @@ class Calib(Node):
                            f"배근이나 장비가 움직였다면 `s` 로 다시 고정하세요")
         return True, f"확인 (가장 가까운 점 {d:.1f}mm)"
 
-    def record(self, idx, check=True):
+    def record(self, idx, check=True, axes='xyz', stage=None):
         if not (0 <= idx < len(self.frozen)):
             print(f"  번호가 범위를 벗어났습니다 (0~{len(self.frozen) - 1})")
             return
@@ -317,15 +317,17 @@ class Calib(Node):
             print("  스테이지 mm 를 못 받습니다 — 기록하지 않습니다 (호밍 필요)")
             return
         x, y, z = self.frozen[idx][:3]
+        if stage is not None:
+            m = list(stage) + [0.0] * (3 - len(stage))
         if self.snap_stage is None:
             print("  검출 당시 스테이지 위치를 모릅니다 — `s` 로 다시 고정하세요")
             return
         self.pairs.setdefault(p, []).append(
             {'cam': [x, y, z], 'stage': m, 'snap': list(self.snap_stage),
-             'idx': idx, 'gun': (self.stage or {}).get('gun_deg'),
+             'idx': idx, 'axes': axes, 'gun': (self.stage or {}).get('gun_deg'),
              't': time.strftime('%Y-%m-%d %H:%M:%S')})
         self._save_state()
-        print(f"  {p}번 자세 짝 {len(self.pairs[p])} 기록 — "
+        print(f"  {p}번 자세 짝 {len(self.pairs[p])} 기록 [{axes}] — "
               f"카메라 ({x:+.1f},{y:+.1f},{z:.1f}) ↔ "
               f"스테이지 (X {m[0]:.1f}, Y {m[1]:.1f}, Z {m[2]:.1f}) mm")
 
@@ -352,58 +354,90 @@ class Calib(Node):
                       f" → stage({m[0]:7.1f},{m[1]:7.1f},{m[2]:7.1f})")
 
     # ---- 산출 --------------------------------------------------------------
+    AXK = {'x': 0, 'y': 1, 'z': 2}
+
+    def _axes_of(self, q):
+        """그 짝이 가진 성분 인덱스. 기본은 세 성분 다."""
+        return {self.AXK[c] for c in q.get('axes', 'xyz') if c in self.AXK}
+
+    def _solve_axis(self, k, poses, base):
+        """성분 k(0=X,1=Y,2=Z) **하나**를 푼다.
+
+        ⚠ 성분마다 **독립**이다 — 미지수가 성분별로 갈린다(a 3개 + b 1개 +
+        자세 오프셋). 그래서 **X·Y 만 있는 짝도 섞어 쓸 수 있다.** Z 를 안 내린
+        상태에서 X·Y 만 맞춘 점이 그런 경우다 (끝단 시험이 그렇게 나온다 —
+        건을 이미 근처에 보낸 뒤 미세 보정만 하므로 정렬 오차가 작아 값이 좋다).
+        """
+        extra = [p for p in poses if p != base]
+        U = 4 + len(extra)
+        M, y = [], []
+        for p in poses:
+            for q in self.pairs.get(p, []):
+                if k not in self._axes_of(q):
+                    continue
+                r = [0.0] * U
+                r[0:3] = q['cam']
+                r[3] = 1.0
+                if p != base:
+                    r[4 + extra.index(p)] = 1.0
+                M.append(r)
+                y.append(q['stage'][k])
+        if len(M) < U:
+            return None
+        M, y = np.array(M), np.array(y)
+        sol, _, rank, _ = np.linalg.lstsq(M, y, rcond=None)
+        if rank < U:
+            return None
+        e = M @ sol - y
+        off = {base: 0.0}
+        off.update({p: float(sol[4 + i]) for i, p in enumerate(extra)})
+        return dict(a=sol[:3], b=float(sol[3]), off=off, n=len(y),
+                    e=e, dof=len(y) - U)
+
     def fit_shared(self):
-        """**공통 변환 + 자세별 오프셋** 으로 한 번에 푼다.
+        """**공통 변환 + 자세별 오프셋.** 성분별로 따로 푼다.
 
-        카메라→세상 변환은 **모든 자세에서 같다** — 카메라가 고정이고 교차점도
-        움직이지 않는다. 자세마다 바뀌는 것은 **건 끝 오프셋 하나**뿐이다
-        (캐리지는 회전하지 않고 평행이동만 한다):
+        카메라→세상 변환은 **모든 자세에서 같다** — 카메라가 캐리지에 달려 있지
+        않다 (2026-10-04 확인: X 를 240mm 옮겨도 교차점 카메라 좌표가 1mm 만
+        변했다). 자세마다 바뀌는 것은 **건 끝 오프셋 하나**뿐이다.
 
-            보낼 위치 = A·P_cam + b + offset(자세)      offset(첫 자세) = 0
+            보낼 위치 = A · P_cam + b + offset(자세)      offset(첫 자세) = 0
 
-        그래서 미지수가 자세별 독립(자세당 12개)보다 훨씬 적다 — 자세 4개면
-        12 + 3x3 = **21개**이고, 점 하나가 식 3개를 주니 7점이면 풀린다.
-        자세별 독립은 16점이 필요하다.
-
-        ⚠ 오프셋을 **자유 벡터**로 둔다 (회전으로 모델링하지 않는다). 실측에서
-        자세 1→2 는 거의 X 로만, 2→3 은 거의 Y 로만 움직였다 — 단순 회전이라면
-        변위 방향이 각도만큼만 돌아야 하는데 80° 가까이 돌았다. 자유 벡터는
-        그게 무엇이든 흡수한다.
-
-        ⚠ Z 오프셋이 0 에 가까운지 보라 — yaw 회전은 높이를 바꾸지 않아야 한다.
-        크게 나오면 정렬이 자세마다 어긋났다는 뜻이다 (실측 -0.9 / -3.0mm).
+        ⚠ **A 의 z 열은 카메라 깊이가 퍼져야 결정된다.** 2026-10-04 에 깊이가
+        480~500mm 에 7/11 몰려 있어 z 열이 8% 틀렸다 — 그 깊이에서는 맞고
+        (오차 0 지점 534mm) 365mm 에서 16mm 빗나갔다. **잔차는 2.6mm 로 멀쩡해
+        보였다.** 그래서 아래에서 깊이 분포를 따로 경고한다.
         """
         poses = sorted(self.pairs)
-        n = sum(len(self.rows(p)) for p in self.pairs)
-        if not poses or n < 1:
+        if not poses:
             return None
-        base, extra = poses[0], poses[1:]
-        U = 12 + 3 * len(extra)
-        if n * 3 < U:
-            return None
-        M = np.zeros((n * 3, U))
-        r = np.zeros(n * 3)
-        row = 0
-        for p in poses:
-            for cam, st in self.rows(p):
-                P = np.array(cam, dtype=float)
-                for k in range(3):
-                    M[row + k, k * 3:(k + 1) * 3] = P
-                    M[row + k, 9 + k] = 1.0
-                    if p in extra:
-                        M[row + k, 12 + 3 * extra.index(p) + k] = 1.0
-                    r[row + k] = st[k]
-                row += 3
-        sol, _, rank, _ = np.linalg.lstsq(M, r, rcond=None)
-        if rank < U:
-            return None                 # 점 배치가 겹쳐 결정되지 않는다
-        e = ((M @ sol) - r).reshape(-1, 3)
-        off = {base: np.zeros(3)}
-        for i, p in enumerate(extra):
-            off[p] = sol[12 + 3 * i:15 + 3 * i]
-        return dict(A=sol[:9].reshape(3, 3), b=sol[9:12], off=off,
-                    rms=float(np.sqrt((e ** 2).sum(axis=1).mean())),
-                    worst=float(np.abs(e).max()), n=n, dof=n * 3 - U)
+        base = poses[0]
+        A = np.zeros((3, 3))
+        b = np.zeros(3)
+        off = {p: np.zeros(3) for p in poses}
+        ns, dofs, errs = [], [], []
+        for k in range(3):
+            pk = [p for p in poses
+                  if any(k in self._axes_of(q) for q in self.pairs.get(p, []))]
+            if base not in pk:
+                return None            # 기준 자세에 그 성분이 없으면 못 푼다
+            r = self._solve_axis(k, pk, base)
+            if r is None:
+                return None
+            A[k, :] = r['a']
+            b[k] = r['b']
+            for p, v in r['off'].items():
+                off[p][k] = v
+            ns.append(r['n'])
+            dofs.append(r['dof'])
+            errs.append(r['e'])
+        e = np.concatenate(errs)
+        return dict(A=A, b=b, off=off, n=sum(ns), dof=min(dofs),
+                    pairs=sum(len(v) for v in self.pairs.values()),
+                    rms=float(np.sqrt((e ** 2).mean())),
+                    worst=float(np.abs(e).max()),
+                    per_axis=[(len(x), float(np.sqrt((x ** 2).mean())))
+                              for x in errs])
 
     def fit_one(self, rows):
         """(A 3x3, b 3, rms, worst) 또는 None."""
@@ -440,14 +474,25 @@ class Calib(Node):
         sh = self.fit_shared()
         print()
         if sh:
-            print(f"■ 공통 변환 + 자세별 오프셋 — 짝 {sh['n']}개, 검증 여유 {sh['dof']}")
-            print(f"   잔차 RMS {sh['rms']:.2f}mm  최대 {sh['worst']:.2f}mm"
+            print(f"■ 공통 변환 + 자세별 오프셋 — 짝 {sh['pairs']}개 "
+                  f"(식 {sh['n']}개), 성분별 검증 여유 최소 {sh['dof']}")
+            print("   성분별 식·잔차: " + "  ".join(
+                f"{a}={m}개 {r:.2f}mm" for a, (m, r) in zip('XYZ', sh['per_axis'])))
+            print(f"   잔차 RMS {sh['rms']:.2f}mm(성분당)  최대 {sh['worst']:.2f}mm"
                   + ("   ⚠ 미지수=식 이라 0 이 당연 (검증 안 됨)"
                      if sh['dof'] == 0 else ""))
             for p in sorted(sh['off']):
                 o = sh['off'][p]
                 tag = ' ← 기준' if not o.any() else ''
                 print(f"     {p}번 오프셋 ({o[0]:+7.1f}, {o[1]:+7.1f}, {o[2]:+6.1f}) mm{tag}")
+            zs = sorted(q['cam'][2] for v in self.pairs.values() for q in v)
+            mid = [z for z in zs if 460 <= z <= 520]
+            if len(zs) >= 4 and len(mid) > len(zs) * 0.5:
+                print(f"   ⚠⚠ 카메라 깊이가 460~520mm 에 {len(mid)}/{len(zs)} 몰려 있습니다 "
+                      "— **A 의 z 열이 결정되지 않습니다.**")
+                print("      그 깊이에서만 맞고 멀어지면 틀립니다. 잔차로는 안 보입니다 "
+                      "(2026-10-04: 365mm 에서 16mm 빗나갔는데 잔차는 2.6mm 였다).")
+                print("      깊이 양 끝(348~380, 600~630mm)에서 점을 받으세요")
             zmax = max(abs(o[2]) for o in sh['off'].values())
             if zmax > 10.0:
                 print(f"   ⚠ Z 오프셋이 {zmax:.1f}mm 입니다 — yaw 회전은 높이를 바꾸지 "
@@ -571,6 +616,11 @@ def run_one(n, cmd):
         n.record(int(cmd[1]))
     elif c == 'r!' and len(cmd) > 1:
         n.record(int(cmd[1]), check=False)       # 재확인 건너뛰기
+    elif c in ('rxy', 'rxy!') and len(cmd) > 1:
+        # X·Y 만 기록한다 (Z 를 안 내린 상태에서 맞춘 점). 값을 주면 그 값을 쓴다 —
+        # 끝단 시험처럼 **지난 시점의 위치**를 소급해 넣을 때 필요하다
+        st = [float(v) for v in cmd[2:4]] if len(cmd) >= 4 else None
+        n.record(int(cmd[1]), check=(c == 'rxy'), axes='xy', stage=st)
     elif c == 'p' and len(cmd) > 1:
         n.predict(int(cmd[1]))
     elif c == 'l':
@@ -582,7 +632,7 @@ def run_one(n, cmd):
     elif c == '':
         n.show()
     else:
-        print("  s / r <n> / r! <n> / p <n> / l / u / f / q")
+        print("  s / r <n> / r! <n> / rxy <n> [X Y] / p <n> / l / u / f / q")
         return False
     return True
 
