@@ -38,6 +38,13 @@ setup(
             # 카메라 좌표를 자세별 스테이지 좌표로 바꾸고, 도달 가능한
             # 것만 골라 자세로 묶어 한 점씩 tying_sequence 에 넘긴다.
             'tying_planner = rmd_robot_control.tying_planner:main',
+            # L3 — 주행부를 거리로 움직인다 (/drive/step mm). 바퀴 각도를
+            # 보며 /cmd_vel 을 끊는다. axis_config(단일 소스)를 읽어야 해서
+            # 이 패키지에 둔다.
+            'drive_node = rmd_robot_control.drive_node:main',
+            # L4 — 웨이포인트 미션을 순서대로 실행한다. 시연은 자율이 아니라
+            # 미리 정한 순서로 간다 ('tie' / 'drive <mm>' / 'lateral <회전>').
+            'navigator = rmd_robot_control.navigator:main',
         ],
     },
 )

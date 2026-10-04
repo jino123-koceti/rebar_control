@@ -53,6 +53,9 @@ class PositionControlNode(Node):
 
         # 파라미터 선언
         self.declare_parameter('can_interface', 'can2')
+        # 주행 바퀴 각도(0x92)를 10Hz 로 읽는다 — 거리 스텝 주행이 이것을 쓴다.
+        # CAN 부담이 문제가 되면 끌 수 있게 파라미터로 둔다.
+        self.declare_parameter('wheel_angle_poll', True)
         self.declare_parameter('motor_ids', [0x141, 0x142, 0x143, 0x144, 0x145, 0x146, 0x147])
         self.declare_parameter('joint_names', ['drive_left', 'drive_right', 'joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5'])
         self.declare_parameter('max_position', 36000.0)  # 최대 위치 (도, 100바퀴)
@@ -95,6 +98,7 @@ class PositionControlNode(Node):
         
         # 파라미터 가져오기
         self.can_interface = self.get_parameter('can_interface').value
+        self.wheel_angle_poll = bool(self.get_parameter('wheel_angle_poll').value)
         self.motor_ids = self.get_parameter('motor_ids').value
         self.joint_names = self.get_parameter('joint_names').value
         self.max_position = self.get_parameter('max_position').value
@@ -733,9 +737,20 @@ class PositionControlNode(Node):
         frame[0] = 0x61
         self._idle_pos_n = getattr(self, '_idle_pos_n', 0) + 1
         idle_turn = (self._idle_pos_n % 5 == 0)        # 10Hz 중 2Hz
+        # ⚠⚠ **주행 바퀴의 0x92 를 10Hz 로 읽는다.** 2차년도는 위치 제어(S20)
+        #   응답에서만 바퀴 각도를 발행해서, `/cmd_vel` 로 달리면 각도가 아예
+        #   없었다 — 2026-10-04 에 거리 스텝 주행을 넣으려다 여기서 막혔다.
+        #   0x92 는 **출력축** 멀티턴 각도(0.01°/LSB)라 그대로 거리가 된다
+        #   (wheel_radius 0.02912m → 0.5082 mm/도). 응답 처리는 기존 0x92
+        #   분기가 그대로 하고 `/motor_0x141_position` 으로 나간다.
+        #   10Hz 로 2프레임뿐이라 버스 부담은 무시할 수 있다 (1Mbps).
+        if self.wheel_angle_poll:
+            for mid in (self.left_motor_id, self.right_motor_id):
+                self.can_manager.send_frame(mid, bytes([0x92, 0, 0, 0, 0, 0, 0, 0]))
+                time.sleep(0.002)
         for mid in self.motor_ids:
             if mid in (self.left_motor_id, self.right_motor_id):
-                continue                # 주행은 이 값이 의미 없다
+                continue                # 주행은 0x61(단회전)이 의미 없다
             self.can_manager.send_frame(mid, bytes(frame))
             time.sleep(0.002)
             if idle_turn and not self.motor_states.get(mid, {}).get('is_moving'):

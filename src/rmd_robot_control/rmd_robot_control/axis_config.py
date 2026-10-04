@@ -50,12 +50,43 @@ HOMING_AXES = {
 
 
 
-def _stage():
+def _section(name):
     import yaml
     from ament_index_python.packages import get_package_share_directory
     p = os.path.join(get_package_share_directory('rebar_base_control'),
                      'config', 'axes.yaml')
-    return (yaml.safe_load(open(p, encoding='utf-8')) or {}).get('stage', {}) or {}
+    return (yaml.safe_load(open(p, encoding='utf-8')) or {}).get(name, {}) or {}
+
+
+def load_drive():
+    """주행부 제원. 못 읽으면 None — 호출부가 거리 제어를 거부해야 한다.
+
+    `mm_per_deg` 는 **출력축** 1도당 전진량이다. 멀티턴 각도 읽기가 출력축 각도를
+    0.01°/LSB 로 주므로 그대로 거리로 환산된다.
+
+    ⚠ 전진 시 **두 바퀴의 부호가 반대**다 (2026-10-04 실측: 우측 +84°, 좌측 -82°).
+      그래서 전진거리는 `(Δ우 - Δ좌)/2 * mm_per_deg` 다. 부호를 합으로 쓰면 0 이
+      나와 아무 것도 안 움직인 것처럼 보인다.
+    """
+    import math
+    try:
+        d = _section('drive')
+        r = float(d['wheel_radius_m'])
+        return dict(
+            right=f"0x{int(d['right']['can_id']):03x}",
+            left=f"0x{int(d['left']['can_id']):03x}",
+            wheel_radius_m=r,
+            wheel_base_m=float(d.get('wheel_base_m', 0.5)),
+            max_linear_mps=float(d.get('max_linear_mps', 0.25)),
+            max_angular_radps=float(d.get('max_angular_radps', 0.5)),
+            mm_per_deg=2.0 * math.pi * r * 1000.0 / 360.0,
+        )
+    except Exception:
+        return None
+
+
+def _stage():
+    return _section('stage')
 
 
 def load_axis_motor_ids(names=AXIS_NAMES):

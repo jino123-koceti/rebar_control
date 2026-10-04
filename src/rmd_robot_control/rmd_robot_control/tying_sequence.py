@@ -178,6 +178,12 @@ class TyingSequence(Node):
         self.asked_pose = None       # /tying/goal_pose 로 지정된 자세
         self._fire_t = 0.0           # 결속건 하위단계 시작 시각
         self._fire_phase = 0
+        # 접수한 목표 수. **상위가 "내 목표가 들어갔나" 를 가리는 유일한 근거다.**
+        # `step` 만 보면 안 된다 — 목표가 **이미 충족된 자리**에서는
+        # precheck→done 이 한 tick 안에 끝나서 상위는 'done' 밖에 못 보고
+        # "시작하지 않았다" 로 오판한다 (2026-10-04 에 검출 자세에 이미 서 있어서
+        # 미션이 첫 단계에서 죽었다).
+        self.goals = 0
         self._retract_tgt = None     # 보낸 후퇴 목표 (도착까지 붙잡는다)
         self._rej0 = None            # 단계 시작 시점의 stage_node 거부 횟수
         self._passed = []            # 회전이 지나가는 자세들
@@ -225,6 +231,7 @@ class TyingSequence(Node):
         self.want_pose = None
         self._retract_tgt = None
         self._fire_phase = 0
+        self.goals += 1
         self._enter(Step.PRECHECK,
                     f'목표 x={self.goal[0]:.1f} y={self.goal[1]:.1f}mm'
                     + ('' if self.goal_z is None else f' z={self.goal_z:.1f}mm'))
@@ -545,6 +552,7 @@ class TyingSequence(Node):
             'pose_want': self.want_pose,
             'current_mm': {'x': x, 'y': y, 'z': self._z()},
             'gun_enabled': self.gun_on,
+            'goals': self.goals,          # 늘었으면 내 목표가 접수된 것이다
             'detail': self.detail,
         }, ensure_ascii=False)))
 

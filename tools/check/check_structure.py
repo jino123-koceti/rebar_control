@@ -69,6 +69,13 @@ R3_PLANNED = {
     # 전부를 결속건까지 돌리는 명령이고, X 를 빼둔 상태에서만 검출이 맞다.
     '/plan/start': '사람·UI 가 보내는 계획 실행 명령 (ros2 topic pub)',
     '/plan/abort': '사람·UI 가 보내는 중단 명령',
+    # 주행 스텝은 **상위(미션)나 사람이** 준다. 자동으로 걸리면 안 된다 —
+    # 장비가 움직이는 명령이고, 정지마다 사람이 상황을 보는 것이 시연 방식이다.
+    '/mission/start': '사람·UI 가 보내는 미션 실행 명령 (ros2 topic pub)',
+    '/mission/abort': '사람·UI 가 보내는 미션 중단 명령',
+    '/lateral/step': 'navigator 가 발행한다. 사람이 직접 주는 경로도 남아 있다',
+    '/drive/step': '사람·미션이 보내는 주행 스텝 (ros2 topic pub)',
+    '/drive/abort': '사람·UI 가 보내는 주행 중단 명령',
     '/plan/execute': '사람·UI 가 보내는 계획 실행 명령'
                      ' (plan_only 로 세워 둔 계획을 실행한다)',
     '/tying/abort': '사람·UI 가 보내는 중단 명령',

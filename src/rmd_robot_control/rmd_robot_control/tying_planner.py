@@ -270,6 +270,7 @@ class TyingPlanner(Node):
         """`tying_sequence` 에 목표를 보낸다. 자세가 **먼저** 가야 한다."""
         self._sent = time.time()
         self._seq_seen = False
+        self._goal0 = (self.seq or {}).get('goals')
         self.pose_pub.publish(Int32(data=int(pose)))
         self.goal_pub.publish(Point(
             x=float(x), y=float(y),
@@ -278,16 +279,27 @@ class TyingPlanner(Node):
     def _seq_state(self):
         """시퀀스 결과 — 'done' / 'failed' / None(진행 중) / 'stuck'.
 
-        ⚠ **움직이기 시작하는 것을 먼저 본다.** 바로 `step` 을 보면 직전 명령의
-          묵은 'done' 에 걸려 도착한 줄로 안다 (2026-10-04 에 그렇게 당했다).
+        ⚠ **`step` 만 보면 안 된다.** 직전 명령의 묵은 'done' 에 걸려 도착한 줄로
+          안다. 그래서 **목표 접수 카운터**(`goals`)가 늘었는지로 가린다.
+        ⚠ "움직이기 시작하는 것을 본다" 로 하면 **이미 목표에 서 있을 때** 거꾸로
+          걸린다 — precheck→done 이 한 tick 안에 끝나 상위가 'done' 밖에 못 보고
+          "시작하지 않았다" 가 된다 (2026-10-04 에 검출 자세에 이미 서 있어서 미션이
+          첫 단계에서 죽었다).
         """
+        g = (self.seq or {}).get('goals')
+        if g is None:
+            # 옛 시퀀스(카운터 없음) — 움직임으로 가린다 (정확하지 않다)
+            step = (self.seq or {}).get('step')
+            if not self._seq_seen:
+                if step not in (None, 'idle', 'done', 'failed'):
+                    self._seq_seen = True
+                elif time.time() - self._sent > 5.0:
+                    return 'stuck'
+                return None
+            return step if step in ('done', 'failed') else None
+        if self._goal0 is not None and g == self._goal0:
+            return 'stuck' if time.time() - self._sent > 5.0 else None
         step = (self.seq or {}).get('step')
-        if not self._seq_seen:
-            if step not in (None, 'idle', 'done', 'failed'):
-                self._seq_seen = True
-            elif time.time() - self._sent > 5.0:
-                return 'stuck'
-            return None
         return step if step in ('done', 'failed') else None
 
     def _do_ready(self):

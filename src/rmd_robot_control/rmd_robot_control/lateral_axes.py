@@ -26,8 +26,11 @@ import time
 CAN_FRAME_FMT = "IB3x8s"
 
 ENC_CPR = 262144          # 엔코더 1회전 counts (18bit)
-DEG_PER_MM = 7.2          # 360° = 50 mm
-MM_PER_TURN = 50.0
+# ⚠ [2026-10-04] 3차년도 장비는 **1회전 = 100mm** 다 (2차년도는 50mm).
+#   둘 다 표시용으로만 쓰인다 — 실제 이동량은 기구가 정하고, `/lateral/step` 은
+#   회전 수를 받는다. 그래도 로그가 틀리면 사람이 거리를 잘못 센다.
+DEG_PER_MM = 3.6          # 360° = 100 mm
+MM_PER_TURN = 100.0
 
 CMD_STATUS1 = 0x9A
 CMD_STATUS2 = 0x9C
