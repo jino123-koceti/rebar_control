@@ -19,8 +19,9 @@
 
   S19   Remote 모드 — 이 노드가 조작을 통과시킨다
   S20   Auto 모드   — 스틱 입력 무시, 정지 유지
-  S17   횡이동 +1스텝 (좌측 50mm)   → /lateral/step
-  S18   횡이동 −1스텝 (우측 50mm)   → /lateral/step
+  S17   횡이동 +1스텝 (좌측 100mm)  → /lateral/step
+  S18   횡이동 −1스텝 (우측 100mm)  → /lateral/step
+        ⚠ 1스텝은 **3차년도 100mm** 다 (2차년도는 50mm 였다).
   S13   누르고 있는 동안 Z축 상승   → /joint_5/speed (0x147)
   S14   누르고 있는 동안 Z축 하강   → /joint_5/speed (0x147)
   S23   토글할 때마다 yaw 자세 **한 단계 위로** (1→2→3→4)  → /stage/yaw_pose

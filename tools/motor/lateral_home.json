@@ -6,9 +6,9 @@
     "home_enc_single": 49095
   },
   "0x144": {
-    "home_angle": 139.11,
+    "home_angle": -99.07,
     "sign": -1,
     "name": "횡이동 #2",
-    "home_enc_single": 36909
+    "home_enc_single": 125607
   }
 }

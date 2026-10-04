@@ -105,6 +105,22 @@ from .axis_config import (envelope_for, envelope_violation, identify_pose,
 AXES = ('x', 'y', 'z')          # yaw 는 mm 개념이 아니라 여기서 다루지 않는다
 
 
+def _axis_list(v):
+    """축 목록 파라미터 — 'x,y' 문자열이나 ['x','y'] 리스트 둘 다 받는다.
+
+    ⚠⚠ 기본은 **문자열**이다. 리스트로 launch 에 넘기면 ros2 launch 가 YAML
+      수열로 쓰고 — `- x` / `- y` — **YAML 1.1 에서 `y` 는 불리언**이라
+      (y/n/yes/no/on/off) 문자열과 불리언이 섞인 수열이 된다. rcl 이 그걸
+      거부해서 `Sequence should be of same type. Value type 'bool' do not
+      belong` 으로 노드가 **아예 못 뜬다** (2026-10-04 에 크래시 루프였다).
+    """
+    if v is None:
+        return ()
+    if isinstance(v, str):
+        return tuple(x.strip() for x in v.split(',') if x.strip())
+    return tuple(str(x).strip() for x in v if str(x).strip())
+
+
 class StageNode(Node):
     def __init__(self):
         super().__init__('stage_node')
@@ -169,7 +185,7 @@ class StageNode(Node):
         #   결속점 3개가 전부 실패했다. 위에는 부딪힐 것이 없고, 건이 철근에
         #   걸려 빠져나올 때 전류가 오르는 것은 정상이다. 보호의 목적은
         #   **교차점이 아닌 곳으로 내려가 철근을 찍는 것**을 막는 것이다.
-        self.declare_parameter('collide_down_only_axes', ['z'])
+        self.declare_parameter('collide_down_only_axes', 'z')
         self.declare_parameter('collide_backoff_mm', 15.0)
         # 기동 직후에는 가속 전류가 뜬다 — 그 구간은 보지 않는다
         self.declare_parameter('collide_grace_sec', 0.7)
@@ -183,7 +199,8 @@ class StageNode(Node):
         # 도착해도 **곧바로 잠그지 않는** 축. 다음 구간이 바로 오면 해제 대기가
         # 아예 없어진다. ⚠ Z 는 넣지 않는다 — 리프팅축이라 자중 낙하한다
         # (브레이크 해제 시 출력축 12.7° 낙하 실측). yaw 도 빼 둔다.
-        self.declare_parameter('brake_hold_axes', ['x', 'y'])
+        # ⚠ 리스트가 아니라 **문자열**이다 — 이유는 `_axis_list` 주석 참조
+        self.declare_parameter('brake_hold_axes', 'x,y')
         self.declare_parameter('brake_hold_sec', 2.5)
         # 중재기에서 권한을 받기까지 기다리는 시간. ⚠ 0 이면 **요청 직후 50ms 에**
         # "권한 없음" 으로 판단해 중단한다 — 리모콘을 쓴 뒤에는 모드가 manual 로
@@ -210,7 +227,7 @@ class StageNode(Node):
                         for ax in ('x', 'y', 'z')}
         self.rise_n = int(g('collide_rise_samples').value)
         self.base_tau = float(g('collide_base_tau_sec').value)
-        self.down_only = tuple(g('collide_down_only_axes').value or ())
+        self.down_only = _axis_list(g('collide_down_only_axes').value)
         self.base_a = {}           # 축 → 전류 기준선(A). 이동 중에만 갱신한다
         self.rise_cnt = {}         # 축 → 상승분 초과 연속 횟수
         self._base_t = {}          # 축 → 기준선 갱신 시각
@@ -222,7 +239,7 @@ class StageNode(Node):
         self.tol_mm = float(g('tolerance_mm').value)
         self.timeout = float(g('move_timeout_sec').value)
         self.arm_sec = float(g('arm_sec').value)
-        self.hold_axes = tuple(g('brake_hold_axes').value or ())
+        self.hold_axes = _axis_list(g('brake_hold_axes').value)
         self.hold_sec = float(g('brake_hold_sec').value)
         self.brake_rel = {}        # 축 → 브레이크 해제 확인 (None = 모름)
         self._lock_at = {}         # 축 → 이 시각 뒤에 잠근다 (유예 중)
@@ -598,7 +615,10 @@ class StageNode(Node):
         self.yaw_moving = False
         self.yaw_tgt = None
         self.yaw_win = None
-        self._request_control('release')
+        # ⚠ XY 가 아직 가고 있으면 권한을 반납하지 않는다 — 반납하면 중재기가
+        #   manual 로 돌아가 남은 이동이 끊긴다
+        if not self.target:
+            self._request_control('release')
         self._publish_status()
 
     # ---- 환산 --------------------------------------------------------------
@@ -728,6 +748,10 @@ class StageNode(Node):
         now = time.time()
         added = [k for k in want if k not in self.target]
         self.target.update(want)
+        # 회전 중에 붙인 경우 `moving` 이 아직 False 다 — 켜지 않으면 도착 판정과
+        # 정지 처리가 돌지 않는다
+        self.moving = True
+        self.target_unit = 'mm'
         self.t_start = now
         for name in added:
             self._lock_at.pop(name, None)
@@ -998,8 +1022,15 @@ class StageNode(Node):
     # ---- 진행 --------------------------------------------------------------
     def tick(self):
         if self.yaw_moving:
-            return self._yaw_tick()
-        if not self.moving:
+            self._yaw_tick()
+            # ⚠⚠ **여기서 반환하면 회전 중 XY 가 멈춰 있다.** 합쳐 둔 mm 목표가
+            #   있으면 아래 루프까지 내려가 명령을 계속 보낸다 — 그게 "회전하면서
+            #   XY 도 움직인다" 의 실제 구현이다. 2026-10-04 에 합치기만 넣고 이
+            #   반환을 그대로 둬서, 명령은 접수됐는데 축이 안 움직였다
+            #   (시뮬레이터는 회전·이동을 한 루프에서 처리해 못 잡았다).
+            if not self.yaw_moving or not self.target:
+                return
+        elif not self.moving:
             return
         stop = self._safety_stop()
         if stop:

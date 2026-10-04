@@ -170,12 +170,16 @@ def generate_launch_description():
             # ⚠⚠ Z 는 **내려갈 때만** 판정한다. 올릴 때도 걸려서 결속점 3개가
             #   전부 실패했다 — 위에는 부딪힐 것이 없고, 건이 철근에 걸려
             #   빠져나올 때 전류가 오르는 것은 정상이다.
-            'collide_down_only_axes': ['z'],
+            # ⚠⚠ **리스트가 아니라 문자열이다.** ros2 launch 가 ['x','y'] 를
+            #   YAML 수열로 쓰면 **YAML 1.1 이 `y` 를 불리언으로 읽어**
+            #   `Sequence should be of same type. Value type 'bool' do not
+            #   belong` 으로 노드가 아예 못 뜬다 (2026-10-04 크래시 루프).
+            'collide_down_only_axes': 'z',
             # ⚠ 브레이크: 도착해도 X·Y 는 곧바로 잠그지 않는다. 다음 구간이 바로
             #   오면 해제 대기가 없어져 동작이 이어진다 — 구간마다 고정 1초를
             #   기다려서 "너무 시퀀스처럼 움직인다" 는 지적을 받았다.
             #   Z 는 넣지 않는다 (자중 낙하).
-            'brake_hold_axes': ['x', 'y'],
+            'brake_hold_axes': 'x,y',
             'brake_hold_sec': 2.5,
             # ⚠ 이동 중 목표 **합치기**가 켜져 있다 (코드 기본). 상위가 구간
             #   완료를 매번 기다리지 않아도 되니 동작이 이어진다.
