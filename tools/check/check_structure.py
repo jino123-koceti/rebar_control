@@ -10,6 +10,7 @@
   R3 토픽 계약 일치        발행/구독 이름이 짝을 이루는지 (yaw_min vs yaw_home 사고 방지)
   R4 노드 크기 상한        아키텍처 문서의 규모를 넘는 파일
   R5 중복 구현             같은 기능 모듈이 둘 이상 (횡이동·CAN·odom)
+  R6 조건부 로거 금지      (logger.info if ok else logger.warning)(msg) 는 노드를 죽인다
 
 기준선(baseline) 방식
   지금은 위반이 많다. 전부 고칠 때까지 검사를 빨간 상태로 두면 아무도 안 본다.
@@ -136,7 +137,8 @@ R4_LIMITS = {
     #   500 → **650**: 방문 순서를 "다음 자세 첫 점까지 포함" 해서 최소화하라는
     #   요구(2026-10-04)가 붙었다. 자세 안에서만 가까운 순으로 가면 그 자세의
     #   마지막 점이 다음 자세 첫 점에서 멀 때 거기서 다 잃는다.
-    'tying_planner': 650,
+    #   650 → **800**: 경로 파일 적재와 방문 순서 최적화가 붙었다.
+    'tying_planner': 800,
     'navigator': 500,
     # stage_node 500 → 620 → 690 → **900**. 아키텍처 §4 가 상부 X/Y/Z/**Yaw** 를
     #   맡기는데 500 은 X/Y/Z 만 보고 잡은 값이었다. 들어온 것은 줄 수가 아니라
@@ -149,7 +151,11 @@ R4_LIMITS = {
     #   다른 속도가 되는 문제(Z 가 X 의 1/3)와, 작업영역 검사로는 막을 수 없는
     #   충돌(작업영역 안에도 철근이 있다)을 전류로 잡아 취소·후퇴하는 것이다.
     #   축별 문턱까지 필요했다 (정상 전류가 X 3.9A · Z 1.9A 로 두 배 넘게 다르다).
-    'stage_node': 1100,        # 887
+    #   1100 → **1300**: 선속도 환산·충돌 감지(상승분·축별 문턱·방향)·
+    #   이동 중 목표 합치기·축별 브레이크 대기가 모두 붙었다.
+    #   ⚠ 1085줄이다. 충돌 감지(기준선·문턱·후퇴)는 그 자체로 한 덩어리라
+    #     별 모듈로 떼는 것이 맞다 — 시연 준비가 끝나면 그것부터 한다.
+    'stage_node': 1300,        # 1085
     # homing_node 600 → 700 → **900**. §4 의 600 은 2차년도 homing_controller
     #   이식분만 보고 잡은 값이었다. yaw 자세 판별+탐색 방향 유도, 브레이크 해제
     #   확인, 준비자세(READY)가 더해졌고 700 도 여유가 0 이 됐다.
@@ -204,6 +210,30 @@ def r1_id_literals():
                 if re.search(r'0x14[1-8]\b', code):
                     per_file[r] = per_file.get(r, 0) + 1
     return [f"{f} ({n}건)" if False else f for f, n in sorted(per_file.items())]
+
+
+def r6_conditional_logger():
+    """조건부 로거 호출 금지 — rclpy 가 **호출 지점별로** 심각도를 캐시한다.
+
+        (logger.info if ok else logger.warning)(msg)      ← ValueError 로 죽는다
+
+    같은 줄에서 심각도가 바뀌면 두 번째 호출이 예외를 던지고 노드가 내려간다.
+    2026-10-04 에 `stage_node` 와 `tying_planner` 에서 **두 번** 당했다 —
+    두 번째는 결속점 하나가 실패해 warning 분기를 탄 순간 플래너가 죽었고,
+    그 바람에 하위가 Z 가 내려간 채로 XY 후퇴를 시작했다. 사람 기억에 맡길
+    수 없어 검사로 옮긴다.
+    """
+    pat = re.compile(r'get_logger\(\)\.\w+\s+if\s')
+    out = []
+    for p in py_files():
+        try:
+            src = open(p, encoding='utf-8', errors='replace').read()
+        except OSError:
+            continue
+        for i, line in enumerate(src.splitlines(), 1):
+            if pat.search(line.split('#')[0]):
+                out.append(f"{rel(p)}:{i}")
+    return out
 
 
 def r2_resource_owners():
@@ -351,6 +381,7 @@ CHECKS = [
     ('R3 토픽 계약', r3_topic_contract),
     ('R4 노드 크기', r4_node_size),
     ('R5 중복 구현', r5_duplicates),
+    ('R6 조건부 로거', r6_conditional_logger),
 ]
 
 

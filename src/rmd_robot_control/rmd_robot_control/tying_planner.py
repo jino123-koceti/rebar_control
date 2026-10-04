@@ -350,8 +350,16 @@ class TyingPlanner(Node):
         self.phase = 'done'
         self.detail = (f'{ok}/{len(self.plans)}점 완료, 검출 자세 복귀'
                        + ('' if r == 'done' else f' 실패({r})'))
-        (self.get_logger().info if r == 'done'
-         else self.get_logger().warning)(f'[done] {self.detail}')
+        # ⚠⚠ `(logger.info if ok else logger.warning)(msg)` 로 쓰면 **안 된다** —
+        #   rclpy 는 **호출 지점별로** 로깅 심각도를 캐시해서, 같은 줄에서 심각도가
+        #   바뀌면 ValueError 로 노드가 죽는다. 2026-10-04 에 여기서 플래너가
+        #   죽었고(점 하나가 실패해 warning 분기를 탄 순간), 그 바람에
+        #   `tying_sequence` 가 Z 가 내려간 채로 복귀 후퇴를 시작했다.
+        #   같은 함정을 `stage_node` 에서 먼저 당하고 적어 두었는데 반복했다.
+        if r == 'done':
+            self.get_logger().info(f'[done] {self.detail}')
+        else:
+            self.get_logger().warning(f'[done] {self.detail}')
         self._publish()
 
     def _do_detect(self):

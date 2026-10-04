@@ -61,6 +61,7 @@ class FakeStage(Node):
                           + self.info['poses'][2]['gun']) / 2)
         self.tgt = {}                     # 축 → mm
         self.yaw_tgt = None
+        self.pose_from = pose
         self.detail = '대기'
         self.rejects = 0                  # 실물과 같다 — 상위가 이걸로 가린다
         self.log = []
@@ -87,10 +88,21 @@ class FakeStage(Node):
                 if not math.isnan(v)}
         if not want:
             return self._reject('목표가 비어 있다')
-        # ⚠ 실물과 같다 — **이동 중이면 합친다** (거부하지 않는다). 회전 중에는
-        #   합치지 않는다 (회전 안전창 검사가 무효가 된다).
+        # ⚠ 실물과 같다 — **이동 중이면 합친다** (거부하지 않는다).
+        #   회전 중에도 XY 는 받는다 — 단 **회전 안전창 안**이어야 한다.
+        #   박스는 볼록하므로 창 안에서만 움직이면 중간 자세에서도 안전하다.
+        #   Z 는 회전 중에 받지 않는다 (건이 원을 그린다).
         if self.yaw_tgt is not None:
-            return self._reject('회전 중이다')
+            if 'z' in want:
+                return self._reject('회전 중에는 Z 를 받지 않는다')
+            win, _p = transit_window(self.env, self.info, self.pose_from,
+                                     self.yaw_tgt)
+            if win:
+                for ax in ('x', 'y'):
+                    if ax in want and not (win[ax][0] <= want[ax] <= win[ax][1]):
+                        return self._reject(
+                            f'회전 중 {ax}={want[ax]:.1f}mm 는 회전 안전창 '
+                            f'{win[ax][0]:.1f}~{win[ax][1]:.1f}mm 밖이다')
         # 작업영역 검사는 X·Y 만이다 — 실물도 Z 는 자세별 실측이 없다
         bad = envelope_violation(self.env, self.pose,
                                  {k: v for k, v in want.items() if k != 'z'})
@@ -119,6 +131,7 @@ class FakeStage(Node):
                     f'{pose_label(self.pose)}→{pose_label(want)} 회전은 [{names}] 를 '
                     f'지난다 — 지금 {ax}={v:.1f}mm 가 그 교집합 '
                     f'{win[ax][0]:.1f}~{win[ax][1]:.1f}mm 밖이다')
+        self.pose_from = self.pose          # 회전 중 창 계산에 쓴다
         self.yaw_tgt = want
         self.detail = '회전'
         self.log.append(('회전', want))
@@ -151,6 +164,7 @@ class FakeStage(Node):
     def pub(self):
         self.st.publish(String(data=json.dumps({
             'moving': bool(self.tgt) or self.yaw_tgt is not None,
+            'yaw_moving': self.yaw_tgt is not None,
             'current_mm': {'x': round(self.x, 2), 'y': round(self.y, 2),
                            'z': round(self.z, 2)},
             'pose': self.pose,

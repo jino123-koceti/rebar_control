@@ -317,6 +317,9 @@ class StageNode(Node):
         self.yaw_moving = False
         self.yaw_tgt = None
         self.yaw_want = None
+        # 회전 중 XY 를 움직여도 되는 범위 (지나가는 자세들의 교집합).
+        # 박스는 볼록하므로 이 안에서만 움직이면 모든 중간 자세에서 안전하다.
+        self.yaw_win = None
         self._yaw_sent = 0.0
         if self.env is None:
             self.get_logger().warning(
@@ -495,6 +498,9 @@ class StageNode(Node):
         bad = self._transit_block(cur, want)
         if bad:
             return self._reject(bad)
+        # 회전 중 XY 를 어디까지 움직여도 되는지 기억한다 (아래 `_on_goal` 이 쓴다)
+        self.yaw_win = (transit_window(self.env, self.pose_id, cur, want)[0]
+                        if self.env is not None and self.enforce else None)
 
         g = info['poses']
         # 기동 때 한 번만 읽으면 런타임 변경이 안 먹는다 — 명령마다 다시 읽는다
@@ -591,6 +597,7 @@ class StageNode(Node):
             self.get_logger().warning(self.detail)
         self.yaw_moving = False
         self.yaw_tgt = None
+        self.yaw_win = None
         self._request_control('release')
         self._publish_status()
 
@@ -689,6 +696,25 @@ class StageNode(Node):
         #   yaw 회전 중에는 합치지 않는다 — 회전은 지나가는 자세들의 교집합을
         #   미리 검사했고, 도중에 XY 가 움직이면 그 검사가 무효가 된다.
         if self.moving and not self.yaw_moving and self.target_unit == 'mm':
+            return self._merge(want)
+
+        # ⚠⚠ **회전 중에도 XY 를 움직일 수 있다 — 단 회전 안전창 안에서만.**
+        #   안전 검사는 "지나가는 자세 전부의 작업영역 **교집합**(축별 min/max
+        #   박스) 안인가" 다. 박스는 **볼록**하므로 박스 안의 두 점을 잇는 직선은
+        #   전부 박스 안이다 — 즉 창 안에서만 움직이면 모든 중간 자세에서 안전이
+        #   유지된다. 전에는 "한 점이 창 안인가" 만 보고 XY 를 고정시켜서,
+        #   회전이 끝나기를 기다렸다가 XY 를 옮겼다 (동작이 끊겼다).
+        #   Z 는 받지 않는다 — 회전은 건이 원을 그리므로 올라가 있어야 한다.
+        if self.yaw_moving:
+            if 'z' in want:
+                return self._reject('회전 중에는 Z 를 받지 않는다 (건이 원을 그린다)')
+            win = self.yaw_win
+            if win:
+                for ax in ('x', 'y'):
+                    if ax in want and not (win[ax][0] <= want[ax] <= win[ax][1]):
+                        return self._reject(
+                            f'회전 중 {ax}={want[ax]:.1f}mm 는 회전 안전창 '
+                            f'{win[ax][0]:.1f}~{win[ax][1]:.1f}mm 밖이다')
             return self._merge(want)
 
         self._begin(want, 'mm')

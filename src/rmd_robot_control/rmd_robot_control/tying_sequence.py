@@ -193,6 +193,7 @@ class TyingSequence(Node):
         self._fire_phase = 0
         self._z_sent = False         # 이 목표에서 Z 하강을 이미 보냈는가
         self._xy_sent = False        # XY 목표를 한 번은 보냈는가
+        self._xy_in_win = False      # 회전 중 XY 를 창 안으로 보냈는가
         self._xy_t = 0.0
         # 접수한 목표 수. **상위가 "내 목표가 들어갔나" 를 가리는 유일한 근거다.**
         # `step` 만 보면 안 된다 — 목표가 **이미 충족된 자리**에서는
@@ -356,10 +357,22 @@ class TyingSequence(Node):
         return self._after_z_clear(why)
 
     def _needs_z_clear(self):
-        if self.goal_z is None:
-            return False                      # Z 를 안 쓰는 운전이다
+        """움직이기 전에 Z 를 올려야 하는가. **목표에 z 가 없어도 본다.**
+
+        ⚠⚠ 전에는 `goal_z is None` 이면 곧바로 False 였다. 복귀 목표는 z 가
+          NaN 이라 거기서 빠졌고, 그래서 **Z 가 -46.9mm 로 내려간 채 XY 후퇴가
+          시작됐다** (2026-10-04). 앞 점이 충돌로 실패해 Z 가 내려간 상태로
+          남은 것이 방아쇠였다 — 충돌 감지는 제대로 돌았고 뒤처리가 틀렸다.
+          **Z 를 올리는 것은 이 목표가 Z 를 쓰는지와 무관하다.**
+
+        회전이 필요하면 `z_safe` 까지, 평행이동만이면 `z_clear_mm` 까지면 된다 —
+        yaw 는 건이 원을 그려 여유가 더 필요하다.
+        """
         z = self._z()
-        return z is not None and z < self.z_safe - self.z_tol
+        if z is None:
+            return False                      # 모르면 판단하지 않는다
+        need = (self.z_safe if self.want_pose != self._pose() else self.z_clear)
+        return z < need - self.z_tol
 
     def _after_z_clear(self, why):
         if self.want_pose == self._pose():
@@ -478,15 +491,47 @@ class TyingSequence(Node):
             + f") — stage_node: {self._stage_detail()}")
 
     def _do_rotate(self):
+        """yaw 를 돌린다. **돌리면서 XY 도 목표 쪽으로 옮긴다.**
+
+        회전 안전창은 지나가는 자세들의 작업영역 **교집합**(축별 min/max 박스)
+        이고 박스는 볼록하다 — 그 안의 두 점을 잇는 직선은 전부 박스 안이다.
+        그래서 창 안에서만 움직이면 모든 중간 자세에서 안전이 유지된다
+        (사용자 요청 2026-10-04: "회전할 때도 기다리지 않고 XY 가 조금 움직였으면").
+
+        회전이 끝나면 `MOVE_XY` 가 창 밖의 나머지를 간다.
+        """
         if self._pose() == self.want_pose:
             return self._enter(Step.MOVE_XY,
                                f'{pose_label(self.want_pose)} 도착 → 결속 지점으로')
-        if self._stage_busy():
+        if self._stage_busy() and not self._yaw_turning():
             return
-        if time.time() - self._sent > 1.5:
+        if time.time() - self._sent > 1.5 and not self._yaw_turning():
             self._sent = time.time()
+            self._xy_in_win = False
             self.yaw_pub.publish(Int32(data=int(self.want_pose)))
             self.detail = f'{pose_label(self.want_pose)}로 회전 중'
+            return
+        # 회전이 시작된 뒤 **한 번** XY 를 창 안쪽 목표로 보낸다
+        if self._yaw_turning() and not self._xy_in_win:
+            win, _passed = transit_window(self.env, self.pose_id,
+                                          self._pose(), self.want_pose)
+            if not win:
+                win, _passed = transit_window(
+                    self.env, self.pose_id, self.want_pose, self.want_pose)
+            if win:
+                tgt = {ax: self._inside(g, win[ax])
+                       for ax, g in zip(('x', 'y'), self.goal)}
+                cur = dict(zip(('x', 'y'), self._mm()))
+                self._xy_in_win = True
+                if any(cur[ax] is None or abs(cur[ax] - tgt[ax]) > self.tol
+                       for ax in ('x', 'y')):
+                    self.goal_pub.publish(
+                        Point(x=tgt['x'], y=tgt['y'], z=NAN))
+                    self.detail = (f'{pose_label(self.want_pose)}로 회전 중 — '
+                                   f"XY 도 함께 ({tgt['x']:.0f}, {tgt['y']:.0f})")
+
+    def _yaw_turning(self):
+        return bool((self.stage or {}).get('yaw_moving'))
 
     def _do_move_xy(self):
         """결속 지점으로. 목표에 가까워지면 **Z 하강을 미리 보낸다.**

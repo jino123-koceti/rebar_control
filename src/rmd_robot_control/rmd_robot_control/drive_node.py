@@ -71,6 +71,11 @@ class DriveNode(Node):
         self.declare_parameter('grant_wait_sec', 3.0)
         # 바퀴 각도가 이보다 오래 묵으면 거부·중단한다. 10Hz 로 오므로 0.5초면 넉넉하다
         self.declare_parameter('angle_stale_sec', 0.5)
+        # ⚠ 좌우차가 이만큼 벌어지면 **스스로 멈춘다.** 직진 보정의 부호가
+        #   틀리면 양의 피드백이 되어 선회로 커지는데, 그걸 사람이 보고 이스탑
+        #   누르기 전에 코드가 끊어야 한다 (2026-10-04 에 그렇게 당했다).
+        #   실측 정상 좌우차는 전진 700mm 에서 ±0.4mm 였다.
+        self.declare_parameter('max_drift_mm', 30.0)
 
         g = self.get_parameter
         self.speed = float(g('speed_mps').value)
@@ -81,6 +86,7 @@ class DriveNode(Node):
         self.kstraight = float(g('straight_gain').value)
         self.grant_wait = float(g('grant_wait_sec').value)
         self.stale = float(g('angle_stale_sec').value)
+        self.max_drift = float(g('max_drift_mm').value)
 
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.mode_pub = self.create_publisher(String, '/control_mode_request', 10)
@@ -261,6 +267,12 @@ class DriveNode(Node):
         #   돌아가 멈췄다. `stage_node` 도 매 tick 재요청한다.
         self._request('auto')
 
+        dr = self._drift()
+        if self.max_drift > 0 and abs(dr) > self.max_drift:
+            self.rejects += 1
+            return self._stop(
+                f'좌우차 {dr:+.1f}mm 가 한계 {self.max_drift:.0f}mm 를 넘었다 — '
+                f'직진이 깨졌다 (보정 부호나 바퀴 슬립을 보라)')
         left = self._left()
         if self._moved() is None:
             self.rejects += 1
@@ -270,9 +282,15 @@ class DriveNode(Node):
 
         v = self.speed if abs(left) > self.approach else self.creep
         v = math.copysign(v, left)
-        # 직진 유지 — 많이 간 쪽을 늦춘다. 후진이면 보정 방향도 뒤집힌다.
-        w = -self.kstraight * self._drift() * (1.0 if left > 0 else -1.0)
+        # 직진 유지 — 많이 간 쪽을 늦춘다.
+        # ⚠⚠ **전진·후진에서 부호가 같다.** 방향각 변화는
+        #   θ ≈ (오른쪽 이동거리 - 왼쪽 이동거리) / 축거 로 진행 방향과 무관하다.
+        #   2026-10-04 에 후진에서 부호를 뒤집어 놓았더니 **양의 피드백**이 되어
+        #   장비가 선회했다 (사람이 이스탑으로 멈췄다). 전진 두 번은 멀쩡했으니
+        #   전진만 시험하면 드러나지 않는다.
+        w = -self.kstraight * self._drift()
         w = max(-self.cfg['max_angular_radps'], min(self.cfg['max_angular_radps'], w))
+        _ = dr                                 # 위에서 이미 한계를 봤다
         t = Twist()
         t.linear.x = max(-self.cfg['max_linear_mps'],
                          min(self.cfg['max_linear_mps'], v))

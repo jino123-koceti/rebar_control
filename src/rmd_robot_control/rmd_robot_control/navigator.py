@@ -81,6 +81,17 @@ class Navigator(Node):
         # 기본은 **한 자리에서 결속 한 바퀴**다. 주행이 들어간 미션은 명시적으로
         # 넘겨야 한다 — 기본값이 장비를 움직이면 안 된다.
         self.declare_parameter('mission', ['tie'])
+        # ── 경로 파일에서 미션 만들기 ──────────────────────────────────────
+        # `번호, x, y` (mm) 한 줄씩. x = 전진(+), y = **좌측(+)** 이다
+        # (횡이동 부호 규약과 같다 — `/lateral/step` 의 +N 이 좌측이다).
+        # 웨이포인트 사이를 전진·횡이동 단계로 바꾸고 각 지점에서 결속한다.
+        # ⚠ 이 장비는 조향이 없다 — **대각선 이동은 못 한다.** x·y 가 동시에
+        #   바뀌는 구간은 거부한다 (조용히 둘로 쪼개면 경로가 사람 의도와
+        #   달라질 수 있다 — 어느 쪽을 먼저 갈지는 공간이 정한다).
+        self.declare_parameter('path_file', '')
+        self.declare_parameter('tie_at_waypoints', True)
+        self.declare_parameter('lateral_mm_per_turn', 100.0)
+        self.declare_parameter('lateral_max_turns', 4)
         self.declare_parameter('drive_timeout_sec', 180.0)
         self.declare_parameter('tie_timeout_sec', 900.0)
         self.declare_parameter('lateral_timeout_sec', 180.0)
@@ -107,10 +118,12 @@ class Navigator(Node):
             self.get_parameter('drive_overlap_kinds').value or ())
 
         self.steps, bad = [], None
+        path = str(self.get_parameter('path_file').value or '')
         try:
-            self.steps = [Step(t) for t in
-                          (self.get_parameter('mission').value or [])]
-        except ValueError as e:
+            texts = (self._from_path(path) if path
+                     else (self.get_parameter('mission').value or []))
+            self.steps = [Step(t) for t in texts]
+        except (ValueError, OSError) as e:
             bad = str(e)
 
         self.drive_pub = self.create_publisher(Float32, '/drive/step', 10)
@@ -150,6 +163,59 @@ class Navigator(Node):
             self.get_logger().info(
                 f"미션 실행기 시작 — {len(self.steps)}단계, /mission/start 로 실행: "
                 + ' → '.join(s.text for s in self.steps))
+
+    # ---- 경로 파일 ---------------------------------------------------------
+    def _from_path(self, path):
+        """`번호, x, y` (mm) 목록을 미션 단계로 바꾼다.
+
+        x = 전진(+), y = 좌측(+). 웨이포인트마다 결속하고, 사이를 전진·횡이동
+        으로 잇는다. 횡이동은 `lateral_mm_per_turn` 단위로만 가므로 나머지가
+        남으면 거부한다 — 몰래 반올림하면 사람이 센 거리와 달라진다.
+        """
+        mm_t = float(self.get_parameter('lateral_mm_per_turn').value)
+        max_t = int(self.get_parameter('lateral_max_turns').value)
+        tie = bool(self.get_parameter('tie_at_waypoints').value)
+        pts = []
+        for i, line in enumerate(open(path, encoding='utf-8'), 1):
+            line = line.split('#')[0].strip()
+            if not line:
+                continue
+            f = [v.strip() for v in line.split(',')]
+            if len(f) < 3:
+                raise ValueError(f"{path}:{i} — '번호, x, y' 세 값이 필요하다: {line!r}")
+            pts.append((float(f[1]), float(f[2])))
+        if len(pts) < 2:
+            raise ValueError(f"{path} — 웨이포인트가 {len(pts)}개뿐이다 (2개 이상)")
+        out = ['tie'] if tie else []
+        for k in range(1, len(pts)):
+            dx = pts[k][0] - pts[k - 1][0]
+            dy = pts[k][1] - pts[k - 1][1]
+            if abs(dx) > 1.0 and abs(dy) > 1.0:
+                raise ValueError(
+                    f"{path} — {k}→{k+1} 구간이 대각선이다 "
+                    f"(dx={dx:+.0f}, dy={dy:+.0f}). 이 장비는 조향이 없어 "
+                    f"전진과 횡이동을 따로 해야 한다 — 경로를 두 줄로 나누라")
+            if abs(dx) > 1.0:
+                out.append(f'drive {dx:.0f}')
+            elif abs(dy) > 1.0:
+                turns = dy / mm_t
+                if abs(turns - round(turns)) > 1e-6:
+                    raise ValueError(
+                        f"{path} — {k}→{k+1} 의 횡이동 {dy:+.0f}mm 가 "
+                        f"{mm_t:.0f}mm 의 배수가 아니다 (기구가 회전 단위로만 간다)")
+                turns = int(round(turns))
+                # 한 번에 갈 수 있는 회전 수가 제한돼 있다 — 나눠 보낸다
+                while turns:
+                    step = max(-max_t, min(max_t, turns))
+                    out.append(f'lateral {step:+d}')
+                    turns -= step
+            else:
+                continue                      # 제자리 — 단계를 만들지 않는다
+            if tie:
+                out.append('tie')
+        self.get_logger().info(
+            f"경로 {path} — 웨이포인트 {len(pts)}개 → {len(out)}단계")
+        return out
 
     # ---- 입력 --------------------------------------------------------------
     def _on_drive(self, msg):
