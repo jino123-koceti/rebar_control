@@ -43,14 +43,16 @@ from rmd_robot_control.axis_config import (envelope_violation, load_envelope,
                                            transit_window)
 
 STEP_MM, STEP_GUN = 12.0, 1.2      # tick 당 이동량 (0.1s tick)
+# ⚠ Z 는 `tick` 의 축 루프가 그대로 처리한다 (getattr/setattr 로 축 이름을
+#   쓴다). 'z' 를 목표에 넣기만 하면 X·Y 와 같은 속도로 움직인다.
 
 
 class FakeStage(Node):
-    def __init__(self, pose, x, y):
+    def __init__(self, pose, x, y, z=0.0):
         super().__init__('fake_stage')
         self.env = load_envelope()
         self.info = load_pose_id('yaw')
-        self.x, self.y = x, y
+        self.x, self.y, self.z = x, y, z
         self.pose = pose                  # 정수 자세 또는 None(자세 사이)
         # 자세 사이는 1번과 2번의 중간으로 둔다 — 실물도 그 구간은 후보가 둘이라
         # 판별을 거부한다
@@ -81,12 +83,15 @@ class FakeStage(Node):
         return bool(self.tgt) or self.yaw_tgt is not None
 
     def _on_goal(self, m):
-        want = {k: v for k, v in (('x', m.x), ('y', m.y)) if not math.isnan(v)}
+        want = {k: v for k, v in (('x', m.x), ('y', m.y), ('z', m.z))
+                if not math.isnan(v)}
         if not want:
             return self._reject('목표가 비어 있다')
         if self._busy():                 # 실물과 같다 — 한 번에 한 동작
             return self._reject('이미 이동 중이다')
-        bad = envelope_violation(self.env, self.pose, want)
+        # 작업영역 검사는 X·Y 만이다 — 실물도 Z 는 자세별 실측이 없다
+        bad = envelope_violation(self.env, self.pose,
+                                 {k: v for k, v in want.items() if k != 'z'})
         if bad:
             return self._reject(bad)
         self.tgt = want
@@ -142,7 +147,8 @@ class FakeStage(Node):
     def pub(self):
         self.st.publish(String(data=json.dumps({
             'moving': bool(self.tgt) or self.yaw_tgt is not None,
-            'current_mm': {'x': round(self.x, 2), 'y': round(self.y, 2), 'z': 0.0},
+            'current_mm': {'x': round(self.x, 2), 'y': round(self.y, 2),
+                           'z': round(self.z, 2)},
             'pose': self.pose,
             'pose_detail': (pose_label(self.pose) if self.pose is not None
                             else f'자세 사이 (건 {self.gun:+.2f}°)'),
@@ -158,18 +164,24 @@ def main():
                     help='시작 자세. -1 이면 **자세 사이**(판별 불가)로 시작한다')
     ap.add_argument('--x', type=float, default=400.0)
     ap.add_argument('--y', type=float, default=100.0)
+    ap.add_argument('--z', type=float, default=0.0, help='시작 Z mm')
     ap.add_argument('--goal-x', type=float, required=True)
     ap.add_argument('--goal-y', type=float, required=True)
+    ap.add_argument('--goal-z', type=float, default=float('nan'),
+                    help='결속 깊이 mm. 주면 Z 하강·결속건·Z 상승까지 돈다')
+    ap.add_argument('--goal-pose', type=int, default=0,
+                    help='자세를 지정한다 (0=지정 없음 → 사분면 규칙)')
     ap.add_argument('--timeout', type=float, default=60.0)
     a = ap.parse_args()
 
     rclpy.init()
-    fake = FakeStage(None if a.pose < 0 else a.pose, a.x, a.y)
+    fake = FakeStage(None if a.pose < 0 else a.pose, a.x, a.y, a.z)
     seen = []
     fake.create_subscription(
         String, '/tying/status',
         lambda m: seen.append(json.loads(m.data)), 10)
     gp = fake.create_publisher(Point, '/tying/goal', 10)
+    pp = fake.create_publisher(Int32, '/tying/goal_pose', 10)
 
     def pump(sec):
         t0 = time.time()
@@ -179,8 +191,13 @@ def main():
     pump(2.0)
     print(f"시작  {'자세 사이' if a.pose < 0 else pose_label(a.pose)}"
           f"  X {a.x:.1f}  Y {a.y:.1f}")
-    print(f"목표  X {a.goal_x:.1f}  Y {a.goal_y:.1f}\n")
-    gp.publish(Point(x=a.goal_x, y=a.goal_y, z=float('nan')))
+    print(f"목표  X {a.goal_x:.1f}  Y {a.goal_y:.1f}"
+          + ('' if math.isnan(a.goal_z) else f"  Z {a.goal_z:.1f}")
+          + ('' if a.goal_pose <= 0 else f"  자세 {a.goal_pose} 지정") + "\n")
+    if a.goal_pose > 0:
+        pp.publish(Int32(data=a.goal_pose))
+        pump(0.3)                     # 자세 지정이 목표보다 **먼저** 가야 한다
+    gp.publish(Point(x=a.goal_x, y=a.goal_y, z=a.goal_z))
 
     last, t0 = None, time.time()
     while time.time() - t0 < a.timeout:
@@ -194,6 +211,7 @@ def main():
             print(f"  {time.time()-t0:5.1f}s  [{s['step']:<8}] "
                   f"X {s['current_mm']['x'] or 0:6.1f}  "
                   f"Y {s['current_mm']['y'] or 0:6.1f}  "
+                  f"Z {s['current_mm'].get('z') or 0:6.1f}  "
                   f"자세 {str(s['pose_now']):<5} → {str(s['pose_want']):<5} "
                   f"{s['detail']}")
         if s['step'] in ('done', 'failed'):

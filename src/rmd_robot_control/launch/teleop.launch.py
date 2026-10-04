@@ -135,9 +135,33 @@ def generate_launch_description():
         }],
         respawn=True, respawn_delay=2.0,
     )
+    # ⚠⚠ **결속건은 기본 꺼짐이다.** 켜는 것은 명시적 결정이어야 한다 —
+    #   되돌릴 수 없고, 작업영역 안에 사람이 있을 수 있다. 꺼져 있으면 Z 하강·
+    #   상승은 그대로 하고 건만 건너뛴다 (예행연습이 그 상태다).
+    #   켤 때: gun_enabled:=true. Pololu 노드(/motor_0/vel)가 떠 있어야 한다.
+    # ⚠ Z 는 목표에 z 가 실려 올 때만 움직인다 (`tying_planner` 가 모델에서
+    #   계산해 싣는다). 손으로 x·y 만 보내면 Z 단계는 건너뛴다.
     tying = Node(
         package='rmd_robot_control', executable='tying_sequence',
         name='tying_sequence', output='screen',
+        parameters=[{
+            'gun_enabled': False,
+            'z_safe_mm': 0.0,
+            # 모델 잔차가 Z 2.7mm 다. 실측 결속깊이는 -58~-83mm 였으니
+            # 그 바깥은 모델이 틀린 것으로 보고 거부한다.
+            'z_tie_min_mm': -95.0,
+            'z_tie_max_mm': -40.0,
+        }],
+        respawn=True, respawn_delay=2.0,
+    )
+    # ⚠ `plan_only` 를 **켜 둔다.** /plan/start 는 검출→계획까지만 하고 멈추고,
+    #   실행은 /plan/execute 로 따로 받는다. 검출이 틀리면 장비가 철근을 향해
+    #   그대로 가므로, 사람이 계획을 보고 한 번 끊는 지점이 있어야 한다.
+    #   한 번에 돌리려면 plan_only:=false.
+    planner = Node(
+        package='rmd_robot_control', executable='tying_planner',
+        name='tying_planner', output='screen',
+        parameters=[{'plan_only': True}],
         respawn=True, respawn_delay=2.0,
     )
 
@@ -145,5 +169,5 @@ def generate_launch_description():
         LogInfo(msg=['리모콘 조작 구성 기동 — 안전 차단: ', use_safety,
                      ' / 호밍은 자동으로 돌지 않는다 (/homing_cmd 로 시작)']),
         motor, lateral, remote_bridge, remote_teleop, ezi_io, safety, mode_arbiter,
-        homing, stage, tying,
+        homing, stage, tying, planner,
     ])
