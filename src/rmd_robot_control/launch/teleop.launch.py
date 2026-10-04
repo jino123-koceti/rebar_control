@@ -59,9 +59,23 @@ def generate_launch_description():
     motor = Node(
         package='rmd_robot_control', executable='position_control_node',
         name='position_control_node', output='screen',
-        parameters=[params, {'safety_timeout': safety_timeout}],
+        parameters=[params, {'safety_timeout': safety_timeout,
+                             'stage_accel_dpss': 12000.0}],
         remappings=[('cmd_vel', '/cmd_vel'), ('joint_states', '/joint_states'),
                     ('motor_status', '/motor_status')],
+        # ⚠⚠ 상부축 가감속. **0x43 은 ROM 에 남지 않아 매 기동 재적용이 필수**라
+        #   노드가 기동 3초 뒤 한 번 넣는다. 2026-10-04 실측(Z 80mm 왕복):
+        #       가속    하강        상승       전류max
+        #         200   5.7mm/s    5.2mm/s    2.06A   ← 낮추면 이만큼 느려진다
+        #        1000  12.4       10.8        1.87
+        #        3000  16.0       13.5        1.80   ← 손대기 전 수준
+        #       12000  18.4       14.9        1.86   ← 여기서 포화
+        #       30000  18.9       15.1        1.98
+        #       60000  18.5       15.4        1.67
+        #   12000 위로는 안 빨라진다. 남은 한계는 가속도 속도도 아니라 **Z 의
+        #   감속비가 촘촘한 것**(0.0906mm/도, X 의 1/3)이라 기구 문제다.
+        #   yaw 는 가속에 둔감하다 (12000·30000·60000 모두 2.7~3.4초, 노이즈 안).
+        #   전류는 전 구간 1.0~2.4A 로 상한(11.7A)과 멀다.
         respawn=True, respawn_delay=2.0,
     )
     lateral = Node(
@@ -224,14 +238,15 @@ def generate_launch_description():
         }],
         respawn=True, respawn_delay=2.0,
     )
-    # ⚠ `plan_only` 를 **켜 둔다.** /plan/start 는 검출→계획까지만 하고 멈추고,
-    #   실행은 /plan/execute 로 따로 받는다. 검출이 틀리면 장비가 철근을 향해
-    #   그대로 가므로, 사람이 계획을 보고 한 번 끊는 지점이 있어야 한다.
-    #   한 번에 돌리려면 plan_only:=false.
+    # ⚠ [2026-10-04] `plan_only` 를 **끈다** (전에는 True 였다). 검출이 틀렸을 때
+    #   사람이 끊는 지점을 두려 했는데, 미션 자체가 `/mission/start` 로 사람이
+    #   시작하는 구조라 매 `tie` 마다 또 확인을 받는 것은 과했다 — 미션이 단계마다
+    #   멈춰서 "결속을 안 한다" 로 보였다.
+    #   계획만 보고 싶으면 plan_only:=true 로 띄우면 된다 (/plan/execute 로 이어서).
     planner = Node(
         package='rmd_robot_control', executable='tying_planner',
         name='tying_planner', output='screen',
-        parameters=[{'plan_only': True}],
+        parameters=[{'plan_only': False}],
         respawn=True, respawn_delay=2.0,
     )
 

@@ -55,8 +55,14 @@ orbbec:
     #   depth 640x400 을 쓰더라도 depth_registration 이 컬러 해상도(1280x800)로
     #     업샘플해 발행하므로 하위 파이프라인은 그대로다. 유효픽셀 67.1%.
     #   ⚠ "토픽은 있는데 데이터가 안 오는" 모습이므로 **반드시 수신율을 재라.**
-    #   ⚠  는 gemini2L 을 **인자
-    #     없이** include 한다 → 컬러 30fps 기본값이라 depth 가 죽는다. [미수정]
+    #   ⚠ [해결 2026-10-04] `full_system.launch.py` 가 gemini2L 을 **인자 없이**
+    #     include 해서 컬러 30fps 기본값이 되고 depth 가 죽던 문제 — 아래 값들을
+    #     `launch_arguments` 로 넘기도록 고쳤다.
+    # ⚠⚠ [2026-10-04] "The device might be connected via USB 2.0" 는 **대역폭
+    #   문제가 아닐 때도 찍힌다.** serial_number 없이 띄워 SDK 가 305 를 열었을
+    #   때 그 메시지가 나왔고, 허브·대역폭을 두 번 헛짚었다. 2L 은 480Mbps
+    #   링크에서도 이 설정(depth 640x400@10 + color 1280x800@10)으로 ~10fps 가
+    #   나온다 — 실측 확인했다. **프로파일 오류가 나면 먼저 serial 을 보라.**
     launch_args:
       depth_registration: true   # CAD 강체변환이 컬러에 정합된 depth 를 쓴다
       depth_width: 640           # 네이티브. registration 이 1280x800 으로 업샘플

@@ -357,7 +357,16 @@ class StageNode(Node):
         self.create_timer(0.05, self.tick)
         # 유예가 끝난 축의 브레이크를 잠근다 (`brake_hold_axes`)
         self.create_timer(0.2, self._lock_tick)
-        self.create_timer(0.5, self._publish_status)
+        # ⚠⚠ **2Hz 는 느리다.** 상위가 이 상태로 겹침을 판단한다 —
+        #   `Z_UP` 은 Z 가 -12mm 를 지나면 끝내고 다음 점의 XY 를 합치는데,
+        #   Z 가 17mm/s 로 올라오면 0.5초 표본 사이에 8.5mm 가 지나간다.
+        #   그래서 "-12 를 넘었다" 를 알아챌 때 실제 Z 는 이미 0 근처고,
+        #   겹칠 구간(약 0.7초)이 **지연에 통째로 먹혔다** (2026-10-04:
+        #   "z 끝나고 xy 움직이는 것 같다" 는 지적의 실제 원인).
+        #   `xy_blend_mm`(목표 40mm 안에서 Z 하강 선행)도 XY 80mm/s 면 0.5초에
+        #   지나가므로 2Hz 로는 그 창을 못 본다.
+        #   tick 과 같은 20Hz 로 올린다 — JSON 한 줄이라 부하는 무시할 수 있다.
+        self.create_timer(0.05, self._publish_status)
         self.get_logger().info(
             "스테이지 노드 시작 — /stage/goal (mm) 로 목표를 준다. "
             "mm 는 호밍 원점 기준이다")
@@ -528,7 +537,10 @@ class StageNode(Node):
         self.yaw_tgt = (self.deg['yaw']
                         + (self.gun_now() - g[want]['gun']) * info['gear'])
         self.yaw_moving = True
-        self.t_start = self.t_arm = time.time()
+        # ⚠ `t_grant_lost` 도 같이 초기화한다 — 안 하면 묵은 값이 남아
+        #   회전 시작 즉시 "제어 권한 없음" 으로 멈춘다 (2026-10-04, 권한 판정을
+        #   '잃은 지 얼마나 됐는가' 로 바꿀 때 이 경로를 빼먹었다).
+        self.t_start = self.t_arm = self.t_grant_lost = time.time()
         self._yaw_sent = 0.0
         self.detail = f'{pose_label(cur)} → {pose_label(want)} — 브레이크 해제 대기'
         self._brake('release', 'yaw')

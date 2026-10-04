@@ -210,14 +210,39 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('use_zedxmini'))
     )
 
-    # Orbbec Gemini 2L - 상단 정면 교차점 검출 (호모그래피 자율결속). USB3, GMSL과 별개라 충돌 없음.
+    # Orbbec Gemini 2L - 상단 정면 교차점 검출. ⚠ **USB 3.0 링크여야 한다** —
+    # 2.0 에 물리면 SDK 가 "The device might be connected via USB 2.0" 로
+    # 스트림을 아예 열지 않는다 (해상도를 낮춰도 안 된다, 2026-10-04 실측).
     # Topic: /camera/color/image_raw (1280x800), /camera/depth/image_raw
+    # ⚠⚠ [수정 2026-10-04] **인자를 반드시 넘긴다.** 인자 없이 include 하면
+    #   컬러 30fps 기본값이 되고 그러면 **depth 가 아예 안 뜬다** (어떤 depth
+    #   설정으로도). 근거는 rebar_base_control/config/cameras.yaml 의 실측 표:
+    #       depth 1280x800@10 + color 1280x800@30 → depth 0fps
+    #       depth 1280x800@10 + color 1280x800@10 → depth 0.1fps (굶는다)
+    #       depth  640x400@10 + color 1280x800@10 → 둘 다 ~9.7fps ✓
+    #   결속은 정지 상태에서 재므로 10fps 로 충분하다. depth 640x400 을 써도
+    #   depth_registration 이 컬러 해상도로 업샘플해 발행한다.
     orbbec_camera = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             PathJoinSubstitution([
                 FindPackageShare('orbbec_camera'), 'launch', 'gemini2L.launch.py'
             ])
         ]),
+        launch_arguments={
+            # ⚠⚠ **serial_number 가 없으면 안 된다.** 305 두 대도 같은 Orbbec 이라
+            #   serial 없이 띄우면 SDK 가 "default device" 로 **305 를 열고**,
+            #   305 에는 이 프로파일이 없어 거부한다. 그때 찍히는 메시지가
+            #   "The device might be connected via USB 2.0" 라서 대역폭 문제로
+            #   오진하기 쉽다 (2026-10-04 에 그렇게 두 번 헛짚었다 — 허브는 멀쩡했다).
+            'serial_number': 'CPAV563008Y',
+            'depth_registration': 'true',
+            'depth_width': '640', 'depth_height': '400', 'depth_fps': '10',
+            'color_width': '1280', 'color_height': '800', 'color_fps': '10',
+            'enable_ir': 'false',
+            'enable_left_ir': 'false', 'enable_right_ir': 'false',
+            'enable_point_cloud': 'false',
+            'enable_colored_point_cloud': 'false',
+        }.items(),
         condition=IfCondition(LaunchConfiguration('use_orbbec'))
     )
 

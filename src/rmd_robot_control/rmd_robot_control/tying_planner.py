@@ -233,6 +233,19 @@ class TyingPlanner(Node):
             return self.get_logger().warning(f'이미 진행 중이다 ({self.phase})')
         if self.model is None or self.env is None:
             return self._fail('모델이나 작업영역 표가 없다')
+        # ⚠ **기동 때 한 번만 읽으면 `ros2 param set` 이 안 먹는다.** 2026-10-04 에
+        #   `plan_only` 를 런타임으로 껐는데 캐시된 True 가 남아, 미션이 매
+        #   `tie` 마다 계획만 세우고 멈췄다 (사람이 "결속은 안 하나" 로 알아챘다).
+        #   속도·충돌 파라미터는 이동마다 다시 읽게 해 두었는데 이것만 빠졌다.
+        g = self.get_parameter
+        self.plan_only = bool(g('plan_only').value)
+        self.send_z = bool(g('send_z').value)
+        self.min_conf = float(g('min_confidence').value)
+        self.dedup = float(g('dedup_mm').value)
+        self.park_pose = int(g('park_pose').value)
+        self.detect_x = float(g('detect_x_mm').value)
+        self.detect_y = float(g('detect_y_mm').value)
+
         self.plans, self.cur = [], -1
         self.grid = None
         self._sent = 0.0

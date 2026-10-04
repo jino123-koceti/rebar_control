@@ -77,6 +77,8 @@ R3_PLANNED = {
     '/lateral/step': 'navigator 가 발행한다. 사람이 직접 주는 경로도 남아 있다',
     '/drive/step': '사람·미션이 보내는 주행 스텝 (ros2 topic pub)',
     '/drive/abort': '사람·UI 가 보내는 주행 중단 명령',
+    '/motor_accel': '상부축 가감속 — 값을 찾는 동안 사람이 보낸다 (ros2 topic pub).'
+                    ' 기동 시에는 stage_accel_dpss 파라미터로 들어간다',
     '/plan/execute': '사람·UI 가 보내는 계획 실행 명령'
                      ' (plan_only 로 세워 둔 계획을 실행한다)',
     '/tying/abort': '사람·UI 가 보내는 중단 명령',

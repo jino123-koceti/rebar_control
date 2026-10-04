@@ -53,6 +53,14 @@ class PositionControlNode(Node):
 
         # 파라미터 선언
         self.declare_parameter('can_interface', 'can2')
+        # ⚠⚠ **상부축 가감속.** 0 이면 건드리지 않는다 (옛 동작).
+        #   X4 계열은 `0x43` 이 ROM 에 남지 않아 **매 기동 재적용이 필수**다.
+        #   2026-10-04 실측으로 상부축 실제 가속이 약 200 dps/s 였다 —
+        #   Z 는 80mm(모터축 883°)를 4.7초, yaw 는 267°를 2.3초에 가는데 둘 다
+        #   삼각 프로파일로 역산하면 같은 값이 나온다. 그래서 **속도를 올려도
+        #   안 빨라졌다** (Z 설정 20·40·60 모두 실측 17mm/s, yaw 400dps 에서 포화).
+        #   줄이려면 속도가 아니라 이 값이다.
+        self.declare_parameter('stage_accel_dpss', 0.0)
         # 주행 바퀴 각도(0x92)를 10Hz 로 읽는다 — 거리 스텝 주행이 이것을 쓴다.
         # CAN 부담이 문제가 되면 끌 수 있게 파라미터로 둔다.
         self.declare_parameter('wheel_angle_poll', True)
@@ -99,6 +107,7 @@ class PositionControlNode(Node):
         # 파라미터 가져오기
         self.can_interface = self.get_parameter('can_interface').value
         self.wheel_angle_poll = bool(self.get_parameter('wheel_angle_poll').value)
+        self.stage_accel = float(self.get_parameter('stage_accel_dpss').value)
         self.motor_ids = self.get_parameter('motor_ids').value
         self.joint_names = self.get_parameter('joint_names').value
         self.max_position = self.get_parameter('max_position').value
@@ -373,6 +382,13 @@ class PositionControlNode(Node):
         self.brake_cmd_sub = self.create_subscription(
             String, '/brake_cmd', self._on_brake_cmd, 10)
 
+        # 상부축 가감속 — 값을 찾는 동안 손으로 바꿀 수 있게 열어 둔다.
+        #   ros2 topic pub --once /motor_accel std_msgs/String "{data: 'all 2000'}"
+        #   ros2 topic pub --once /motor_accel std_msgs/String "{data: '0x147 2000'}"
+        # ⚠ ROM 에 남지 않으므로 기동마다 `stage_accel_dpss` 로 다시 들어간다.
+        self.accel_cmd_sub = self.create_subscription(
+            String, '/motor_accel', self._on_accel_cmd, 10)
+
         # 단회전 절대 위치 발행 (0x61 mod 262144).
         # **멀티턴은 전원에 날아가지만 단회전값은 물리적으로 고정**이라, 전원 재투입
         # 후에도 "지금 어느 각도인가" 를 말해준다. 호밍 전제 검사(yaw 가 12시 근처인가)
@@ -445,6 +461,12 @@ class PositionControlNode(Node):
         )
         
         # 타이머 설정 (bus-off 방지: 모터 상태 읽기 비활성화)
+        # ⚠ 상부축 가감속은 **기동마다** 다시 넣어야 한다 (0x43 이 ROM 에 안 남는다).
+        #   CAN 이 열린 뒤여야 하므로 타이머로 한 번만 늦게 부른다.
+        if self.stage_accel > 0:
+            self._accel_once = self.create_timer(
+                3.0, lambda: (self.apply_stage_accel_limits(self.stage_accel),
+                              self._accel_once.cancel()))
         self.status_timer = self.create_timer(0.1, self.publish_status)  # 10Hz
         # self.motor_status_timer = self.create_timer(0.1, self.read_motor_status)  # 비활성화 (CAN 부하 감소)
         self.position_control_timer = self.create_timer(0.1, self.position_control_loop)  # 10Hz로 변경 (과부하 방지)
@@ -1664,6 +1686,40 @@ class PositionControlNode(Node):
                 self.get_logger().warning(
                     f"    ❌ 0x{motor_id:03X} accel idx {index:#04x} set failed"
                 )
+
+    def apply_stage_accel_limits(self, accel_dpss: int):
+        """상부축(주행 제외 전부)에 0x43 가감속을 적용한다.
+
+        ⚠ ROM 에 남지 않으므로 **기동마다** 부른다. 주행 축은 따로
+        `apply_drive_accel_limits` 가 맡는다 (값이 다르다).
+        """
+        n = 0
+        for mid in self.motor_ids:
+            if mid in (self.left_motor_id, self.right_motor_id):
+                continue
+            self.write_acceleration_limits(mid, accel_dpss)
+            time.sleep(0.01)
+            n += 1
+        self.get_logger().info(
+            f"상부축 {n}개에 가감속 {int(accel_dpss)} dps/s 적용 (모터축 기준)")
+
+    def _on_accel_cmd(self, msg):
+        """실험용 — "0x147 2000" 또는 "all 2000". 값을 찾는 동안 쓴다."""
+        parts = str(msg.data).split()
+        if len(parts) != 2:
+            return self.get_logger().error(
+                f"가감속 명령 형식: '<모터ID|all> <dps/s>' (받은 것: {msg.data!r})")
+        try:
+            val = int(float(parts[1]))
+        except ValueError:
+            return self.get_logger().error(f"숫자가 아니다: {parts[1]!r}")
+        if parts[0].lower() == 'all':
+            return self.apply_stage_accel_limits(val)
+        try:
+            mid = int(parts[0], 0)
+        except ValueError:
+            return self.get_logger().error(f"모터 ID 를 모르겠다: {parts[0]!r}")
+        self.write_acceleration_limits(mid, val)
 
     def apply_drive_accel_limits(self, accel_dpss: int = 20000):
         """Raise drive motors' accel/decel limits to improve step response."""

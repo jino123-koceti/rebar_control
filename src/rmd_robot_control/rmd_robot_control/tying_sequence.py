@@ -208,8 +208,10 @@ class TyingSequence(Node):
         self.t_step = 0.0
         self._sent = 0.0
 
-        self.create_timer(0.2, self.tick)
-        self.create_timer(0.5, self._publish)
+        # ⚠ 5Hz 는 겹침 판단에 느리다 — XY 80mm/s 면 한 tick 에 16mm 를 가고
+        #   `xy_blend_mm`(40mm) 창을 두세 tick 에 지나간다. 20Hz 로 올린다.
+        self.create_timer(0.05, self.tick)
+        self.create_timer(0.2, self._publish)
         self.get_logger().info(
             "결속 시퀀스 시작 — /tying/goal (x,y,z mm) 로 결속 지점을 준다. "
             "자세 선택 → Z 확보 → 후퇴 → 회전 → 이동"
