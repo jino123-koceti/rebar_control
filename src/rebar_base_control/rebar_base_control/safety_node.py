@@ -45,10 +45,17 @@ from rebar_base_interfaces.msg import RemoteControl, SafetyState
 BUMPERS = ('front', 'rear', 'left', 'right')
 LIMITS = ('x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max', 'yaw_home')
 # 리미트 → 막을 축 방향. yaw_home 은 원점 센서라 방향을 막지 않는다(호밍이 써야 한다).
+# ⚠⚠ **Z 만 부호가 반대다.** 막을 방향은 "리미트 쪽으로 더 가는 mm 방향" 인데,
+#   mm 는 **호밍 원점 기준**이고 Z 의 원점(z_min)은 **위쪽**이다:
+#       X  x_min(원점) → 0 .. +453.7     | y 도 같다
+#       Z  z_min(원점·위) → 0 .. **-139.2**   ← mm 가 아래로 갈수록 음수
+#   그래서 z_min 은 **'z+'**(원점 쪽 = 위)를 막아야 한다. 'z-' 로 두면 **내려가는
+#   방향을 막아** 결속 깊이로 갈 수 없다 — 2026-10-04 에 stage_node 가
+#   "z: 안전 차단으로 그 방향 이동 불가" 로 Z 명령을 통째로 버렸다.
 LIMIT_BLOCKS = {
     'x_min': 'x-', 'x_max': 'x+',
     'y_min': 'y-', 'y_max': 'y+',
-    'z_min': 'z-', 'z_max': 'z+',
+    'z_min': 'z+', 'z_max': 'z-',
 }
 
 

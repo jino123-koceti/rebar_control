@@ -133,8 +133,13 @@ class Calib(Node):
     # ⚠ 건 끝이 yaw 축에서 약 640mm 떨어져 있다 (실측 오프셋 1→2 가 10.44° 에
     #   116mm). 그래서 **건 1° = 약 11mm** 다. 1.0° 로 두면 11mm 틀어진 짝이
     #   그대로 섞인다 — 2026-10-04 에 2번(0.87°)·3번(0.60°) 이 안 잡혔다.
-    #   0.2° ≈ 2.2mm 로 조인다 (목표 정확도 ±5mm 의 절반 미만).
-    STALE_DEG = 0.2
+    # ⚠⚠ 그렇다고 **도달 허용오차보다 작게 두면 안 된다.** yaw 도달 판정이
+    #   모터축 3°(= 건 0.24°)이므로 정상 도달도 그만큼 벗어난다 — 0.2° 로 두었더니
+    #   방금 받은 정상 짝(+4.83° vs 설정 +4.60°)이 즉시 무효로 걸렸다.
+    #   0.35°(≈3.9mm) 로 둔다: 도달 오차 0.24° 는 통과하고, 자세 재정의(0.6~1.5°)는
+    #   걸린다. 남는 도달 오차는 위치로 최대 2.7mm 다 — ±5mm 예산 안이지만
+    #   무시할 수준은 아니다. 더 조이려면 yaw 도달 판정을 먼저 조여야 한다.
+    STALE_DEG = 0.35
 
     def stale(self):
         """설정된 자세 각도와 **기록 당시 각도**가 다른 짝. {자세: [(i, 기록각, 설정각)]}"""
@@ -157,12 +162,21 @@ class Calib(Node):
         return bad
 
     def _save_state(self):
+        """⚠ **파일에 있던 다른 키를 덮어쓰지 않는다.** 전에는 dict 를 새로 만들어
+        썼더니 `archive`(보관한 짝) 가 다음 저장에서 사라졌다 — 사람이 리모콘으로
+        맞춘 15짝이 날아갔다(git 에서 복구했다). 읽어서 **고칠 것만 고친다.**
+        """
         os.makedirs(os.path.dirname(STATE), exist_ok=True)
-        json.dump({'pairs': {str(k): v for k, v in self.pairs.items()},
-                   'frozen': [list(f) for f in self.frozen],
-                   'snap_stage': self.snap_stage,
-                   'saved': time.strftime('%Y-%m-%d %H:%M:%S')},
-                  open(STATE, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+        try:
+            d = json.load(open(STATE, encoding='utf-8'))
+        except Exception:
+            d = {}
+        d['pairs'] = {str(k): v for k, v in self.pairs.items()}
+        d['frozen'] = [list(f) for f in self.frozen]
+        d['snap_stage'] = self.snap_stage
+        d['saved'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        json.dump(d, open(STATE, 'w', encoding='utf-8'),
+                  ensure_ascii=False, indent=1)
 
     def _on_stage(self, msg):
         try:
@@ -282,17 +296,17 @@ class Calib(Node):
         except Exception as e:
             print(f"  (그림 저장 실패: {e})")
 
-    def _still_there(self, idx, tol=8.0):
-        """고정한 좌표에 **지금도** 교차점이 있는가. (있다, 설명).
+    def _scene_moved(self, tol=8.0, need=0.5):
+        """장면이 움직였는가. (움직였다, 설명).
 
-        ⚠⚠ 짝은 **고정한 순간의 카메라 좌표**를 쓰는데 건 끝을 맞추는 것은 그
-        **뒤**다. 그 사이에 배근이나 장비가 움직이면 "고정된 좌표" 와 "실제로
-        맞춘 위치" 가 다른 점이 되어 **조용히 오염된다.** 잔차만 보고는 어느
-        짝이 문제인지 알 수 없다 (2026-10-03 에 이전 스냅샷 점들만 4~4.7mm 튀었다).
+        ⚠⚠ **목표 교차점 자리를 확인하면 안 된다.** 결속 위치에 건을 내려놓으면
+        그 교차점은 **건에 가려진다** — 기록하는 순간엔 원리적으로 안 보인다.
+        2026-10-04 에 그래서 정상 기록이 "그 좌표에 교차점이 없다(125mm)" 로 막혔다.
 
-        그래서 기록 직전에 새로 검출해 그 좌표 근처에 점이 있는지 본다.
+        대신 **지금 보이는 점들이 고정해 둔 집합과 맞는지** 본다. 장면이 그대로면
+        가려지지 않은 점들은 제자리에 있다. 가림으로 수가 줄어드는 것은 정상이므로
+        **몇 개가 맞는지가 아니라 맞는 것들이 얼마나 가까운지**로 판단한다.
         """
-        want = np.array(self.frozen[idx][:3], dtype=float)
         self.grid = None
         self.trig.publish(Empty())
         t = time.time() + 5.0
@@ -300,24 +314,28 @@ class Calib(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
         if self.grid is None:
             return False, "새 검출을 못 받았습니다 — 확인할 수 없습니다"
-        if not self.grid.detections:
-            return False, "지금 검출이 0개입니다"
-        d = min(np.linalg.norm(np.array([q.x, q.y, q.z]) - want)
-                for q in self.grid.detections)
-        if d > tol:
-            return False, (f"그 좌표에 지금 교차점이 없습니다 — 가장 가까운 점이 "
-                           f"{d:.1f}mm 떨어져 있습니다 (허용 {tol:.0f}mm). "
-                           f"배근이나 장비가 움직였다면 `s` 로 다시 고정하세요")
-        return True, f"확인 (가장 가까운 점 {d:.1f}mm)"
+        now = [(d.x, d.y, d.z) for d in self.grid.detections]
+        if not now:
+            return False, "지금 검출이 0개입니다 — 가림으로 확인 불가"
+        F = np.array([f[:3] for f in self.frozen], dtype=float)
+        ds = [float(np.min(np.linalg.norm(F - np.array(q), axis=1))) for q in now]
+        near = sum(1 for d in ds if d <= tol)
+        med = float(np.median(ds))
+        if near >= max(1, int(len(now) * need)):
+            return False, (f"장면 일치 (검출 {len(now)}개 중 {near}개가 {tol:.0f}mm "
+                           f"안, 중앙값 {med:.1f}mm)")
+        return True, (f"장면이 움직인 것 같습니다 — 검출 {len(now)}개 중 "
+                      f"{tol:.0f}mm 안에 맞는 것이 {near}개뿐 (중앙값 {med:.1f}mm). "
+                      f"`s` 로 다시 고정하세요")
 
     def record(self, idx, check=True, axes='xyz', stage=None):
         if not (0 <= idx < len(self.frozen)):
             print(f"  번호가 범위를 벗어났습니다 (0~{len(self.frozen) - 1})")
             return
         if check:
-            ok, why = self._still_there(idx)
-            print(f"  고정 좌표 재확인: {why}")
-            if not ok:
+            moved, why = self._scene_moved()
+            print(f"  장면 확인: {why}")
+            if moved:
                 print("  → **기록하지 않았습니다.** 강행하려면 `r! <n>`")
                 return
         self.spin(0.8)
