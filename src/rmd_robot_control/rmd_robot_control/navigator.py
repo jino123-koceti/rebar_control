@@ -84,10 +84,21 @@ class Navigator(Node):
         self.declare_parameter('drive_timeout_sec', 180.0)
         self.declare_parameter('tie_timeout_sec', 900.0)
         self.declare_parameter('lateral_timeout_sec', 180.0)
+        # ⚠ **복귀 중에 주행을 먼저 시작한다** (사용자 요청 2026-10-04). 결속을
+        #   다 끝낸 뒤 검출 자세로 돌아가는 동안 — Z 는 이미 올라왔고 남은 것은
+        #   XY 후퇴와 yaw 회전뿐이다 — 주행을 겹치면 웨이포인트당 4초쯤 줄고
+        #   동작이 이어져 보인다.
+        # ⚠ 조건이 둘이다: (1) 다음 단계가 주행·횡이동일 때만 (또 결속이면
+        #   겹칠 수 없다), (2) Z 가 이 높이 위로 올라왔을 때만. Z 가 철근에
+        #   들어가 있는 채로 주행하면 건이 끌린다.
+        self.declare_parameter('drive_overlap', True)
+        self.declare_parameter('drive_overlap_z_mm', -3.0)
 
         self.t_drive = float(self.get_parameter('drive_timeout_sec').value)
         self.t_tie = float(self.get_parameter('tie_timeout_sec').value)
         self.t_lat = float(self.get_parameter('lateral_timeout_sec').value)
+        self.overlap = bool(self.get_parameter('drive_overlap').value)
+        self.overlap_z = float(self.get_parameter('drive_overlap_z_mm').value)
 
         self.steps, bad = [], None
         try:
@@ -241,10 +252,19 @@ class Navigator(Node):
         self.detail = (f"{self.cur + 1}/{len(self.steps)} — {s.text}, "
                        f"남은 {(self.drv or {}).get('left_mm')}mm")
 
+    def _next_kind(self):
+        i = self.cur + 1
+        return self.steps[i].kind if i < len(self.steps) else None
+
     def _do_tie(self, s):
         if self._sent == 0.0:
             if self.plan is None:
                 self.detail = '/plan/status 를 기다린다 — tying_planner 가 떠 있는가'
+                return
+            # 앞 단계의 복귀가 아직 끝나지 않았으면 기다린다 (겹침으로 미션이
+            # 먼저 넘어온 경우다) — 복귀 중에 새 바퀴를 시작하면 엉킨다
+            if (self.plan or {}).get('phase') in ('ready', 'detect', 'run', 'park'):
+                self.detail = f"앞 복귀가 끝나기를 기다린다 ({self.plan.get('phase')})"
                 return
             self._sent = time.time()
             self.plan_pub.publish(Empty())
@@ -262,6 +282,17 @@ class Navigator(Node):
         if ph == 'failed':
             s.state = f"실패: {(self.plan or {}).get('detail', '')}"
             return self._abort(f'{s.text} — {s.state}')
+        # ⚠ **복귀 중이면 다음 주행을 먼저 시작한다.** Z 가 올라온 뒤에만,
+        #   그리고 다음 단계가 주행·횡이동일 때만이다.
+        if (self.overlap and ph == 'park'
+                and self._next_kind() in ('drive', 'lateral')):
+            z = (self.plan or {}).get('z_mm')
+            if z is not None and z >= self.overlap_z:
+                s.state = '완료(복귀는 계속)'
+                self.get_logger().info(
+                    f"[{s.kind}] 복귀 중 — Z {z:.1f}mm 올라옴, "
+                    f"다음 {self._next_kind()} 를 먼저 시작한다")
+                return self._next()
         self.detail = (f"{self.cur + 1}/{len(self.steps)} — tie "
                        f"[{ph}] {(self.plan or {}).get('detail', '')}")
 

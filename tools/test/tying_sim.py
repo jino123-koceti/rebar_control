@@ -87,17 +87,21 @@ class FakeStage(Node):
                 if not math.isnan(v)}
         if not want:
             return self._reject('목표가 비어 있다')
-        if self._busy():                 # 실물과 같다 — 한 번에 한 동작
-            return self._reject('이미 이동 중이다')
+        # ⚠ 실물과 같다 — **이동 중이면 합친다** (거부하지 않는다). 회전 중에는
+        #   합치지 않는다 (회전 안전창 검사가 무효가 된다).
+        if self.yaw_tgt is not None:
+            return self._reject('회전 중이다')
         # 작업영역 검사는 X·Y 만이다 — 실물도 Z 는 자세별 실측이 없다
         bad = envelope_violation(self.env, self.pose,
                                  {k: v for k, v in want.items() if k != 'z'})
         if bad:
             return self._reject(bad)
-        self.tgt = want
+        merged = bool(self.tgt)
+        self.tgt.update(want)
         self.detail = '이동'
-        self.log.append(('이동', dict(want)))
-        print(f"    [가짜 stage] 이동 수락 {', '.join(f'{k}={v:.1f}' for k, v in sorted(want.items()))}")
+        self.log.append(('합침' if merged else '이동', dict(want)))
+        print(f"    [가짜 stage] {'합침' if merged else '이동 수락'} "
+              f"{', '.join(f'{k}={v:.1f}' for k, v in sorted(want.items()))}")
 
     def _on_yaw(self, m):
         want = int(m.data)

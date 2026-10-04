@@ -104,6 +104,7 @@ class DriveNode(Node):
                                  lambda m: self._stop('중단 명령'), 10)
 
         self.moving = False
+        self.t_lost = 0.0        # 권한을 마지막으로 쥐고 있던 시각
         self.goal = 0.0          # 목표 거리 mm (부호 있음)
         self.base = None         # 시작 시점의 (우, 좌) 각도
         self.detail = '대기'
@@ -145,7 +146,7 @@ class DriveNode(Node):
         self.goal = d
         self.base = a
         self.moving = True
-        self.t_start = time.time()
+        self.t_start = self.t_lost = time.time()
         self.detail = f'주행 시작 {d:+.0f}mm'
         self._request('auto')
         self.get_logger().info(f"주행 시작 — {d:+.0f}mm")
@@ -242,13 +243,19 @@ class DriveNode(Node):
         if time.time() - self.t_start > self.timeout:
             self.rejects += 1
             return self._stop(f'타임아웃 {self.timeout:.0f}s')
+        # ⚠⚠ **잃은 지 얼마나 됐는가로 본다** (이동 시작 시점이 아니다).
+        #   `stage_node` 와 같은 중재기 토큰을 쓰는데, 복귀가 끝나면서 그쪽이
+        #   권한을 반납하면 중재기가 manual 로 돌아간다 — 재요청으로 50ms 뒤
+        #   되찾는데도 "시작 뒤 grant_wait 지났다" 로 즉시 중단됐다
+        #   (2026-10-04 복귀 중 주행을 겹치자 374mm 남기고 죽었다).
         if not self._granted():
             self._request('auto')
-            if time.time() - self.t_start < self.grant_wait:
+            if time.time() - self.t_lost < self.grant_wait:
                 self.cmd_pub.publish(Twist())
                 return
             self.rejects += 1
             return self._stop(f'제어 권한 없음 (모드 {self.mode})')
+        self.t_lost = time.time()              # 쥐고 있는 동안 계속 갱신
         # ⚠ **하트비트가 필요하다.** 중재기는 재요청이 끊기면 권한을 회수한다 —
         #   2026-10-04 에 시작할 때만 요청해서 200mm 중 167mm 에서 manual 로
         #   돌아가 멈췄다. `stage_node` 도 매 tick 재요청한다.

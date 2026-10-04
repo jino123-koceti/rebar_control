@@ -226,6 +226,8 @@ class StageNode(Node):
         self.hold_sec = float(g('brake_hold_sec').value)
         self.brake_rel = {}        # 축 → 브레이크 해제 확인 (None = 모름)
         self._lock_at = {}         # 축 → 이 시각 뒤에 잠근다 (유예 중)
+        self.t_grant_lost = 0.0    # 권한을 마지막으로 쥐고 있던 시각
+        self._arm_t = {}           # 축 → 해제 요청 시각 (축별 대기용)
         self.grant_wait = float(g('grant_wait_sec').value)
         self.enforce = bool(g('enforce_envelope').value)
         self.yaw_speed = float(g('yaw_speed_dps').value)
@@ -680,7 +682,41 @@ class StageNode(Node):
         if bad:
             return self._reject(bad)
 
+        # ⚠ **이동 중이면 합친다** (거부하지 않는다). 상위가 구간 완료를 매번
+        #   기다리면 동작이 뚝뚝 끊긴다 — Z 가 철근에서 빠져나오자마자 다음 XY 를
+        #   시작하거나, XY 가 거의 닿았을 때 Z 하강을 시작하는 식으로 겹치려면
+        #   이동 중에 축을 더 붙일 수 있어야 한다 (2026-10-04 사용자 요청).
+        #   yaw 회전 중에는 합치지 않는다 — 회전은 지나가는 자세들의 교집합을
+        #   미리 검사했고, 도중에 XY 가 움직이면 그 검사가 무효가 된다.
+        if self.moving and not self.yaw_moving and self.target_unit == 'mm':
+            return self._merge(want)
+
         self._begin(want, 'mm')
+
+    def _merge(self, want):
+        """이동 중에 목표를 합친다. 가던 축은 계속 가고, 새 축만 해제를 기다린다.
+
+        같은 축이 오면 목표를 **바꾼다** (되돌아가도 상위의 뜻이다). 타임아웃은
+        새로 시작한다 — 붙인 축의 행정만큼 시간이 더 걸린다.
+        """
+        now = time.time()
+        added = [k for k in want if k not in self.target]
+        self.target.update(want)
+        self.t_start = now
+        for name in added:
+            self._lock_at.pop(name, None)
+            self._arm_t[name] = now
+            self._brake('release', name)
+            # 붙인 축은 **충돌 판정 유예를 새로** 받는다 (기동 전류가 뜬다)
+            self.base_a.pop(name, None)
+            self.hit_cnt[name] = 0
+            self.rise_cnt[name] = 0
+        self.detail = ('합침 ' + ', '.join(f'{k}={v:+.1f}mm'
+                                          for k, v in sorted(want.items())))
+        self.get_logger().info(
+            "이동 중 목표 합침 — "
+            + ", ".join(f"{k}={v:+.1f}mm" for k, v in sorted(want.items()))
+            + (f" (새 축 {', '.join(added)})" if added else " (목표 변경)"))
 
     def _begin(self, want, unit):
         stop = self._safety_stop()
@@ -707,8 +743,11 @@ class StageNode(Node):
         self.target_unit = unit
         self.t_start = time.time()
         self.t_arm = time.time()
+        self.t_grant_lost = time.time()
+        now = time.time()
         for name in want:
             self._lock_at.pop(name, None)      # 유예 중이면 취소 — 계속 쓴다
+            self._arm_t[name] = now
         self.moving = True
         self.detail = '브레이크 해제 대기'
         for name in want:
@@ -745,7 +784,8 @@ class StageNode(Node):
             self.rise_cnt[name] = 0
             self.hit_cnt[name] = 0
             return False
-        if time.time() - self.t_arm < self.arm_sec + self.hit_grace:
+        # ⚠ 축별 유예다 — 이동 중에 붙인 축도 기동 전류 구간을 건너뛰어야 한다
+        if time.time() - self._arm_t.get(name, 0.0) < self.arm_sec + self.hit_grace:
             return False
         a = self.cur_a.get(name)
         if a is None:
@@ -820,15 +860,19 @@ class StageNode(Node):
         self._begin({name: back}, 'mm')
         self.detail = f'충돌 후퇴 — {name} {back:.1f}mm (전류 {a:.2f}A)'
 
-    def _armed(self):
-        """목표 축들의 브레이크 해제가 확인됐는가.
+    def _axis_armed(self, name):
+        """그 축의 브레이크 해제가 확인됐는가. **축별로 본다.**
 
-        확인이 오면 **즉시** 참이다. 확인이 안 오는 축(브레이크 토픽이 없거나
-        늦는 경우)은 `arm_sec` 이 지나면 통과시킨다 — 옛 동작과 같은 최악값이다.
+        확인이 오면 즉시 참이다. 확인이 안 오면 `arm_sec` 뒤에 통과시킨다
+        (옛 동작과 같은 최악값).
+
+        ⚠ 전체를 한 번에 보면 **이동 중에 축을 더 붙일 수 없다** — 새 축이
+          풀리기를 기다리는 동안 이미 가던 축의 명령이 끊겨 멈춰 버린다.
+          그래서 축마다 따로 본다 (2026-10-04, 동작을 겹치게 만들면서).
         """
-        if time.time() - self.t_arm >= self.arm_sec:
+        if self.brake_rel.get(name):
             return True
-        return all(self.brake_rel.get(n) for n in self.target)
+        return time.time() - self._arm_t.get(name, 0.0) >= self.arm_sec
 
     def _lock_later(self, name):
         """도착한 축의 브레이크를 잠근다. `brake_hold_axes` 는 유예를 둔다.
@@ -883,7 +927,10 @@ class StageNode(Node):
         self.mode_pub.publish(String(data=f"stage_node {what}"))
 
     def _granted(self):
-        return self.mode is None or self.mode == 'auto'
+        ok = self.mode is None or self.mode == 'auto'
+        if ok:
+            self.t_grant_lost = time.time()    # 쥐고 있는 동안 계속 갱신
+        return ok
 
     def _wait_grant(self):
         """권한이 없을 때 **기다릴 것인가**. 기다릴 동안 요청을 계속 보낸다.
@@ -895,7 +942,11 @@ class StageNode(Node):
         if self._granted():
             return False
         self._request_control('auto')
-        return (time.time() - self.t_start) < self.grant_wait
+        # ⚠⚠ **잃은 지 얼마나 됐는가로 본다** (이동 시작 시점이 아니다).
+        #   `drive_node` 와 같은 중재기 토큰을 쓰므로, 그쪽이 반납하면 잠깐
+        #   manual 로 떨어진다 — 재요청으로 곧 되찾는데 시작 시점 기준이면
+        #   이동이 그대로 죽는다 (2026-10-04 겹침에서 드러났다).
+        return (time.time() - self.t_grant_lost) < self.grant_wait
 
     def _stop(self, reason):
         self.retreating = None
@@ -934,12 +985,6 @@ class StageNode(Node):
         if time.time() - self.t_start > self.timeout:
             return self._stop(f"타임아웃 {self.timeout:.0f}s")
 
-        # 브레이크 해제가 명령보다 먼저 도착해야 한다 (homing_node 와 같은 이유).
-        # **확인이 오면 바로 출발한다** — 고정 대기는 확인이 안 올 때의 한계다.
-        if not self._armed():
-            for name in self.target:
-                self._brake('release', name)
-            return
         self._request_control('auto')          # 하트비트
 
         done = []
@@ -951,6 +996,11 @@ class StageNode(Node):
                 cur, goal_deg = self.mm_of(name), self.deg_of(name, goal)
                 tol = self.tol_mm
             if cur is None:
+                continue
+            # 브레이크 해제가 명령보다 먼저 도착해야 한다 (homing_node 와 같은
+            # 이유). **축별로** 본다 — 다른 축은 그동안 계속 간다.
+            if not self._axis_armed(name):
+                self._brake('release', name)
                 continue
             err = goal - cur
             if abs(err) <= tol:

@@ -115,6 +115,17 @@ class TyingSequence(Node):
         self.declare_parameter('z_safe_mm', 0.0)     # 회전·이동 중 Z 안전높이
         self.declare_parameter('z_tie_mm', NAN)      # 목표에 z 가 없을 때 쓸 깊이
         self.declare_parameter('z_tol_mm', 2.0)
+        # ⚠ **건이 철근에서 빠져나온 높이.** Z 가 0 까지 올라오기를 기다리지 않고
+        #   여기를 지나면 다음 동작(다음 점의 XY, 복귀 후퇴)을 시작한다 — 동작이
+        #   이어져 보이고 점당 1.5초쯤 줄어든다 (2026-10-04 사용자 요청).
+        #   실측: Z -15.31mm 에서 XY 를 움직여도 간섭이 없었다. -12 는 그보다
+        #   1mm 이상 여유를 둔 값이다.
+        # ⚠ **회전에는 쓰지 않는다** — yaw 는 건이 원을 그리며 돌아서 평행이동보다
+        #   여유가 더 필요하다. 회전 전에는 `z_safe_mm` 까지 올린다.
+        self.declare_parameter('z_clear_mm', -12.0)
+        # XY 가 목표에서 이만큼 안으로 들어오면 **Z 하강을 미리 시작**한다.
+        # 건이 아직 결속깊이보다 한참 위에 있어 안전하고, 비스듬히 접근한다.
+        self.declare_parameter('xy_blend_mm', 40.0)
         # ⚠ 캘리브레이션 모델이 틀린 깊이를 내도 **매트를 찍지 않도록** 범위를
         #   강제한다. 작업영역 검사(`envelope`)에는 X·Y 만 있다 — Z 는 자세별
         #   실측이 없다. 모델 잔차가 Z 2.7mm 라 여유를 넉넉히 둔다.
@@ -136,6 +147,8 @@ class TyingSequence(Node):
         self.z_safe = float(self.get_parameter('z_safe_mm').value)
         self.z_tie_default = float(self.get_parameter('z_tie_mm').value)
         self.z_tol = float(self.get_parameter('z_tol_mm').value)
+        self.z_clear = float(self.get_parameter('z_clear_mm').value)
+        self.blend = float(self.get_parameter('xy_blend_mm').value)
         self.z_lo = float(self.get_parameter('z_tie_min_mm').value)
         self.z_hi = float(self.get_parameter('z_tie_max_mm').value)
         self.gun_on = bool(self.get_parameter('gun_enabled').value)
@@ -178,6 +191,9 @@ class TyingSequence(Node):
         self.asked_pose = None       # /tying/goal_pose 로 지정된 자세
         self._fire_t = 0.0           # 결속건 하위단계 시작 시각
         self._fire_phase = 0
+        self._z_sent = False         # 이 목표에서 Z 하강을 이미 보냈는가
+        self._xy_sent = False        # XY 목표를 한 번은 보냈는가
+        self._xy_t = 0.0
         # 접수한 목표 수. **상위가 "내 목표가 들어갔나" 를 가리는 유일한 근거다.**
         # `step` 만 보면 안 된다 — 목표가 **이미 충족된 자리**에서는
         # precheck→done 이 한 tick 안에 끝나서 상위는 'done' 밖에 못 보고
@@ -228,6 +244,8 @@ class TyingSequence(Node):
                 f'[{self.z_lo:.0f}, {self.z_hi:.0f}] 밖이다 — 모델 예측을 의심하라')
         self.goal = (float(msg.x), float(msg.y))
         self.goal_z = None if math.isnan(z) else z
+        self._z_sent = False
+        self._xy_sent = False
         self.want_pose = None
         self._retract_tgt = None
         self._fire_phase = 0
@@ -471,6 +489,12 @@ class TyingSequence(Node):
             self.detail = f'{pose_label(self.want_pose)}로 회전 중'
 
     def _do_move_xy(self):
+        """결속 지점으로. 목표에 가까워지면 **Z 하강을 미리 보낸다.**
+
+        ⚠ XY 목표를 **먼저 한 번은 반드시 보낸다.** 직전 점이 가까우면 첫 tick
+          부터 이미 `xy_blend_mm` 안이라, Z 만 보내고 XY 를 안 보내 타임아웃으로
+          죽는다 (2026-10-04 시뮬레이션에서 11mm 떨어진 점이 그랬다).
+        """
         x, y = self._mm()
         if (x is not None and y is not None
                 and abs(x - self.goal[0]) <= self.tol
@@ -479,12 +503,19 @@ class TyingSequence(Node):
                 return self._finish(f'x={x:.1f} y={y:.1f}mm')
             return self._enter(Step.Z_DOWN,
                                f'결속 깊이 {self.goal_z:.1f}mm 로 하강')
-        if self._stage_busy():
-            return
-        if time.time() - self._sent > 1.0:
-            self._sent = time.time()
+        if not self._xy_sent or time.time() - self._xy_t > 1.0:
+            self._xy_sent = True
+            self._xy_t = time.time()
             self.goal_pub.publish(Point(x=self.goal[0], y=self.goal[1], z=NAN))
             self.detail = f'결속 지점으로 이동 중 ({self.goal[0]:.1f}, {self.goal[1]:.1f})'
+        # XY 가 나간 뒤에만 Z 를 미리 보낸다. 건이 아직 결속깊이보다 한참 위라
+        # 안전하고, 비스듬히 내려가 동작이 이어진다 (`stage_node` 가 합쳐 준다).
+        if (self.goal_z is not None and not self._z_sent and x is not None
+                and y is not None
+                and math.hypot(x - self.goal[0], y - self.goal[1]) <= self.blend):
+            self._z_sent = True
+            self._send_z(self.goal_z)
+            self.detail = f'접근 중 Z 하강 시작 ({self.goal_z:.1f}mm)'
 
     def _finish(self, what):
         self.step = Step.DONE
@@ -496,9 +527,8 @@ class TyingSequence(Node):
         if self._z_arrived(self.goal_z):
             return self._enter(Step.FIRE,
                                '결속건 작동' if self.gun_on else '결속건 꺼짐 — 건너뜀')
-        if self._stage_busy():
-            return
-        if time.time() - self._sent > 1.0:
+        if not self._z_sent:
+            self._z_sent = True       # 접근 중에 이미 보냈으면 다시 안 보낸다
             self._send_z(self.goal_z)
             self.detail = f'결속 깊이 {self.goal_z:.1f}mm 로 하강 중'
 
@@ -532,11 +562,17 @@ class TyingSequence(Node):
             self._enter(Step.Z_UP, 'Z 상승')
 
     def _do_z_up(self):
-        if self._z_arrived(self.z_safe):
+        """Z 를 올린다. **빠져나온 높이를 지나면 끝낸다** — 0 까지 기다리지 않는다.
+
+        Z 이동은 그대로 진행되고, 다음 동작(다음 점의 XY, 복귀 후퇴)이 목표를
+        합쳐 들어온다. 회전이 필요한 경우는 다음 점의 `Z_CLEAR` 가 0 까지
+        올라오기를 다시 기다리므로 안전이 깨지지 않는다.
+        """
+        z = self._z()
+        if z is not None and z >= self.z_clear:
             x, y = self._mm()
-            return self._finish(f'x={x:.1f} y={y:.1f}mm z={self.z_safe:.0f}mm')
-        if self._stage_busy():
-            return
+            return self._finish(
+                f'x={x:.1f} y={y:.1f}mm z={z:.1f}mm (빠져나옴)')
         if time.time() - self._sent > 1.0:
             self._send_z(self.z_safe)
             self.detail = f'Z 를 {self.z_safe:.0f}mm 로 올리는 중'

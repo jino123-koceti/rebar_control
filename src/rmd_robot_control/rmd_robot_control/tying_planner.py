@@ -615,6 +615,9 @@ class TyingPlanner(Node):
             'total': len(self.plans),
             'current': self.cur if 0 <= self.cur < len(self.plans) else None,
             'points': [p.as_dict() for p in self.plans],
+            # 상위(미션)가 **복귀 중 주행을 먼저 시작**할지 판단하는 근거다.
+            # Z 가 올라와 있으면 XY 후퇴·yaw 회전은 주행과 겹쳐도 안전하다.
+            'z_mm': ((self.seq or {}).get('current_mm') or {}).get('z'),
             'detail': self.detail,
         }, ensure_ascii=False)))
 
