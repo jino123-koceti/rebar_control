@@ -129,6 +129,13 @@ class Calib(Node):
         except Exception:
             pass
 
+    # 자세 각도가 이만큼 달라지면 **다른 자세의 데이터**로 본다.
+    # ⚠ 건 끝이 yaw 축에서 약 640mm 떨어져 있다 (실측 오프셋 1→2 가 10.44° 에
+    #   116mm). 그래서 **건 1° = 약 11mm** 다. 1.0° 로 두면 11mm 틀어진 짝이
+    #   그대로 섞인다 — 2026-10-04 에 2번(0.87°)·3번(0.60°) 이 안 잡혔다.
+    #   0.2° ≈ 2.2mm 로 조인다 (목표 정확도 ±5mm 의 절반 미만).
+    STALE_DEG = 0.2
+
     def stale(self):
         """설정된 자세 각도와 **기록 당시 각도**가 다른 짝. {자세: [(i, 기록각, 설정각)]}"""
         try:
@@ -145,7 +152,7 @@ class Calib(Node):
                 continue
             for i, q in enumerate(rows):
                 g = q.get('gun')
-                if g is not None and abs(g - want) > 1.0:
+                if g is not None and abs(g - want) > self.STALE_DEG:
                     bad.setdefault(p, []).append((i, g, want))
         return bad
 
@@ -169,6 +176,10 @@ class Calib(Node):
     def _on_color(self, msg):
         self.color = msg
 
+    def stale_idx(self, p):
+        """그 자세에서 **무효가 된 짝의 번호**. 자세 각도가 재조정된 뒤의 것들이다."""
+        return {i for i, g, w in self.stale().get(p, [])}
+
     def rows(self, p):
         """(cam, stage) 짝. **절대 위치**로 푼다 — 카메라와 스테이지가 둘 다
         상부체에 있어 장비가 움직여도 둘 사이 관계가 변하지 않는다.
@@ -176,7 +187,9 @@ class Calib(Node):
         `snap`(검출 당시 스테이지 위치)은 수식에 쓰지 않고 기록만 한다 — 나중에
         "이 짝이 어느 상황에서 나왔나" 를 되짚을 때 필요하다.
         """
-        return [(q['cam'], q['stage']) for q in self.pairs.get(p, [])]
+        bad = self.stale_idx(p)
+        return [(q['cam'], q['stage'])
+                for i, q in enumerate(self.pairs.get(p, [])) if i not in bad]
 
     def spin(self, sec):
         end = time.time() + sec
@@ -331,6 +344,37 @@ class Calib(Node):
               f"카메라 ({x:+.1f},{y:+.1f},{z:.1f}) ↔ "
               f"스테이지 (X {m[0]:.1f}, Y {m[1]:.1f}, Z {m[2]:.1f}) mm")
 
+    def archive(self, why=''):
+        """지금 짝을 **보관함으로 옮기고** 비운다. 지우지 않는다.
+
+        자세 정의가 바뀌거나 수집 조건이 달라지면 기존 짝을 쓸 수 없다. 그렇다고
+        지우면 "어느 각도·조건에서 받았나" 가 사라져 나중에 되짚을 수 없다 —
+        사람이 리모콘으로 맞춘 노동의 기록이다. 그래서 옮겨만 둔다.
+        """
+        if not self.pairs:
+            print("  보관할 짝이 없습니다")
+            return
+        try:
+            d = json.load(open(STATE, encoding='utf-8'))
+        except Exception:
+            d = {}
+        arc = d.get('archive') or []
+        n = sum(len(v) for v in self.pairs.values())
+        arc.append({'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'why': why,
+                    'pairs': {str(k): v for k, v in self.pairs.items()}})
+        self.pairs = {}
+        d['archive'] = arc
+        d['pairs'] = {}
+        d['frozen'] = [list(f) for f in self.frozen]
+        d['snap_stage'] = self.snap_stage
+        d['saved'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        json.dump(d, open(STATE, 'w', encoding='utf-8'),
+                  ensure_ascii=False, indent=1)
+        print(f"  {n}짝을 보관함으로 옮겼습니다 (보관 {len(arc)}건). 짝 목록은 비었습니다")
+        if why:
+            print(f"  사유: {why}")
+
     def undo(self):
         p = self.pose()
         if p is None or not self.pairs.get(p):
@@ -347,7 +391,8 @@ class Calib(Node):
         for p in sorted(self.pairs):
             rows = self.pairs[p]
             zs = [c[2] for c, _ in rows]
-            print(f"  {p}번 자세: {len(rows)}개"
+            nb = len(self.stale_idx(p))
+            print(f"  {p}번 자세: {len(rows)}개" + (f" (무효 {nb}개 제외)" if nb else "")
                   + (f"  (카메라 z {min(zs):.0f}~{max(zs):.0f}mm)" if rows else ''))
             for i, (c, m) in enumerate(self.rows(p)):
                 print(f"     {i} cam({c[0]:+7.1f},{c[1]:+7.1f},{c[2]:7.1f})"
@@ -372,8 +417,9 @@ class Calib(Node):
         U = 4 + len(extra)
         M, y = [], []
         for p in poses:
-            for q in self.pairs.get(p, []):
-                if k not in self._axes_of(q):
+            bad = self.stale_idx(p)
+            for i, q in enumerate(self.pairs.get(p, [])):
+                if i in bad or k not in self._axes_of(q):
                     continue
                 r = [0.0] * U
                 r[0:3] = q['cam']
@@ -408,7 +454,10 @@ class Calib(Node):
         (오차 0 지점 534mm) 365mm 에서 16mm 빗나갔다. **잔차는 2.6mm 로 멀쩡해
         보였다.** 그래서 아래에서 깊이 분포를 따로 경고한다.
         """
-        poses = sorted(self.pairs)
+        # ⚠ 유효 짝이 **0개인 자세는 빼야 한다.** 남겨 두면 그 자세의 오프셋
+        #   열이 전부 0 이 되어 랭크가 부족해 전체가 안 풀린다 (2026-10-04 에
+        #   4번 자세 짝이 전부 무효가 되자 그렇게 됐다).
+        poses = [p for p in sorted(self.pairs) if self.rows(p)]
         if not poses:
             return None
         base = poses[0]
@@ -418,7 +467,9 @@ class Calib(Node):
         ns, dofs, errs = [], [], []
         for k in range(3):
             pk = [p for p in poses
-                  if any(k in self._axes_of(q) for q in self.pairs.get(p, []))]
+                  if any(k in self._axes_of(q)
+                         for i, q in enumerate(self.pairs.get(p, []))
+                         if i not in self.stale_idx(p))]
             if base not in pk:
                 return None            # 기준 자세에 그 성분이 없으면 못 푼다
             r = self._solve_axis(k, pk, base)
@@ -469,8 +520,10 @@ class Calib(Node):
                 for i, g, want in items:
                     print(f"     {p}번 자세 짝 {i}: 기록 당시 건 {g:+.2f}° / "
                           f"지금 설정 {want:+.2f}°")
-            print("     그 짝들은 **다른 자세의 데이터**입니다 — 빼고 다시 받으세요")
-            print("     (`u` 로 취소하거나 pairs.json 에서 지우면 됩니다)")
+            print("     그 짝들은 **다른 자세의 데이터**입니다 — "
+                  "**피팅에서 자동으로 제외**합니다.")
+            print("     파일에는 그대로 남습니다 (어느 각도에서 받았는지 기록이 "
+                  "남아야 되살릴 수 있다). 그 자세는 다시 받아야 합니다")
         sh = self.fit_shared()
         print()
         if sh:
@@ -625,6 +678,8 @@ def run_one(n, cmd):
         n.predict(int(cmd[1]))
     elif c == 'l':
         n.listing()
+    elif c == 'archive':
+        n.archive(' '.join(cmd[1:]))
     elif c == 'u':
         n.undo()
     elif c == 'f':
@@ -632,7 +687,8 @@ def run_one(n, cmd):
     elif c == '':
         n.show()
     else:
-        print("  s / r <n> / r! <n> / rxy <n> [X Y] / p <n> / l / u / f / q")
+        print("  s / r <n> / r! <n> / rxy <n> [X Y] / p <n> / l / u / "
+              "archive <사유> / f / q")
         return False
     return True
 

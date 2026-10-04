@@ -113,6 +113,10 @@ class StageNode(Node):
         self.declare_parameter('tolerance_mm', 1.0)
         self.declare_parameter('move_timeout_sec', 30.0)
         self.declare_parameter('arm_sec', 1.0)        # 브레이크 해제 후 대기
+        # 중재기에서 권한을 받기까지 기다리는 시간. ⚠ 0 이면 **요청 직후 50ms 에**
+        # "권한 없음" 으로 판단해 중단한다 — 리모콘을 쓴 뒤에는 모드가 manual 로
+        # 돌아가 있어 항상 그렇게 된다 (2026-10-04 에 yaw 회전이 그래서 죽었다).
+        self.declare_parameter('grant_wait_sec', 3.0)
         # ⚠ 끄면 프레임 충돌을 막을 것이 없다. 범위를 다시 재는 동안만 끈다.
         self.declare_parameter('enforce_envelope', True)
         self.declare_parameter('yaw_speed_dps', 60.0)     # 모터축. 실측 3.5s/208°
@@ -123,6 +127,7 @@ class StageNode(Node):
         self.tol_mm = float(g('tolerance_mm').value)
         self.timeout = float(g('move_timeout_sec').value)
         self.arm_sec = float(g('arm_sec').value)
+        self.grant_wait = float(g('grant_wait_sec').value)
         self.enforce = bool(g('enforce_envelope').value)
         self.yaw_speed = float(g('yaw_speed_dps').value)
         self.yaw_tol = float(g('yaw_tol_deg').value)
@@ -421,6 +426,8 @@ class StageNode(Node):
         if stop:
             return self._yaw_done(f'안전 — {stop}')
         if not self._granted():
+            if self._wait_grant():
+                return                        # 승인 대기 — 요청은 계속 보낸다
             return self._yaw_done(f'제어 권한 없음 (모드 {self.mode})')
         if time.time() - self.t_start > self.timeout:
             return self._yaw_done(f'타임아웃 {self.timeout:.0f}s')
@@ -610,6 +617,18 @@ class StageNode(Node):
     def _granted(self):
         return self.mode is None or self.mode == 'auto'
 
+    def _wait_grant(self):
+        """권한이 없을 때 **기다릴 것인가**. 기다릴 동안 요청을 계속 보낸다.
+
+        중재기는 "아무도 안 잡고 있을 때만" 넘겨주고, 리모콘을 쓴 뒤에는 모드가
+        `manual` 이다. 요청과 승인 사이에 왕복이 있으므로 그 틈을 기다려야 한다 —
+        안 기다리면 명령이 **항상** 권한 없음으로 죽는다.
+        """
+        if self._granted():
+            return False
+        self._request_control('auto')
+        return (time.time() - self.t_start) < self.grant_wait
+
     def _stop(self, reason):
         if self.yaw_moving:
             return self._yaw_done(reason)
@@ -635,6 +654,8 @@ class StageNode(Node):
         if stop:
             return self._stop(f"안전 — {stop}")
         if not self._granted():
+            if self._wait_grant():
+                return                        # 승인 대기 — 요청은 계속 보낸다
             return self._stop(f"제어 권한 없음 (모드 {self.mode})")
         if time.time() - self.t_start > self.timeout:
             return self._stop(f"타임아웃 {self.timeout:.0f}s")
