@@ -93,12 +93,18 @@ class Navigator(Node):
         #   들어가 있는 채로 주행하면 건이 끌린다.
         self.declare_parameter('drive_overlap', True)
         self.declare_parameter('drive_overlap_z_mm', -3.0)
+        # ⚠ 겹칠 단계. 기본은 **주행만**이다 — 횡이동은 상부체를 들어올려
+        #   옮기는 기구라 주행보다 큰 동작이고, 복귀 중 리프팅은 아직 검증하지
+        #   않았다. 검증되면 'lateral' 을 더하면 된다.
+        self.declare_parameter('drive_overlap_kinds', ['drive'])
 
         self.t_drive = float(self.get_parameter('drive_timeout_sec').value)
         self.t_tie = float(self.get_parameter('tie_timeout_sec').value)
         self.t_lat = float(self.get_parameter('lateral_timeout_sec').value)
         self.overlap = bool(self.get_parameter('drive_overlap').value)
         self.overlap_z = float(self.get_parameter('drive_overlap_z_mm').value)
+        self.overlap_kinds = tuple(
+            self.get_parameter('drive_overlap_kinds').value or ())
 
         self.steps, bad = [], None
         try:
@@ -285,7 +291,7 @@ class Navigator(Node):
         # ⚠ **복귀 중이면 다음 주행을 먼저 시작한다.** Z 가 올라온 뒤에만,
         #   그리고 다음 단계가 주행·횡이동일 때만이다.
         if (self.overlap and ph == 'park'
-                and self._next_kind() in ('drive', 'lateral')):
+                and self._next_kind() in self.overlap_kinds):
             z = (self.plan or {}).get('z_mm')
             if z is not None and z >= self.overlap_z:
                 s.state = '완료(복귀는 계속)'
