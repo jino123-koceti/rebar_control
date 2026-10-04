@@ -360,6 +360,11 @@ class TyingPlanner(Node):
             self.detail = f"복귀 중 — {(self.seq or {}).get('detail', '')}"
             return
         ok = sum(1 for p in self.plans if p.state == '완료')
+        # 복귀 성공 여부를 상위가 볼 수 있게 남긴다 — 실패하면 끝 상태가 검출
+        # 자세가 아니므로 다음 주행·결속의 전제가 깨진다 (2026-10-04 에 복귀가
+        # 실패했는데 미션은 "완료" 로 보고해, 3번 자세로 끝난 것을 사람이 눈으로
+        # 알아챘다).
+        self.park_ok = (r == 'done')
         self.phase = 'done'
         self.detail = (f'{ok}/{len(self.plans)}점 완료, 검출 자세 복귀'
                        + ('' if r == 'done' else f' 실패({r})'))
@@ -586,6 +591,7 @@ class TyingPlanner(Node):
             # 끝났으면 **검출 자세로 돌아간다** — 주행과 이어지기 위해서다
             ok = sum(1 for p in self.plans if p.state == '완료')
             self.phase, self.t_phase = 'park', time.time()
+            self.park_ok = None
             self._sent = 0.0
             self.detail = f'{ok}/{len(self.plans)}점 완료 — 검출 자세로 복귀'
             return self._publish()
@@ -639,6 +645,7 @@ class TyingPlanner(Node):
             # 상위(미션)가 **복귀 중 주행을 먼저 시작**할지 판단하는 근거다.
             # Z 가 올라와 있으면 XY 후퇴·yaw 회전은 주행과 겹쳐도 안전하다.
             'z_mm': ((self.seq or {}).get('current_mm') or {}).get('z'),
+            'park_ok': getattr(self, 'park_ok', None),
             'detail': self.detail,
         }, ensure_ascii=False)))
 

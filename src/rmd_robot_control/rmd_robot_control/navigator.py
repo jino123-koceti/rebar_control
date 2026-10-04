@@ -350,6 +350,16 @@ class Navigator(Node):
                 return self._abort(f'{s.text} — {s.state}')
             return
         if ph == 'done':
+            # ⚠ 복귀 실패는 **결속을 무효로 만들지 않지만 끝 상태를 깨뜨린다.**
+            #   그대로 "완료" 로 넘기면 다음 웨이포인트가 엉뚱한 자세에서
+            #   시작한다 — 2026-10-04 에 3번 자세로 끝났는데 미션은 완료라고
+            #   보고했다. 상태에 남기고 경고한다 (`ready` 가 다음 바퀴에서
+            #   바로잡지만, 미션 마지막 단계면 바로잡을 기회가 없다).
+            if (self.plan or {}).get('park_ok') is False:
+                s.state = '완료(복귀 실패)'
+                self.get_logger().warning(
+                    f"{s.text} — 결속은 됐지만 검출 자세 복귀가 실패했다. "
+                    f"끝 자세가 다를 수 있다: {(self.plan or {}).get('detail', '')}")
             return self._next()
         if ph == 'failed':
             s.state = f"실패: {(self.plan or {}).get('detail', '')}"
