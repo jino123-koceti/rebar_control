@@ -191,6 +191,18 @@ class StageNode(Node):
         #   걸려 빠져나올 때 전류가 오르는 것은 정상이다. 보호의 목적은
         #   **교차점이 아닌 곳으로 내려가 철근을 찍는 것**을 막는 것이다.
         self.declare_parameter('collide_down_only_axes', 'z')
+        # ⚠⚠ **감지를 켤 축 — 기본 Z 만.** (2026-10-07 사용자 결정)
+        #   X·Y 를 빼는 이유: 수평면 충돌은 **자세별 작업영역 강제**가 막고,
+        #   전류 문턱은 감속비가 바뀌면 조용히 무효가 된다. X 는 X4-10 →
+        #   X4-36 으로 바뀌며 감속비가 2.88배가 되어 4.8A 가 더는 근거가 없다.
+        #   틀린 문턱은 보호가 아니라 **헛트립**이고, 그러면 결속점이 '이동만
+        #   하고 하강 없이 패스' 된다 — 2026-10-04 에 실제로 그렇게 잃었다.
+        #   Z 만 남기는 이유: 교차점이 아닌 곳으로 내려가 철근을 찍는 것은
+        #   작업영역 검사로 **막을 수 없다**(영역 안에도 철근이 있다).
+        # ⚠ X 의 진짜 위험은 충돌이 아니라 **지속 과전류**다 — 10모터가 죽은
+        #   것도 가감속을 바꿔가며 돌리다 허용전류를 넘긴 쪽이 의심된다.
+        #   그건 이 감지가 아니라 전류 감시가 맡아야 한다 [미구현].
+        self.declare_parameter('collide_axes', 'z')
         self.declare_parameter('collide_backoff_mm', 15.0)
         # 기동 직후에는 가속 전류가 뜬다 — 그 구간은 보지 않는다
         self.declare_parameter('collide_grace_sec', 0.7)
@@ -247,6 +259,7 @@ class StageNode(Node):
         self.rise_n = int(g('collide_rise_samples').value)
         self.base_tau = float(g('collide_base_tau_sec').value)
         self.down_only = _axis_list(g('collide_down_only_axes').value)
+        self.hit_axes = _axis_list(g('collide_axes').value)
         self.base_a = {}           # 축 → 전류 기준선(A). 이동 중에만 갱신한다
         self.rise_cnt = {}         # 축 → 상승분 초과 연속 횟수
         self._base_t = {}          # 축 → 기준선 갱신 시각
@@ -961,6 +974,8 @@ class StageNode(Node):
         ⚠ 기동 직후 `collide_grace_sec` 은 보지 않는다 — 가속 전류가 뜬다.
         """
         if not self.hit_on or self.retreating is not None:
+            return False
+        if name not in self.hit_axes:   # 감지를 켜지 않은 축 — 판정하지 않는다
             return False
         # 내려갈 때만 보는 축 — 올라가는 중이면 판정하지 않는다. 기준선도
         # 쌓지 않는다 (상승 전류가 섞이면 다음 하강 판정이 틀어진다).
