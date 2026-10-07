@@ -426,10 +426,17 @@ def identify_pose(info, single):
         if bd is None or abs(d) < abs(bd):
             best, bd = n, d
     if abs(bd) > info['tol_gun']:
-        return None, (f"어느 자세에도 맞지 않는다 — 건 {gun:+.2f}°, 가장 가까운 "
-                      f"{pose_label(best)} 에서 {bd:+.2f}° "
-                      f"(허용 ±{info['tol_gun']:.2f}°). "
-                      f"1~4번 자세나 12시로 옮긴 뒤 다시 시작하세요")
+        # ⚠⚠ [2026-10-07] **각도를 버리지 않는다.** 후보가 하나뿐이면 자세 번호가
+        #   없어도 **건 각도는 안다** — 예전에는 문자열만 돌려줘서 호출부가 그걸
+        #   쓸 수 없었고, 자세 사이면 호밍이 통째로 거부됐다. 호밍이 실제로
+        #   필요한 것은 자세 번호가 아니라 **탐색 방향 한 비트**다. 판단은 호출부가
+        #   한다 (이웃 자세의 방향이 일치하는지 — `homing_node._dir_ok`).
+        return None, {
+            'between': True, 'gun': gun, 'near': best, 'err_gun': bd,
+            'msg': (f"어느 자세에도 맞지 않는다 — 건 {gun:+.2f}°, 가장 가까운 "
+                    f"{pose_label(best)} 에서 {bd:+.2f}° "
+                    f"(허용 ±{info['tol_gun']:.2f}°)"),
+        }
     p = dict(info['poses'][best])
     p['err_gun'] = bd
     p['gun_now'] = gun

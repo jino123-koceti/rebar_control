@@ -430,6 +430,41 @@ class HomingNode(Node):
         except Exception:
             self._frame = None
 
+    def _dir_ok(self, detail):
+        """자세 사이일 때 **탐색 방향이 한 쪽으로 갈리는가** → 건 각도 또는 None.
+
+        에지는 자세 범위 **안쪽**(건 -5.05°)에 있어서 방향이 ± 두 가지다. 그런데
+        에지를 끼는 구간은 `2번 ↔ 12시` **하나뿐**이고, 나머지 구간은 양쪽 이웃
+        자세가 같은 방향이다 — 1·2번 사이면 둘 다 +1 이다. 그러면 사이 어디에
+        있는지 몰라도 방향은 정해진다.
+
+        ⚠ 이 검사는 `g` 를 `edge_gun` 과 직접 비교하는 것보다 **낡은 에지값에
+          강하다.** 이웃 자세는 에지에서 멀어서 몇 도 틀려도 분류가 안 바뀐다.
+          에지값이 틀려 방향이 뒤집힌 것이 2026-10-03 스톨의 원인이었다.
+
+        에지를 끼는 구간이면 None 을 돌려 기존 거부 경로로 보낸다 — 추측하지 않는다.
+        """
+        if not isinstance(detail, dict) or not detail.get('between'):
+            return None
+        g = detail.get('gun')
+        ps = (self.pose_id or {}).get('poses') or {}
+        if g is None or not ps:
+            return None
+        lo = max((p for p in ps.values() if p['gun'] <= g),
+                 key=lambda p: p['gun'], default=None)
+        hi = min((p for p in ps.values() if p['gun'] >= g),
+                 key=lambda p: p['gun'], default=None)
+        dirs = {p['dir'] for p in (lo, hi) if p}
+        if len(dirs) != 1:
+            self.get_logger().warning(
+                f"yaw 건 {g:+.2f}° 는 **에지를 끼는 구간**이라 이웃 자세의 탐색 "
+                f"방향이 엇갈린다 — 2번이나 12시로 옮긴 뒤 다시 하세요")
+            return None
+        self.get_logger().info(
+            f"yaw 자세 사이 (건 {g:+.2f}°) — 이웃 자세가 둘 다 방향 "
+            f"{dirs.pop():+d} 이므로 자세 번호 없이 진행한다")
+        return float(g)
+
     def _vision_pick(self, detail):
         """별칭 후보 둘 중 하나를 **영상으로** 고른다 → 건 각도(도) 또는 None.
 
@@ -512,14 +547,23 @@ class HomingNode(Node):
                     #     검증됐다. X 가 다르면 건의 모습이 달라져 틀린다.
                     picked = self._vision_pick(info)
                     if picked is None:
-                        if defer_yaw:
+                        # ⚠⚠ [2026-10-07] **자세 사이여도 방향이 갈리면 간다.**
+                        #   호밍이 필요한 것은 자세 번호가 아니라 탐색 방향 한
+                        #   비트다 (에지까지 그 방향으로 달리면 끝). 이웃 자세
+                        #   둘의 방향이 같으면 사이 어디에 있어도 같은 방향이다.
+                        ok = self._dir_ok(info)
+                        if ok is not None:
+                            g, src = ok, '단회전 (자세 사이 — 이웃 방향 일치)'
+                        elif defer_yaw:
                             # 아직 X 를 안 맞췄다 — yaw 차례에 다시 본다
                             self.get_logger().info(
                                 "yaw 자세는 아직 모른다 — X 호밍 뒤에 다시 본다 "
                                 "(그때 비전으로 별칭을 가린다)")
                             return None
-                        return f"yaw {pose_reason(info)}"
-                    g, src = picked, '비전 판정'
+                        else:
+                            return f"yaw {pose_reason(info)}"
+                    else:
+                        g, src = picked, '비전 판정'
                 else:
                     g, src = info['gun'], f"단회전 {pose_label(n)}"
             # ⚠⚠ [2026-10-07] **12시 근처에서 출발하면 방향을 유도하지 않는다.**
@@ -545,6 +589,18 @@ class HomingNode(Node):
                 return None
             d = 1 if g < self.pose_id['edge_gun'] else -1
             AXES['yaw']['dir'] = d
+            # ⚠⚠ **탐색 한도는 "12시에서 출발" 전제로 잡힌 값이다** (건 12°).
+            #   아무 자세에서나 출발하게 되면 정상 호밍이 한도에 걸려 헛실패한다 —
+            #   1번에서 에지까지가 건 11.7° 로 이미 턱걸이다. 거리를 **알고 있으니**
+            #   그만큼 + 여유로 올린다. ⚠ 내리지는 않는다 (설정값이 하한이다) —
+            #   한도는 방향이 틀렸을 때의 뒷받침이므로 좁을수록 좋다.
+            need = (abs(self.pose_id['edge_gun'] - g) + 4.0) * float(
+                self.pose_id.get('gear') or 12.5)
+            if need > (self.search_limit or 0.0):
+                self.get_logger().info(
+                    f"yaw 탐색 한도 {self.search_limit:.0f}° → {need:.0f}° "
+                    f"(모터축) 로 올린다 — 출발이 에지에서 멀다")
+                self.search_limit = need
             self.get_logger().info(
                 f"yaw {src} — 건 {g:+.2f}° (12시에서 멀다) → 탐색 방향 {d:+d} 유도, "
                 f"에지까지 건 {self.pose_id['edge_gun'] - g:+.2f}°")
