@@ -58,6 +58,7 @@ class Bridge(Node):
         self._raw = {}
         self._seen = {}            # 토픽별 마지막 수신 시각
         self.estop = None
+        self.safety = None         # estop 외에 막는 조건까지 — _on_safety 참고
         self.estop_t = 0.0
 
         self.homing_pub = self.create_publisher(String, '/homing_cmd', 10)
@@ -88,7 +89,18 @@ class Bridge(Node):
             pass                      # 깨진 JSON 은 버린다. 옛 값을 그대로 둔다
 
     def _on_safety(self, msg):
+        # ⚠⚠ **estop 만 보면 안 된다.** 2026-10-07 에 STOP 스위치가 눌린 채로
+        #   화면이 "비상정지 해제" 를 띄웠고, [전체 호밍] 을 눌러도 중재기가
+        #   조용히 거절했다 — 눌렀는데 아무 일도 안 일어나고 이유가 화면에
+        #   없었다. 막는 조건을 **전부** 넘긴다.
         self.estop = bool(msg.estop)
+        self.safety = {
+            'estop': bool(msg.estop),
+            'stop_switch': bool(getattr(msg, 'stop_switch', False)),
+            'inputs_stale': bool(getattr(msg, 'inputs_stale', False)),
+            'blocked_axes': list(getattr(msg, 'blocked_axes', [])),
+            'reason': str(getattr(msg, 'reason', '')),
+        }
         self.estop_t = time.time()
 
     def snapshot(self):
@@ -100,7 +112,8 @@ class Bridge(Node):
             age['safety'] = round(now - self.estop_t, 1)
         return {**{k: self._raw.get(k, {}) for k in
                    ('homing', 'mission', 'stage', 'drive')},
-                'estop': self.estop, 'age_sec': age, 'now': round(now, 1)}
+                'estop': self.estop, 'safety': self.safety,
+                'age_sec': age, 'now': round(now, 1)}
 
     def command(self, what):
         if what == 'homing':
