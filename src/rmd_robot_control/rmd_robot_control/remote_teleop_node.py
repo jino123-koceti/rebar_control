@@ -27,9 +27,10 @@
   S23   토글할 때마다 yaw 자세 **한 단계 위로** (1→2→3→4)  → /stage/yaw_pose
   S24   토글할 때마다 yaw 자세 **한 단계 아래로** (4→3→2→1) → /stage/yaw_pose
   S21   **전체 호밍 시작** → /homing_cmd "all"
-  S22   **호밍 정지**     → /homing_cmd "stop"
+  S22   **경로 미션 시작** → /mission/start  (path_file 웨이포인트 결속)
         ⚠ 리모콘으로 시작하는 것이 웹 UI 보다 안전하다 — 비상정지를 쥔 사람이
           시작하게 된다. 축별 호밍은 넣지 않는다 (프레임끼리 부딪힌다).
+        ⚠ **정지는 비상정지와 웹 UI 정지 버튼이다.** 시작만 리모콘에 둔다.
 
   비상정지 → 전 축 정지. `remote_bridge` 가 판정해서 넘겨준다.
   송신기 꺼짐·START 전(DATA[0]=0x00)도 비상정지로 들어온다.
@@ -87,7 +88,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Float32, Int32, String
+from std_msgs.msg import Empty, Float32, Int32, String
 from rebar_base_interfaces.msg import RemoteControl, SafetyState
 
 from .axis_config import load_pose_id, load_stage_axes, pose_label
@@ -150,6 +151,8 @@ class RemoteTeleop(Node):
         # 호밍 시작/정지 (S21/S22). ⚠ 'all' 과 'stop' 만 보낸다 — 축 이름은
         #   `homing_node` 가 거부하고, 애초에 축별 호밍은 프레임을 친다.
         self.homing_pub = self.create_publisher(String, '/homing_cmd', 10)
+        # 경로 미션 시작 (S22). `navigator` 가 `path_file` 의 웨이포인트를 돈다.
+        self.mission_pub = self.create_publisher(Empty, '/mission/start', 10)
         self.stage = None
         self.create_subscription(String, '/stage/status', self._on_stage, 10)
         self._pose_noted = set()
@@ -377,15 +380,28 @@ class RemoteTeleop(Node):
         #   프레임끼리 부딪힌다 (`/homing_cmd x` 하나로 실제로 쳤다).
         # ⚠ S22 는 **정지**다. 시작 버튼만 두고 정지를 안 두면 안 된다 — 멈추는
         #   쪽은 언제나 안전한 방향이라 같이 넣었다.
-        for name, cmd, label in (('S21', 'all', '전체 호밍 시작'),
-                                 ('S22', 'stop', '호밍 정지')):
-            if btn[name] and not self.prev[name]:
-                if self.homing_pub.get_subscription_count() == 0:
-                    self.get_logger().warning(
-                        f"{name}: /homing_cmd 구독자 없음 — homing_node 확인")
-                else:
-                    self.homing_pub.publish(String(data=cmd))
-                    self.get_logger().warning(f"{name}: {label} (리모콘)")
+        if btn['S21'] and not self.prev['S21']:
+            if self.homing_pub.get_subscription_count() == 0:
+                self.get_logger().warning(
+                    "S21: /homing_cmd 구독자 없음 — homing_node 확인")
+            else:
+                self.homing_pub.publish(String(data='all'))
+                self.get_logger().warning("S21: 전체 호밍 시작 (리모콘)")
+
+        # ⚠⚠ **S22 = 경로 미션 시작** (2026-10-07 사용자 지시). `path_file` 의
+        #   웨이포인트를 순서대로 돌며 결속한다 — 주행이 섞인 **가장 큰 동작**이
+        #   한 번의 토글로 시작된다. 리모콘으로 두는 이유는 비상정지를 쥔 사람이
+        #   시작하게 되는 것이다 (웹 UI 는 와이파이→HTTP→ROS 를 거쳐 느리다).
+        # ⚠ 정지는 **비상정지**(1차)와 **웹 UI 정지 버튼**(/homing_cmd stop +
+        #   /mission/abort + /stage/stop 동시)이다. S22 에 있던 '호밍 정지' 는
+        #   이 할당으로 빠졌다.
+        if btn['S22'] and not self.prev['S22']:
+            if self.mission_pub.get_subscription_count() == 0:
+                self.get_logger().warning(
+                    "S22: /mission/start 구독자 없음 — navigator 확인")
+            else:
+                self.mission_pub.publish(Empty())
+                self.get_logger().warning("S22: 경로 미션 시작 (리모콘)")
 
         self.prev = btn
         self._note(f"Remote  주행 {lin:+.2f}/{ang:+.2f}  "
