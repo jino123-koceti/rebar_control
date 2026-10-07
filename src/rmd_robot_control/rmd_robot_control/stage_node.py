@@ -21,6 +21,10 @@ mm 는 **호밍 원점에서의 거리**다. 그래서 호밍이 선행 조건�
 ## 토픽
 
   구독  /stage/goal      geometry_msgs/Point  목표 (x,y,z) mm. NaN 인 축은 안 움직인다
+        /stage/yaw_deg   std_msgs/Float32     yaw 를 **건 각도(12시 기준 도)** 로.
+                                              자세 사이 임의 각도용 — `/stage/yaw_pose`
+                                              는 자세 1~4 만 받는다. 발행자는
+                                              `tools/test/` 의 수집 도구다
         /stage/stop      std_msgs/Empty       즉시 정지
         /homing_status   String(JSON)         원점 레퍼런스
         /safety/state    SafetyState          방향별 차단
@@ -342,6 +346,8 @@ class StageNode(Node):
                     (lambda nm: (lambda m: self.cur_a.__setitem__(nm, float(m.data))))(_n),
                     10)
         self.create_subscription(Int32, '/stage/yaw_pose', self._on_yaw_pose, 10)
+        self.create_subscription(
+            Float32, '/stage/yaw_deg', self._on_yaw_deg, 10)
         # 사람이 "지금 눈으로 보니 N번 자세다" 를 알려주는 경로. 재시작으로 기준점을
         # 잃었을 때 재호밍(64초) 없이 복구한다. ⚠ 사람이 틀리면 그대로 틀린다 —
         # 자동으로는 절대 보내지 않는다 (ros2 topic pub 전용).
@@ -567,6 +573,75 @@ class StageNode(Node):
             f"yaw 회전 — {pose_label(cur)} → {pose_label(want)} "
             f"(건 {g[cur]['gun']:+.2f}° → {g[want]['gun']:+.2f}°, "
             f"모터축 {self.yaw_tgt - self.deg['yaw']:+.1f}°)")
+
+    def _on_yaw_deg(self, msg):
+        """yaw 를 **건 각도(12시 기준, 도)** 로 돌린다. 자세 사이 임의 각도용.
+
+        왜 필요한가 (2026-10-07): `/stage/yaw_pose` 는 자세 1~4 만 받아서 **자세
+        사이로는 갈 수 없다.** 리모콘(S23/S24)도 자세 단위다. 그래서 "1번에서
+        4번까지 조금씩 돌리며 각도-영상 데이터를 모으는" 일을 할 수 없었다.
+
+        ⚠⚠ **yaw 는 끝 리미트가 없다.** 각도를 그대로 받으면 구동범위 밖으로
+          밀어붙일 수 있고, 그러면 기구부에 박는다 — 2026-10-07 에 탐색 방향이
+          틀려 실제로 박았고 커플링이 미끄러졌다. 그래서 두 겹으로 막는다:
+            ① 목표가 **가동범위(gun_lo~gun_hi) 안**인가
+            ② 목표를 감싸는 **양쪽 자세 모두**에 대해 전환 검사를 통과하는가
+          ②가 핵심이다. 전환 검사는 자세 번호 기준이라 임의 각도를 직접 못 보는데,
+          **감싸는 두 자세가 모두 안전하면 그 사이도 안전하다** — 가동범위 박스는
+          볼록하기 때문이다 (`_transit_block` 과 같은 근거).
+        """
+        info = self.pose_id
+        if self.moving or self.yaw_moving:
+            return self._reject('이미 이동 중이다 — /stage/stop 후 다시')
+        if not info:
+            return self._reject('자세 판별 정보가 없다 (axes.yaml 확인)')
+        c = self.ax.get('yaw') or {}
+        if not c.get('joint') or self.deg.get('yaw') is None:
+            return self._reject('yaw: 축 정의나 현재 위치가 없다')
+        want_gun = float(msg.data)
+        lo, hi = info.get('gun_lo'), info.get('gun_hi')
+        if lo is not None and hi is not None and not (lo <= want_gun <= hi):
+            return self._reject(
+                f'건 {want_gun:+.2f}° 는 가동범위 {lo:+.1f}~{hi:+.1f}° 밖이다')
+        cur, why = self.cur_pose()
+        if cur is None:
+            return self._reject(f'현재 yaw 자세를 못 가린다 — {why}')
+        now_gun = self.gun_now()
+        if now_gun is None:
+            return self._reject('yaw 기준점이 없다')
+
+        # 목표를 감싸는 자세들 — 그 **전부**에 대해 전환 검사를 통과해야 한다
+        poses = info['poses']
+        around = sorted(poses, key=lambda k: abs(poses[k]['gun'] - want_gun))[:2]
+        for p in around:
+            bad = self._transit_block(cur, p)
+            if bad:
+                return self._reject(
+                    f'건 {want_gun:+.2f}° 로 가려면 {pose_label(p)} 를 지나는데 — {bad}')
+        # 회전 창도 **가장 좁은 쪽**으로 잡는다 (보수적)
+        wins = [transit_window(self.env, self.pose_id, cur, p)[0]
+                for p in around] if (self.env is not None and self.enforce) else []
+        wins = [w for w in wins if w]
+        if wins:
+            self.yaw_win = {ax: (max(w[ax][0] for w in wins),
+                                 min(w[ax][1] for w in wins))
+                            for ax in wins[0]}
+        else:
+            self.yaw_win = None
+
+        self.yaw_speed = float(self.get_parameter('yaw_speed_dps').value)
+        self.yaw_want = None            # 자세 번호가 아니라 각도 목표다
+        self.yaw_tgt = (self.deg['yaw']
+                        + (now_gun - want_gun) * info['gear'])
+        self.yaw_moving = True
+        self.t_start = self.t_arm = self.t_grant_lost = time.time()
+        self._yaw_sent = 0.0
+        self.detail = f'건 {now_gun:+.2f}° → {want_gun:+.2f}° — 브레이크 해제 대기'
+        self._brake('release', 'yaw')
+        self._request_control('auto')
+        self.get_logger().info(
+            f"yaw 각도 이동 — 건 {now_gun:+.2f}° → {want_gun:+.2f}° "
+            f"(모터축 {self.yaw_tgt - self.deg['yaw']:+.1f}°)")
 
     def _transit_block(self, cur, want):
         """회전 중 지나가는 자세들의 교집합 밖이면 사유, 안이면 None.

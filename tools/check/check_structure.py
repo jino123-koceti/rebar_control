@@ -60,6 +60,10 @@ R3_PLANNED = {
     '/gripper/command': '외부에서 부르는 토픽',
     '/gripper/position': '외부에서 부르는 토픽',
     '/rebar/recorder/trigger': '데이터 수집 도구에서 부른다',
+    '/stage/yaw_deg': 'yaw 를 건 각도로 돌린다 — 자세 사이 임의 각도용.'
+                      ' 상시 제어 경로가 아니라 **데이터 수집·측정 도구**에서만'
+                      ' 부른다 (tools/test/). 자세 1~4 로 가는 상시 경로는'
+                      ' /stage/yaw_pose 이고 그쪽은 발행자가 있다',
     '/rebar/detect': '사람이 직접 주는 경로도 남아 있다 (ros2 topic pub).'
                      ' tying_planner 가 발행하므로 위반은 아니다',
     '/stage/goal': '캘리브레이션 도구·사람이 직접 주는 경로도 남아 있다'
