@@ -74,6 +74,10 @@ def generate_launch_description():
         # (이동·하강·상승은 그대로 돈다 — 동작 확인용으로 유용하다).
         DeclareLaunchArgument('use_gun', default_value='false',
                               description='결속건 트리거(Pololu) 사용'),
+        # 경로 미션(주행 + 결속). 끄면 drive_node·navigator 가 안 뜬다 —
+        # 상부 축만 쓰는 작업에서는 주행 노드가 CAN 을 쓰지 않게 둘 수 있다.
+        DeclareLaunchArgument('use_mission', default_value='true',
+                              description='경로 미션(drive_node + navigator) 기동'),
     ]
 
     motor = Node(
@@ -363,9 +367,56 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('use_camera')),
     )
 
+    # ── 주행 거리 제어 ───────────────────────────────────────────────────
+    # `/drive/step` 으로 mm 단위 전후진. 바퀴 각도로 닫힌 루프를 돈다.
+    # ⚠ 전진은 **우측 +, 좌측 −** 다 (모터가 마주 보게 달렸다). 직진 보정 부호는
+    #   **방향에 따라 뒤집으면 안 된다** — 2026-10-04 에 후진에서 뒤집었다가
+    #   양의 되먹임이 되어 장비가 돌았고 사용자가 비상정지했다.
+    drive = Node(
+        package='rmd_robot_control', executable='drive_node',
+        name='drive_node', output='screen',
+        condition=IfCondition(LaunchConfiguration('use_mission')),
+        respawn=True, respawn_delay=2.0,
+    )
+
+    # ── 경로 미션 ────────────────────────────────────────────────────────
+    # `path_file` 을 읽어 `drive`/`tie`/`lateral` 단계로 풀고 순서대로 돌린다.
+    # 시작은 `/mission/start`. ⚠ 비워 두면 경로를 안 읽고 `mission` 파라미터
+    # (기본 `['tie']`)만 돈다 — 리허설에서 "주행을 안 한다" 로 보인다.
+    navigator = Node(
+        package='rmd_robot_control', executable='navigator',
+        name='navigator', output='screen',
+        parameters=[{
+            # ⚠ `rmd_share` 는 `<ws>/install/rmd_robot_control/share/rmd_robot_control`
+            #   이라 **4단계** 올라가야 워크스페이스 뿌리다. 3단계만 올라갔다가
+            #   `install/src/...` 가 나와 파일을 못 찾았다 — 그러면 navigator 가
+            #   조용히 `mission` 기본값(`['tie']`)만 돌아 **"주행을 안 한다"** 로 보인다.
+            'path_file': os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.dirname(rmd_share)))),
+                'src', 'rebar_control', 'path_generation', 'test_path.txt'),
+        }],
+        condition=IfCondition(LaunchConfiguration('use_mission')),
+        respawn=True, respawn_delay=2.0,
+    )
+
+    # ── 교차점 검출 ──────────────────────────────────────────────────────
+    # ⚠ `rate: 0.0` 은 **트리거 전용**이다 (`/rebar/detect`). 0 이 아니면 그 주기로
+    #   계속 추론해 GPU 를 먹는다. 결속은 정지 상태에서 한 번만 찍으면 된다.
+    # ⚠ 첫 트리거는 **모델 적재 중이라 버려진다** (RF-DETR 적재에 40초쯤). 기동
+    #   직후 바로 미션을 걸면 검출이 안 온 것처럼 보인다.
+    detector = Node(
+        package='rebar_vision', executable='crossing_detector',
+        name='crossing_detector', output='screen',
+        parameters=[{'rate': 0.0}],
+        condition=IfCondition(LaunchConfiguration('use_camera')),
+        respawn=True, respawn_delay=5.0,
+    )
+
     return LaunchDescription(args + [
         LogInfo(msg=['리모콘 조작 구성 기동 — 안전 차단: ', use_safety,
                      ' / 호밍은 자동으로 돌지 않는다 (/homing_cmd 로 시작)']),
         motor, lateral, remote_bridge, remote_teleop, ezi_io, safety, mode_arbiter,
         homing, stage, tying, planner, camera, pololu,
+        drive, navigator, detector,
     ])
