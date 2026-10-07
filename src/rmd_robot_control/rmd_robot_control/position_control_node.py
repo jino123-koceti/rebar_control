@@ -379,6 +379,9 @@ class PositionControlNode(Node):
         #   ros2 topic pub --once /brake_cmd std_msgs/String "{data: 'release x,y'}"
         #   ros2 topic pub --once /brake_cmd std_msgs/String "{data: 'lock x,y'}"
         #   ros2 topic pub --once /brake_cmd std_msgs/String "{data: 'release z force'}"
+        #   ros2 topic pub --once /brake_cmd std_msgs/String "{data: 'recover z'}"
+        #     └ 에러에 빠진 모터 복구: 잠금 → 0x9B(클리어) → 0x88(재기동).
+        #       브레이크는 잠긴 채로 남는다 — 움직일 사람이 푼다.
         self.brake_cmd_sub = self.create_subscription(
             String, '/brake_cmd', self._on_brake_cmd, 10)
 
@@ -806,10 +809,10 @@ class PositionControlNode(Node):
         if not parts:
             return
         action = parts[0]
-        if action not in ('release', 'lock', 'shutdown'):
+        if action not in ('release', 'lock', 'shutdown', 'recover'):
             self.get_logger().error(
                 f"브레이크 명령을 모르겠습니다: '{msg.data}' — "
-                f"'release x,y' / 'lock z' / 'shutdown x,y' 형식")
+                f"'release x,y' / 'lock z' / 'shutdown x,y' / 'recover z' 형식")
             return
 
         force = 'force' in parts[1:]
@@ -834,6 +837,23 @@ class PositionControlNode(Node):
         # 순서가 중요하다: 먼저 잠그지 않고 0x80 을 보내면 **Z 가 떨어진다.**
         shutdown_cmd = (self.protocol.create_system_command(CommandType.MOTOR_SHUTDOWN)
                         if action == 'shutdown' else None)
+        # ⚠⚠ **`recover` = 잠금 → 0x9B(에러 클리어) → 0x88(재기동).**
+        #   2026-10-07 에 알게 된 것: `0x9B` 도 `0x88` 도 **이 저장소 어디에서도
+        #   보내지 않았다** (프로토콜에 상수만 있었다). 그래서 모터가 한 번 에러에
+        #   빠지면 소프트웨어 복구 경로가 **아예 없었고**, 전원 재투입만 들었다 —
+        #   '전원만 듣는다' 가 모터 특성이 아니라 **시도하는 코드가 없었던 것**이다.
+        #   그날 Z(0x147)가 호밍 완료 0.7초 뒤 에러 0x40 을 띄우고 위치 명령에
+        #   반응하지 않아 결속 9점이 z_down 타임아웃 45초씩으로 전부 실패했다.
+        # ⚠ **순서가 안전을 결정한다.** 먼저 잠근다 — 에러 상태의 Z 는 여자가
+        #   끊겨 있을 수 있고, 잠그지 않은 채 0x88 로 되살리면 제어가 붙기 전에
+        #   자중으로 떨어진다. 브레이크는 **잠긴 채로 둔다** (움직일 사람이 푼다).
+        # ⚠ 과온도(0x4000 계열)라면 식기 전에는 0x9B 가 먹지 않는다 — 그때는
+        #   실패가 정상이고, 식히고 다시 불러야 한다.
+        recover_cmds = ([self.protocol.create_system_command(
+                             CommandType.CLEAR_MOTOR_FAULT),
+                         self.protocol.create_system_command(
+                             CommandType.MOTOR_ENABLE)]
+                        if action == 'recover' else [])
 
         done, skipped, failed = [], [], []
         for name in names:
@@ -848,13 +868,17 @@ class PositionControlNode(Node):
             if ok and shutdown_cmd is not None:
                 time.sleep(0.05)                 # 잠금이 먹은 뒤에 여자를 끊는다
                 ok = self.can_manager.send_frame(mid, shutdown_cmd)
+            for extra in (recover_cmds if ok else []):
+                time.sleep(0.05)                 # 잠금이 먹은 뒤에 되살린다
+                ok = self.can_manager.send_frame(mid, extra) and ok
             if ok:
                 done.append(f"{name}(0x{mid:03X})")
             else:
                 failed.append(f"{name}(0x{mid:03X})")
             time.sleep(0.05)
 
-        verb = {'release': '해제', 'lock': '잠금', 'shutdown': '잠금+차단'}[action]
+        verb = {'release': '해제', 'lock': '잠금', 'shutdown': '잠금+차단',
+                'recover': '복구(잠금+0x9B+0x88, 잠긴 채로 둔다)'}[action]
         if done:
             self.get_logger().info(f"브레이크 {verb}: {', '.join(done)}")
         if skipped:

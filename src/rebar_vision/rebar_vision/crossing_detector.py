@@ -117,6 +117,28 @@ class CrossingDetector(Node):
             f"좌표계 {'stage' if self.R is not None else 'camera(캘리브레이션 전)'}"
             + ("" if rate > 0 else ", 트리거 전용(/rebar/detect)"))
 
+        # ⚠⚠ **모델을 기동 직후 미리 적재한다.** 예전에는 첫 검출 요청 때 올렸고
+        #   그게 약 20초 걸렸다 — `tying_planner` 의 검출 대기가 15초라 **그 날의
+        #   첫 시도가 항상 실패**했다 (2026-10-07 실측: 19:56:15 타임아웃 →
+        #   19:56:20 적재 완료 → 19:56:24 검출 9개). 전원 켜고 기다려도 안 풀린다 —
+        #   적재가 **요청 전에는 시작되지 않기** 때문이다.
+        # ⚠ 생성자에서 바로 부르지 않는다 — 20초 동안 spin 이 안 돌면 이 노드가
+        #   죽은 것처럼 보인다. one-shot 타이머로 첫 spin 뒤에 올린다.
+        self._warm = self.create_timer(0.1, self._warmup)
+
+    def _warmup(self):
+        '''기동 직후 한 번 — 모델을 미리 올린다.
+
+        적재가 실패해도 노드는 살려 둔다 — `detect` 가 다시 시도한다.
+        적재 실패를 기동 실패로 만들면 카메라가 늦게 붙는 경우에 노드가 사라진다.
+        '''
+        self.destroy_timer(self._warm)
+        t0 = time.time()
+        ok = self._ensure_model()
+        self.get_logger().info(
+            f"모델 예비 적재 {'완료' if ok else '실패'} — {time.time() - t0:.1f}초"
+            + ('' if ok else ' (첫 검출에서 다시 시도한다)'))
+
     # ---- 준비 --------------------------------------------------------------
     def _load_transform(self, path):
         if not path or not os.path.exists(path):
