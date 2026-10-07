@@ -554,7 +554,28 @@ class StageNode(Node):
             return self._reject('yaw: 축 정의나 현재 위치가 없다')
         cur, why = self.cur_pose()
         if cur is None:
-            return self._reject(f'현재 yaw 자세를 못 가린다 — {why}')
+            # ⚠⚠ [2026-10-07] **자세 사이여도 회전한다.** 회전에 필요한 것은 자세
+            #   번호가 아니라 **건 각도**다 (아래 목표 계산이 그것만 쓴다). 예전에는
+            #   번호가 없으면 거부했는데, 자세 사이일 때가 바로 회전이 필요한
+            #   때다 — 그날 리모콘 S23/S24 가 먹지 않고(요청은 나가는데 거부),
+            #   미션도 자세 사이에 빠진 뒤 남은 점 전부가 거부됐다.
+            # ⚠ 전환 안전 검사(`_transit_block`·`transit_window`)는 자세 번호로
+            #   하므로, **실제로 지나갈 구간을 덮는 쪽**을 출발로 잡는다 — 목표에서
+            #   먼 이웃이다. 스치는 자세 집합이 실제보다 넓어져 더 보수적이다.
+            g0 = self.gun_now()
+            if g0 is None:
+                return self._reject(f'현재 yaw 자세를 못 가린다 — {why}')
+            ps = info['poses']
+            up = ps[want]['gun'] > g0
+            side = [(k, v) for k, v in ps.items()
+                    if (v['gun'] <= g0 if up else v['gun'] >= g0)]
+            if not side:
+                return self._reject(f'현재 yaw 자세를 못 가린다 — {why}')
+            cur = (max(side, key=lambda kv: kv[1]['gun'])[0] if up
+                   else min(side, key=lambda kv: kv[1]['gun'])[0])
+            self.get_logger().warning(
+                f'yaw 자세 사이 (건 {g0:+.2f}°) — 회전은 건 각도로 한다. '
+                f'전환 검사는 {pose_label(cur)} 출발로 **넓게** 본다')
         if cur == want:
             # 한도 때문에 지웠다가 되돌림 (2026-10-03) — 상태에도 남아야 상위가 본다
             self.detail = f'{pose_label(want)} — 이미 그 자세다'
