@@ -70,6 +70,10 @@ def generate_launch_description():
         #   거부되어 기존 경로로 간다).
         DeclareLaunchArgument('use_camera', default_value='true',
                               description='작업영역 카메라(Gemini 2L) 동시 기동'),
+        # 결속건을 쓸지. 끄면 Pololu 노드도 안 뜨고 결속 시퀀스도 발사를 건너뛴다
+        # (이동·하강·상승은 그대로 돈다 — 동작 확인용으로 유용하다).
+        DeclareLaunchArgument('use_gun', default_value='false',
+                              description='결속건 트리거(Pololu) 사용'),
     ]
 
     motor = Node(
@@ -274,11 +278,45 @@ def generate_launch_description():
     #   켤 때: gun_enabled:=true. Pololu 노드(/motor_0/vel)가 떠 있어야 한다.
     # ⚠ Z 는 목표에 z 가 실려 올 때만 움직인다 (`tying_planner` 가 모델에서
     #   계산해 싣는다). 손으로 x·y 만 보내면 Z 단계는 건너뛴다.
+    # ── 결속건 트리거 (Pololu Simple Motor Controller 18v7) ──────────────
+    # ⚠ 전에는 `base_system.launch.py` 에만 있어 **수동으로 띄워야** 했다. 그러면
+    #   상부 전원이 내려갈 때 USB 가 빠져 노드가 죽고 **프로세스 껍데기만 남는다**
+    #   — 2026-10-07 에 실제로 그랬고, 조용히 죽어 있어서 결속만 안 되고 원인을
+    #   찾기 어려웠다. 카메라와 같은 현상이라 같이 올린다.
+    # ⚠ 포트는 udev 심링크(`/dev/pololu_trigger`)를 쓴다. `ttyACM*` 번호는 꽂는
+    #   순서에 따라 바뀐다.
+    pololu = Node(
+        package='pololu_ros2', executable='pololu_node',
+        name='pololu_node', output='screen',
+        parameters=[{
+            'serial_port': '/dev/pololu_trigger',
+            'baudrate': 9600,
+            'motor_ids': [0],
+            'motor_topics': ['motor_0/vel'],
+        }],
+        condition=IfCondition(LaunchConfiguration('use_gun')),
+        respawn=True, respawn_delay=3.0,
+    )
+
     tying = Node(
         package='rmd_robot_control', executable='tying_sequence',
         name='tying_sequence', output='screen',
         parameters=[{
-            'gun_enabled': False,
+            # ⚠ `LaunchConfiguration` 을 그대로 넣으면 **문자열 'false' 가 전달**되고
+            #   파이썬에서 빈 문자열이 아니므로 **참으로 평가된다** — 껐는데 켜진다.
+            #   저장소의 기존 방식(`safety_timeout`)대로 명시 변환한다.
+            'gun_enabled': PythonExpression(
+                ["'", LaunchConfiguration('use_gun'), "' == 'true'"]),
+            # ⚠⚠ **음수다.** 2026-10-07 실장비 확인: **수축 = 트리거 당김(발사)**,
+            #   팽창 = 놓음. `tying_sequence` 는 `gun_speed` 로 발사하고
+            #   `-gun_speed` 로 원복하므로 부호가 반대면 **발사와 원복이 뒤바뀐다.**
+            #   2차년도 코드(`trigger_speed: +1.0`)는 당시 배선 기준이라 지금과 반대다.
+            'gun_speed': -1.0,
+            # 2차년도 검증값과 같다. ⚠ 실제 스트로크가 짧아 트리거가 안 걸리는
+            #   문제는 **미해결**이다 (기구 쪽). 시간을 늘려도 끝(하드스토퍼)에
+            #   닿으면 더 안 간다 — 3초·5회 끊어보기 전부 같은 거리였다.
+            'gun_fire_sec': 1.0,
+            'gun_return_sec': 1.0,
             'z_safe_mm': 0.0,
             # 모델 잔차가 Z 2.7mm 다. 실측 결속깊이는 -58~-83mm 였으니
             # 그 바깥은 모델이 틀린 것으로 보고 거부한다.
@@ -329,5 +367,5 @@ def generate_launch_description():
         LogInfo(msg=['리모콘 조작 구성 기동 — 안전 차단: ', use_safety,
                      ' / 호밍은 자동으로 돌지 않는다 (/homing_cmd 로 시작)']),
         motor, lateral, remote_bridge, remote_teleop, ezi_io, safety, mode_arbiter,
-        homing, stage, tying, planner, camera,
+        homing, stage, tying, planner, camera, pololu,
     ])
