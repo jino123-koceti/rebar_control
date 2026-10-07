@@ -775,42 +775,24 @@ class StageNode(Node):
         #   어긋나면 돌아올 길이 없었고, 자세를 못 맞춘 채 "도달" 로 넘어가
         #   **미션 9점이 0점**이 됐다 (yaw 가 자세 사이에 남자 그 뒤 모든 동작이
         #   거부됐다). 오차가 있으면 **실패로 넘기지 않고 수렴할 때까지 제어한다.**
-        info = self.pose_id or {}
-        gun = self.gun_now()
-        gerr = None        # ⚠ 아래 로그가 참조한다 — 분기마다 꼭 정해 둘 것
-        want_gun = ((info.get('poses') or {}).get(self.yaw_want) or {}).get('gun')
-        if gun is None or want_gun is None:
-            # 기준점이 없으면 건 각도를 모른다 — 옛 방식(모터 목표)으로 판정한다
-            err = self.yaw_tgt - self.deg['yaw']
-            if abs(err) <= self.yaw_tol:
-                return self._yaw_done(f'도달 (남은 모터축 {err:+.2f}°)')
-        else:
-            gerr = want_gun - gun
-            if abs(gerr) <= self.yaw_gun_tol:
-                # 바로 끝내지 않는다 — 잠그고 차단한 뒤 **정착을 확인**한다
-                return self._yaw_park(f'도달 (남은 건 {gerr:+.2f}°)')
-            # ⚠⚠ **멀어지면 멈춘다.** 부호가 틀렸거나 기구 문제인데, yaw 는 끝
-            #   리미트가 없어서 계속 밀면 기구부에 박는다 (2026-09-30: 10.7A/86°C).
-            if self._yaw_best is None or abs(gerr) < self._yaw_best - 0.05:
-                self._yaw_best, self._yaw_worse = abs(gerr), 0
-            elif abs(gerr) > self._yaw_best + 0.5:
-                self._yaw_worse += 1
-                if self._yaw_worse >= 3:
-                    return self._yaw_done(
-                        f'오차가 커진다 (건 {gerr:+.2f}°, 최선 '
-                        f'{self._yaw_best:.2f}°) — 부호·기준점·기구 확인')
-            # ⚠ 부호 규약: `+모터 → −건` 이므로 **−gerr** 를 더한다
-            self.yaw_tgt = self.deg['yaw'] - gerr * float(info['gear'])
+        # ⚠⚠ [2026-10-07 정정] **움직이는 중에 목표를 다시 계산하지 않는다.**
+        #   폐루프를 매 틱 돌렸더니 **오버슈트**가 났다 — 피드백이 10Hz 인데 속도가
+        #   400dps(건 32°/s)라 **0.1초 지연이 건 3.2°** 다. 묵은 값으로 상대 목표를
+        #   고쳐 쓰니 지나친다. 실측 3→2 전환에서 3.04° 넘어가 발산 감지가 걸렸다.
+        #   목표는 `_on_yaw_pose` 가 시작할 때 한 번 정하고 **위치 제어에 맡긴다**
+        #   (0xA4 가 스스로 감속해 들어간다). 보정은 **멈춘 뒤에만** 한다
+        #   (`_yaw_settle_tick`) — 그게 원래 더해야 했던 전부다.
+        err = self.yaw_tgt - self.deg['yaw']
+        if abs(err) <= self.yaw_tol:
+            return self._yaw_park(f'도달 (남은 모터축 {err:+.2f}°)')
         if time.time() - self._yaw_sent > 0.4:
             self._yaw_sent = time.time()
             self.pos_pubs['yaw'].publish(
                 Float64MultiArray(data=[self.yaw_tgt, self.yaw_speed]))
-            # ⚠ [2026-10-07] 여기서 `err`(옛 변수)를 참조해 **노드가 죽었다**
-            #   (`UnboundLocalError`). 폐루프 분기에서는 `err` 를 안 만든다.
-            #   남은 양은 건 각도로 말하는 것이 맞다 — 그게 판정 기준이다.
+            g = self.gun_now()
             self.detail = (f"{pose_label(self.yaw_want)}로 회전 중"
-                           + (f" (건 {gun:+.2f}°, 남은 건 {gerr:+.2f}°)"
-                              if gun is not None and gerr is not None else ''))
+                           + (f" (건 {g:+.2f}°, 남은 모터축 {err:+.1f}°)"
+                              if g is not None else ''))
 
     def _yaw_park(self, reason):
         """멈추고 잠그고 차단한 뒤 **정착 확인 단계로 넘긴다** (끝내지 않는다)."""
@@ -838,6 +820,15 @@ class StageNode(Node):
         gerr = want_gun - gun
         if abs(gerr) <= self.yaw_gun_tol:
             return self._yaw_done(f'{reason} · 정착 후 건 {gerr:+.2f}°')
+        # ⚠⚠ **회차마다 줄어드는지 본다.** 안 줄면 부호가 틀렸거나 기구 문제다 —
+        #   yaw 는 끝 리미트가 없어서 계속 밀면 기구부에 박는다. 틱 단위로 보면
+        #   움직이는 중 지연 때문에 헛걸린다 (그래서 여기로 옮겼다).
+        if self._yaw_best is not None and abs(gerr) > self._yaw_best + 0.5:
+            return self._yaw_done(
+                f'{reason} ⚠ 재보정이 오차를 키운다 (건 {gerr:+.2f}°, 최선 '
+                f'{self._yaw_best:.2f}°) — 부호·기준점·기구 확인')
+        if self._yaw_best is None or abs(gerr) < self._yaw_best:
+            self._yaw_best = abs(gerr)
         if self._yaw_pass >= self.yaw_max_pass:
             return self._yaw_done(
                 f'{reason} ⚠ 정착 후 건 {gerr:+.2f}° — 재보정 '
@@ -850,7 +841,6 @@ class StageNode(Node):
         self.yaw_tgt = self.deg['yaw'] - gerr * float(info['gear'])
         self.t_start = self.t_arm = self.t_grant_lost = time.time()
         self._yaw_sent = 0.0
-        self._yaw_best, self._yaw_worse = None, 0
         self.detail = (f'{pose_label(self.yaw_want)} 재보정 '
                        f'{self._yaw_pass}/{self.yaw_max_pass}회차')
         self._brake('release', 'yaw')
