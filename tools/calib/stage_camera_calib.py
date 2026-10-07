@@ -57,7 +57,8 @@ mm 는 **원점 기준**이라 재호밍·전원 재투입을 견딘다 (원점 
   않는다. 철근 배근이 기울어 있어 보통은 349~624mm 로 충분히 퍼진다.
 ⚠ 4점은 미지수와 같은 수라 잔차가 0 으로 나와 정확도 확인이 안 된다.
 
-명령: s=고정  r <n>=기록  p <n>=예측검증  l=목록  u=마지막취소  f=산출·저장  q=종료
+명령: s=고정  g <n>=예측위치로 X·Y 이동  r <n>=기록  rxy <n>=X·Y만 기록
+      p <n>=예측검증  l=목록  u=마지막취소  f=산출·저장  q=종료
 """
 
 import json
@@ -99,6 +100,12 @@ class Calib(Node):
         self.create_subscription(Image, '/camera/color/image_raw',
                                  self._on_color, qos_profile_sensor_data)
         self.trig = self.create_publisher(Empty, '/rebar/detect', 10)
+        # ⚠ 예측 위치로 **X·Y 만** 보낸다 (`g <n>`). Z 는 NaN 으로 둬서 내리지
+        #   않는다 — 캘리 중에 Z 를 내리면 X·Y 가 아직 틀린 상태라 철근을 찍는다
+        #   (2026-10-07 에 결속 9점이 전부 그렇게 -48mm 에서 걸렸다).
+        from geometry_msgs.msg import Point
+        self._Point = Point
+        self.goal = self.create_publisher(Point, '/stage/goal', 10)
         self.frozen = []          # 고정한 검출점 [(x,y,z,conf), ...]
         self.pairs = {}           # 자세 → [{cam, stage, snap, gun, idx, t}, ...]
         self.snap_stage = None    # 마지막 스냅샷 당시 스테이지 mm
@@ -679,6 +686,28 @@ class Calib(Node):
         return q
 
 
+    def goto(self, idx):
+        """예측 위치로 **X·Y 만** 보낸다. 그다음 사람이 리모콘으로 미세보정하고
+        `rxy <n>` 으로 기록하면, 기록값과 예측값의 차이가 곧 보정량이 된다.
+
+        왜 이 단계가 필요한가: 처음부터 손으로 맞추면 자세당 6점이 너무 느리다.
+        모델이 이미 있으면 **예측으로 가 놓고 조금만 고치는** 쪽이 훨씬 빠르고,
+        남는 차이가 바로 "모델이 얼마나 틀렸나" 라서 눈으로 검증도 된다.
+
+        ⚠ Z 는 보내지 않는다 (NaN). X·Y 가 틀린 채 내리면 철근을 찍는다.
+        ⚠ 작업영역 밖이면 `stage_node` 가 거부한다 — 여기서 또 검사하지 않는다
+          (두 곳에서 검사하면 규칙이 갈라진다).
+        """
+        q = self.predict(idx)
+        if q is None:
+            return
+        m = self._Point()
+        m.x, m.y, m.z = float(q[0]), float(q[1]), float('nan')
+        self.goal.publish(m)
+        print(f"  → X {q[0]:.1f}  Y {q[1]:.1f} mm 로 이동 명령 (Z 는 유지). "
+              f"맞춘 뒤 `rxy {idx}` 로 기록하세요")
+
+
 def run_one(n, cmd):
     c = cmd[0] if cmd else ''
     if c == 's':
@@ -694,6 +723,8 @@ def run_one(n, cmd):
         n.record(int(cmd[1]), check=(c == 'rxy'), axes='xy', stage=st)
     elif c == 'p' and len(cmd) > 1:
         n.predict(int(cmd[1]))
+    elif c == 'g' and len(cmd) > 1:
+        n.goto(int(cmd[1]))
     elif c == 'l':
         n.listing()
     elif c == 'archive':
@@ -705,7 +736,7 @@ def run_one(n, cmd):
     elif c == '':
         n.show()
     else:
-        print("  s / r <n> / r! <n> / rxy <n> [X Y] / p <n> / l / u / "
+        print("  s / r <n> / r! <n> / rxy <n> [X Y] / p <n> / g <n> / l / u / "
               "archive <사유> / f / q")
         return False
     return True
@@ -717,8 +748,8 @@ def main():
     # 한 명령만 돌리고 끝낸다. 짝은 STATE 파일에 남아 다음 호출로 이어진다 —
     # 사람이 리모콘으로 맞추는 동안 터미널을 붙잡고 있을 필요가 없다
     ap.add_argument('--cmd',
-                    help='비대화 모드: "s" | "r 3" | "r! 3"(재확인 생략) | '
-                         '"l" | "u" | "f" | "p 3"')
+                    help='비대화 모드: "s" | "g 3" | "r 3" | "r! 3"(재확인 생략) | '
+                         '"rxy 3" | "l" | "u" | "f" | "p 3"')
     a = ap.parse_args()
 
     rclpy.init()
