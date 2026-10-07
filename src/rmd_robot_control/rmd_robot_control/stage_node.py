@@ -603,21 +603,34 @@ class StageNode(Node):
         if lo is not None and hi is not None and not (lo <= want_gun <= hi):
             return self._reject(
                 f'건 {want_gun:+.2f}° 는 가동범위 {lo:+.1f}~{hi:+.1f}° 밖이다')
-        cur, why = self.cur_pose()
-        if cur is None:
-            return self._reject(f'현재 yaw 자세를 못 가린다 — {why}')
+        # ⚠⚠ **`cur_pose()` 를 쓰면 안 된다.** 각도 이동은 **자세 사이에서 출발**할
+        #   수 있는데 `cur_pose()` 는 자세 번호를 못 내면 None 이다. 2026-10-07 에
+        #   그걸 요구했다가, 첫 이동으로 자세 사이에 간 뒤 **나머지가 전부 거부**돼
+        #   16점 중 2점만 수집됐다. `_on_yaw_pose` 의 검사를 그대로 가져오면서
+        #   그것이 "자세에서 자세로" 를 전제한다는 것을 놓쳤다.
+        #   기준점만 있으면 **현재 건 각도**는 알 수 있고, 검사에 필요한 것은
+        #   그것이다 — 지금 각도와 목표 각도를 **둘 다 감싸는 자세들**을 보면 된다.
         now_gun = self.gun_now()
         if now_gun is None:
-            return self._reject('yaw 기준점이 없다')
+            return self._reject('yaw 기준점이 없다 — 호밍하거나 /stage/yaw_declare')
 
-        # 목표를 감싸는 자세들 — 그 **전부**에 대해 전환 검사를 통과해야 한다
+        # 지금 각도와 목표 각도를 **둘 다 감싸는** 자세들. 그 전부에 대해
+        # 전환 검사를 통과해야 한다 (박스가 볼록하므로 양 끝이 안전하면 사이도 안전).
         poses = info['poses']
-        around = sorted(poses, key=lambda k: abs(poses[k]['gun'] - want_gun))[:2]
-        for p in around:
-            bad = self._transit_block(cur, p)
+        lo_g, hi_g = min(now_gun, want_gun), max(now_gun, want_gun)
+        span = [k for k, v in poses.items()
+                if lo_g - info['period'] / 2 <= v['gun'] <= hi_g + info['period'] / 2]
+        if not span:                      # 아주 짧은 이동 — 가장 가까운 자세로
+            span = [min(poses, key=lambda k: abs(poses[k]['gun'] - want_gun))]
+        base = min(poses, key=lambda k: abs(poses[k]['gun'] - now_gun))
+        for p in span:
+            bad = self._transit_block(base, p)
             if bad:
                 return self._reject(
-                    f'건 {want_gun:+.2f}° 로 가려면 {pose_label(p)} 를 지나는데 — {bad}')
+                    f'건 {now_gun:+.2f}° → {want_gun:+.2f}° 는 {pose_label(p)} '
+                    f'부근을 지나는데 — {bad}')
+        around = span
+        cur = base
         # 회전 창도 **가장 좁은 쪽**으로 잡는다 (보수적)
         wins = [transit_window(self.env, self.pose_id, cur, p)[0]
                 for p in around] if (self.env is not None and self.enforce) else []
