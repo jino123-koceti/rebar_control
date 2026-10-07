@@ -749,6 +749,7 @@ class StageNode(Node):
         #   거부됐다). 오차가 있으면 **실패로 넘기지 않고 수렴할 때까지 제어한다.**
         info = self.pose_id or {}
         gun = self.gun_now()
+        gerr = None        # ⚠ 아래 로그가 참조한다 — 분기마다 꼭 정해 둘 것
         want_gun = ((info.get('poses') or {}).get(self.yaw_want) or {}).get('gun')
         if gun is None or want_gun is None:
             # 기준점이 없으면 건 각도를 모른다 — 옛 방식(모터 목표)으로 판정한다
@@ -774,10 +775,12 @@ class StageNode(Node):
             self._yaw_sent = time.time()
             self.pos_pubs['yaw'].publish(
                 Float64MultiArray(data=[self.yaw_tgt, self.yaw_speed]))
-            g = self.gun_now()
+            # ⚠ [2026-10-07] 여기서 `err`(옛 변수)를 참조해 **노드가 죽었다**
+            #   (`UnboundLocalError`). 폐루프 분기에서는 `err` 를 안 만든다.
+            #   남은 양은 건 각도로 말하는 것이 맞다 — 그게 판정 기준이다.
             self.detail = (f"{pose_label(self.yaw_want)}로 회전 중"
-                           + (f" (건 {g:+.2f}°, 남은 모터축 {err:+.1f}°)"
-                              if g is not None else ''))
+                           + (f" (건 {gun:+.2f}°, 남은 건 {gerr:+.2f}°)"
+                              if gun is not None and gerr is not None else ''))
 
     def _yaw_done(self, reason):
         """멈추고 **잠그고 0x80 까지** 보낸다 — 0x78 만으로는 전류가 계속 흐른다."""
