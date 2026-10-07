@@ -235,6 +235,16 @@ def main():
                    help='예: x=0:450:25 (여러 번 줄 수 있다)')
     p.add_argument('--z-park', type=float, default=0.0,
                    help='수집 중 Z 를 여기에 둔다 (올린 상태. 건이 철근을 긁지 않게)')
+    # ⚠ 중앙값은 **자세별 범위가 아니라 "자세 사이" 샘플까지 포함한 교집합**에서
+    #   잡아야 한다. `axes.yaml` 의 envelope.samples 를 보면 자세 사이를 지나는
+    #   각도가 양 끝 자세보다 **더 좁다** (gun -11.71° 에서 Y 66.2~259.9).
+    #   회전은 그 사이를 지나가므로 양 끝만 보고 잡으면 중간에 프레임을 친다.
+    #     Y 교집합 86.0~259.9 → 중앙 173.0
+    #     X 는 자세 사이가 미측정이라 자세 0 의 상한(361.0)을 보수적으로 써서 180.5
+    p.add_argument('--center-x', type=float, default=175.0,
+                   help='자세 변경 전에 옮겨 둘 X (자세 사이까지 포함한 교집합 안)')
+    p.add_argument('--center-y', type=float, default=173.0,
+                   help='자세 변경 전에 옮겨 둘 Y (교집합 86.0~259.9 의 중앙)')
     p.add_argument('--serpentine', action='store_true',
                    help='X·Y 를 지그재그로 덮는다 (조합이 비지 않게)')
     p.add_argument('--pose-first', type=int,
@@ -297,12 +307,25 @@ def main():
         if a.pose_first:
             # ⚠ Z 를 **먼저** 올린 뒤에 돌린다 — 회전하면 건이 원을 그리므로
             #   Z 가 내려가 있으면 철근을 친다 (stage_node 도 회전 중 Z 를 거부한다).
-            print(f"[0b] {a.pose_first}번 자세로 회전")
+            # ⚠ 그리고 XY 를 **중앙으로** 옮긴 뒤에 돌린다 (위 참조).
+            print(f"[0b] XY 를 중앙({a.center_x}, {a.center_y}) 으로")
+            if not col.goto({'x': a.center_x, 'y': a.center_y}):
+                raise SystemExit('중앙 이동 실패 — 중단')
+            print(f"[0c] {a.pose_first}번 자세로 회전")
             if not col.goto_pose(a.pose_first):
                 raise SystemExit('자세 복귀 실패 — 중단')
         for i, (kind, v) in enumerate(jobs, 1):
             print(f"[{i}/{len(jobs)}] {kind} → {v}")
             if kind == 'pose':
+                # ⚠⚠ [사용자 지시 2026-10-07] **자세를 바꾸기 전에 XY 를 중앙으로.**
+                #   가동범위가 자세마다 다르다. 끝에 있는 채로 돌리면 회전 중
+                #   간섭이 난다 — 2026-10-06 에 4번 자세에서 그렇게 부딪혔고,
+                #   그 충격이 yaw 커플링을 미끄러뜨렸다.
+                #   중앙은 **모든 자세의 가동범위 교집합** 안이라 어느 자세로
+                #   돌려도 안전하다.
+                if not col.goto({'x': a.center_x, 'y': a.center_y}):
+                    print("    중앙 이동 실패 — 자세 변경을 건너뛴다")
+                    continue
                 ok = col.goto_pose(v)
                 tag = f"pose{v}"
             elif kind == 'xy':

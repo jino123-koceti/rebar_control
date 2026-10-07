@@ -97,6 +97,7 @@ from std_msgs.msg import Bool, Empty, Float32, Float64MultiArray, Int32, String
 from rebar_base_interfaces.msg import SafetyState
 
 from .axis_config import (envelope_for, envelope_violation, identify_pose,
+                          pose_reason,
                           load_axis_motor_ids,
                           load_envelope, load_pose_id, load_pose_select,
                           load_ready_yaw_pose, load_stage_axes, gun_from_anchor,
@@ -482,7 +483,7 @@ class StageNode(Node):
             # 성공한 결과는 별칭이 없다 (12시·2번·3번). 1번·4번은 거부된다.
             got, det = identify_pose(self.pose_id, self.yaw_single)
             if got is None:
-                return None, f"yaw 자세를 모른다 — {det}"
+                return None, f"yaw 자세를 모른다 — {pose_reason(det)}"
             # 공칭 각도가 아니라 **단회전에서 나온 실측 각도**로 잡는다
             self._anchor(got, '단회전 (별칭 없음)', gun=det.get('gun_now'))
             g = self.gun_now()

@@ -89,6 +89,19 @@ def _stage():
     return _section('stage')
 
 
+def load_mm_per_deg(name):
+    """축의 `mm_per_deg` (출력축 1도당 mm). 없으면 None.
+
+    환산값이 없으면 **넘기지 않는 쪽**이 맞다 — 틀린 환산으로 mm 를 만들면
+    호출부가 그것을 믿는다. 없으면 호출부가 다른 근거로 돌아가게 둔다.
+    """
+    try:
+        v = ((_stage().get(name) or {}).get('mm_per_deg'))
+        return float(v) if v else None
+    except Exception:
+        return None
+
+
 def load_axis_motor_ids(names=AXIS_NAMES):
     """축 이름 → 위치 토픽에 쓰는 CAN ID 문자열 (소문자 16진, 세 자리).
 
@@ -352,6 +365,18 @@ def pose_label(n):
     return '12시' if n == 0 else f'{n}번 자세'
 
 
+def pose_reason(detail):
+    """`identify_pose` 의 둘째 값을 **사람이 읽을 한 줄**로.
+
+    모호한 경우에는 후보 목록을 담은 dict 가 오고(호출부가 비전으로 고르라고),
+    그 외에는 문자열이 온다. 포매팅하는 쪽이 둘 다 받을 수 있어야 한다 —
+    dict 를 그대로 f-string 에 넣으면 사용자에게 내부 구조가 노출된다.
+    """
+    if isinstance(detail, dict):
+        return str(detail.get('msg', detail))
+    return str(detail)
+
+
 def identify_pose(info, single):
     """단회전값 → (자세번호, 상세) 또는 (None, 거부 사유).
 
@@ -382,11 +407,18 @@ def identify_pose(info, single):
                       f"(건 {base:+.2f}°, 범위 {info['gun_lo']:+.1f}~"
                       f"{info['gun_hi']:+.1f}°) — 기구나 기준값을 확인하세요")
     if len(cands) > 1:
-        return None, ("단회전만으로는 자세를 가릴 수 없다 — 후보가 "
-                      + " / ".join(f"건 {g:+.2f}°" for g in sorted(cands))
-                      + f" 둘 다 구동범위 안이다 (별칭 주기 {per:.1f}°). "
-                      "12시·2번·3번 자세로 옮긴 뒤 다시 하거나, "
-                      "/stage/yaw_declare 로 지금 자세를 알려주세요")
+        # ⚠ [2026-10-07] **후보 목록을 함께 돌려준다.** 호출부(호밍)가 비전으로
+        #   둘 중 하나를 고를 수 있게 하기 위해서다. 비전은 각도를 재는 것이
+        #   아니라 **이 후보 중 고르기만** 하므로, 틀려도 후보 밖으로는 못 간다.
+        return None, {
+            'ambiguous': True,
+            'candidates': sorted(cands),
+            'msg': ("단회전만으로는 자세를 가릴 수 없다 — 후보가 "
+                    + " / ".join(f"건 {g:+.2f}°" for g in sorted(cands))
+                    + f" 둘 다 구동범위 안이다 (별칭 주기 {per:.1f}°). "
+                    "12시·2번·3번 자세로 옮긴 뒤 다시 하거나, "
+                    "/stage/yaw_declare 로 지금 자세를 알려주세요"),
+        }
     gun = cands[0]
     best, bd = None, None
     for n, p in info['poses'].items():

@@ -100,24 +100,110 @@ def gun_blob(bgr):
     return (len(xs), ang, float(ctr[0] + c['x0']))
 
 
-def pick_sign(bgr):
+# ── 레일 마스크 ───────────────────────────────────────────────────────────
+# 카메라가 **고정**이라 프레임 레일은 영상에서 늘 같은 자리다. 45장에서 90% 이상
+# 항상 어두운 화소를 모아 만들었다. 이걸 빼지 않으면 "가장 큰 어두운 덩어리" 가
+# **건이 아니라 레일**이 된다 — 2026-10-07 에 그걸 모르고 레일을 재면서
+# "x=0 에서는 어떤 특징도 안 갈린다" 는 틀린 결론을 냈다.
+RAIL_MASK = ('/home/koceti/ros2_ws/src/rebar_control/'
+             'data/vision/rail_mask.png')
+_mask = None
+
+# 구간 경계 — 레일 마스크 후 건 면적. 실측(y 중앙 줄):
+#   x=0  19k   x=100  37k   x=200  45~65k   x=300  82~113k   x=400  105~155k
+AREA_NEAR = 30000         # 이보다 작으면 "건이 멀다" — `near_x_mm` 이 없을 때만 쓴다
+# X 를 알 때 쓰는 경계. 비전 판정이 검증된 것은 **X=0 근처**다
+# (1번 +56~57° / 4번 -29~-40°, y 100~250 에서 8/8). 그 밖은 검증되지 않았다.
+FAR_X_MM = 60.0
+
+
+def _rail():
+    global _mask
+    if _mask is None:
+        import cv2
+        m = cv2.imread(RAIL_MASK, cv2.IMREAD_GRAYSCALE)
+        _mask = None if m is None else (m > 127)
+    return _mask
+
+
+def gun_masked(bgr):
+    """레일을 빼고 가장 큰 어두운 덩어리 → (면적, 박스좌단, 무게중심x).
+
+    건이 카메라에 가까운 구간(x 큼)에서 쓴다. 거기서는 건이 화면을 크게 차지해
+    레일만 빼면 확실히 잡힌다.
+    """
+    import cv2
+    import numpy as np
+    rail = _rail()
+    if rail is None:
+        return None
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    m = ((g < DARK) & (~rail)).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, 8)
+    if n < 2:
+        return None
+    i = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+    xs = np.nonzero(lab == i)[1]
+    return (int(st[i, cv2.CC_STAT_AREA]), int(st[i, cv2.CC_STAT_LEFT]),
+            float(xs.mean()))
+
+
+# x 가 큰 구간에서 자세를 가르는 기준 — 건 박스 좌단.
+# 실측: 1번이 4번보다 **항상 오른쪽**이다 (x≥100 에서 +70~+630px, 16/16).
+LEFT_GAP = 40             # 이보다 작으면 애매 → 거부
+
+
+def pick_sign(bgr, left_ref=None, near_x_mm=None):
     """영상으로 건 각도의 **부호**를 고른다 → -1 / +1, 모르면 None.
 
-    돌려주는 둘째 값은 사람이 읽을 사유다 — 거부했을 때 왜인지 알아야 한다.
+    ⚠ **구간마다 듣는 특징이 다르다.** 하나로 전 구간을 덮으려다 실패했다:
+      · 주축각 하나로 밀었더니 x 가 커지면 **뒤집혔다** (1번인데 -86°, 4번인데
+        +77.6°). 거부가 아니라 **틀린 답을 자신 있게 내는** 최악의 실패였다.
+      · 그 뒤 레일 마스크+최대덩어리로 바꿨더니 이번엔 x=0 에서 건이 아닌 물체를
+        집어 "구분 불가" 가 됐다.
+    그래서 **건 면적으로 구간을 먼저 가리고** 구간별 특징을 쓴다.
+
+    `left_ref` 는 x 가 큰 구간에서 비교 기준이 되는 박스 좌단이다. 없으면
+    그 구간은 판정하지 않는다 — 절대 임계로는 못 가른다(X 에 따라 변한다).
     """
-    blob = gun_blob(bgr)
-    if blob is None:
-        return None, '건 끝단을 못 찾았다 (가려졌거나 조명이 다르다)'
-    area, ang, _cx = blob
-    if ang >= ANG_NEG:
-        return -1, f'주축각 {ang:+.1f}° ≥ {ANG_NEG:+.1f}° → 음수각 (면적 {area})'
-    if ang <= ANG_POS:
-        return +1, f'주축각 {ang:+.1f}° ≤ {ANG_POS:+.1f}° → 양수각 (면적 {area})'
-    return None, (f'주축각 {ang:+.1f}° 가 판정 경계 사이다 '
-                  f'({ANG_POS:+.1f}~{ANG_NEG:+.1f}) — 추측하지 않는다')
+    gm = gun_masked(bgr)
+    if gm is None:
+        return None, '레일 마스크를 못 읽었거나 덩어리가 없다'
+    area, x0, _cx = gm
+
+    # ⚠ **구간은 면적으로 가르지 않는다.** 면적은 X 와 단조가 아니고 구간끼리
+    #   겹친다 (x=0 이 18.8k~38.1k, x=100 이 31.9k~56.9k, x=400 이 28.9k 로
+    #   내려오기도 한다). 호출부가 `near_x_mm` 로 **실제 X** 를 주면 그것을 쓴다 —
+    #   X 호밍이 끝난 뒤에 부르므로 알 수 있는 값이다. 추정할 이유가 없다.
+    far = (abs(near_x_mm) <= FAR_X_MM) if near_x_mm is not None \
+        else (area < AREA_NEAR)
+
+    if far:
+        # 건이 멀다 → 상단 크롭 안의 **주축각**. 실측 차이 85.6~96.5°
+        blob = gun_blob(bgr)
+        if blob is None:
+            return None, f'건이 멀고(면적 {area}) 크롭에서 끝단을 못 찾았다'
+        _a, ang, _c = blob
+        if ang >= ANG_NEG:
+            return -1, f'먼 구간 — 주축각 {ang:+.1f}° ≥ {ANG_NEG:+.1f}° → 음수각'
+        if ang <= ANG_POS:
+            return +1, f'먼 구간 — 주축각 {ang:+.1f}° ≤ {ANG_POS:+.1f}° → 양수각'
+        return None, f'먼 구간 — 주축각 {ang:+.1f}° 가 경계 사이다'
+
+    # 건이 가깝다 → 박스 좌단. **절대값이 아니라 두 후보 비교**라야 한다
+    if left_ref is None:
+        return None, (f'가까운 구간(면적 {area}) 은 비교 기준(left_ref)이 있어야 '
+                      f'한다 — 절대 임계로는 못 가른다')
+    gap = x0 - left_ref
+    if gap >= LEFT_GAP:
+        return -1, f'가까운 구간 — 좌단 {x0} 가 기준 {left_ref} 보다 {gap:+d}px 오른쪽'
+    if gap <= -LEFT_GAP:
+        return +1, f'가까운 구간 — 좌단 {x0} 가 기준 {left_ref} 보다 {gap:+d}px 왼쪽'
+    return None, f'가까운 구간 — 좌단 차이 {gap:+d}px 가 작다 ({LEFT_GAP}px 미만)'
 
 
-def choose(candidates, bgr):
+def choose(candidates, bgr, near_x_mm=None):
     """후보 각도(도) 중 하나를 고른다. 못 고르면 (None, 사유).
 
     ⚠ 후보가 **부호가 갈리는 둘** 일 때만 쓴다. 같은 부호면 비전이 가릴 수 없고,
@@ -130,7 +216,7 @@ def choose(candidates, bgr):
     pos = [c for c in cands if c >= 0]
     if len(neg) != 1 or len(pos) != 1:
         return None, '후보 부호가 갈리지 않는다 — 비전으로 못 가린다'
-    sign, why = pick_sign(bgr)
+    sign, why = pick_sign(bgr, near_x_mm=near_x_mm)
     if sign is None:
         return None, why
     return (neg[0] if sign < 0 else pos[0]), why

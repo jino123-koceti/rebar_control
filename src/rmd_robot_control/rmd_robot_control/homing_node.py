@@ -50,7 +50,8 @@ from rclpy.node import Node
 
 from .axis_config import (load_axis_motor_ids, load_home_offsets,
                           load_precheck, load_seek_dirs, precheck_violation,
-                          load_pose_id, identify_pose, pose_label,
+                          load_pose_id, identify_pose, pose_label, pose_reason,
+                          load_mm_per_deg,
                           load_search_limit, load_ready_pose, ready_target)
 from .axis_config import HOMING_AXES as AXES
 from std_msgs.msg import Bool, Float32, Float64, Float64MultiArray, Int32, String
@@ -82,7 +83,17 @@ LIMITS = ('x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max', 'yaw_home')
 # ⚠ 옛 순서 (z,x,y,yaw) 는 y 가 yaw 보다 앞이라 12시가 아닌 상태로 y 가 리미트까지
 #   달려 프레임을 친다. 되돌리지 말 것.
 # ⚠ x+y 동시 이동은 미구현 — 순서는 같으므로 안전성은 동일하고 시간만 더 걸린다.
-ALL_ORDER = ('z', 'yaw', 'x', 'y')
+# ⚠ [2026-10-07] **x 를 yaw 보다 먼저** 한다 (전에는 z→yaw→x→y).
+#   이유: yaw 1번·4번은 단회전만으로 못 가려(별칭 주기 건 28.8°) 호밍이 거부되고,
+#   사용자가 손으로 12시에 맞춰야 했다. 비전으로 가리려 했더니 **X·Y 를 모르면**
+#   건의 모습이 달라져 틀린 답을 냈다 (45장 중 3장 오답 — 거부가 아니라 오답이라
+#   가장 나쁜 실패였다).
+#   그런데 `x_min` 은 **yaw 자세와 무관하게 언제나 갈 수 있다**(axes.yaml). 그래서
+#   x 를 먼저 호밍하면 **X=0 으로 고정**되고, 그 한 점에서는 비전이 1번·4번을
+#   확실히 가린다 (실측: 1번 +56~57° / 4번 -29~-40°, y 100~250 전 구간 8/8).
+#   z 가 x 보다 먼저인 것은 그대로다 — Z 가 아래에 있으면 X 이동 중 배근에 걸린다.
+#   y 가 마지막인 것도 그대로다 — y_min/y_max 는 yaw 12시에서만 안전하다.
+ALL_ORDER = ('z', 'x', 'yaw', 'y')
 
 
 class HomingNode(Node):
@@ -168,6 +179,25 @@ class HomingNode(Node):
         for name, d in load_seek_dirs().items():
             if name in AXES:
                 AXES[name]['dir'] = d          # axes.yaml 이 코드 기본값을 덮는다
+        # ── 작업영역 카메라 (yaw 별칭을 가릴 때만 쓴다) ──────────────────
+        # ⚠ 카메라가 없어도 호밍은 **그대로 동작해야 한다.** 비전은 별칭이
+        #   생겼을 때만 부르는 보조 수단이고, 없으면 기존 거부 경로로 간다.
+        #   그래서 import 실패·토픽 없음을 전부 흡수한다.
+        self._frame = None
+        self.declare_parameter('vision_topic', '/camera/color/image_raw')
+        try:
+            from cv_bridge import CvBridge
+            from sensor_msgs.msg import Image
+            self._bridge = CvBridge()
+            self.create_subscription(
+                Image, str(self.get_parameter('vision_topic').value),
+                self._on_frame, 1)
+        except ImportError as exc:
+            self._bridge = None
+            self.get_logger().warning(
+                f"cv_bridge/sensor_msgs 를 못 불러왔다 ({exc}) — "
+                f"yaw 별칭 비전 판정은 쓸 수 없다 (호밍 자체는 영향 없음)")
+
         self.precheck = load_precheck()
         self.single = {}                   # 축 → 단회전 절대값
         # {축: {탐색방향: 모터축 도}} — 접근 방향마다 다르다 (감지판 폭 때문)
@@ -380,6 +410,68 @@ class HomingNode(Node):
         if phase in (Phase.DONE, Phase.FAILED, Phase.IDLE):
             self.axis = None
 
+    def _on_frame(self, msg):
+        """마지막 영상 한 장만 들고 있는다. 변환 실패는 조용히 버린다 —
+        카메라 문제로 호밍 노드가 죽으면 안 된다."""
+        try:
+            self._frame = self._bridge.imgmsg_to_cv2(msg, 'bgr8')
+        except Exception:
+            self._frame = None
+
+    def _vision_pick(self, detail):
+        """별칭 후보 둘 중 하나를 **영상으로** 고른다 → 건 각도(도) 또는 None.
+
+        단회전이 못 주는 것은 **부호 한 비트**다 — 후보 둘은 항상 28.8° 떨어져
+        있고 가동범위가 ±17° 이므로 하나는 음수각, 하나는 양수각이다. 비전은
+        각도를 재지 않고 그 비트만 고른다. 후보 밖의 값은 만들 수 없다.
+
+        ⚠⚠ **X 호밍이 끝난 뒤에만 쓴다.** 비전 판정은 X=0 에서만 검증됐다
+          (1번 +56~57° / 4번 -29~-40°, y 100~250 전 구간 8/8). X 가 다르면 건이
+          카메라에 가까워져 **주축각이 뒤집힌다** — 전 범위 격자에서 45장 중 3장을
+          틀렸고, 거부가 아니라 **틀린 답을 자신 있게 내는** 실패였다.
+          그래서 `ALL_ORDER` 를 z→x→yaw→y 로 바꿔 X 를 먼저 맞춘다.
+
+        못 고르면 None 을 돌려주고 호출부가 기존 거부 경로로 간다 — 추측하지 않는다.
+        """
+        if not isinstance(detail, dict) or not detail.get('ambiguous'):
+            return None
+        cands = detail.get('candidates') or []
+        if len(cands) != 2:
+            return None
+        if 'x' not in self.refs:
+            self.get_logger().warning(
+                "yaw 자세가 모호한데 **X 가 아직 호밍되지 않았다** — 비전 판정은 "
+                "X=0 에서만 유효하므로 시도하지 않는다")
+            return None
+        if self._frame is None:
+            self.get_logger().warning(
+                "yaw 자세가 모호한데 카메라 영상이 없다 — 비전 판정 불가 "
+                "(/camera/color/image_raw 확인)")
+            return None
+        try:
+            from .yaw_pose_vision import choose
+        except ImportError as exc:
+            self.get_logger().warning(f"비전 모듈을 못 불러왔다: {exc}")
+            return None
+        # X 호밍이 끝났으므로 **지금 X 를 안다** — 추정하지 않는다.
+        # ⚠ `self.pos` 는 **모터 각도**(토픽값)이지 mm 가 아니다. 원점 대비
+        #   차이를 `mm_per_deg` 로 환산해야 한다. 환산값이 없으면 넘기지 않고
+        #   `choose` 가 면적 기준으로 되돌아가게 둔다.
+        x_now = None
+        deg, ref = self.pos.get('x'), self.refs.get('x')
+        mmpd = load_mm_per_deg('x')
+        if deg is not None and ref is not None and mmpd:
+            x_now = abs(deg - ref) * float(mmpd)
+        picked, why = choose(cands, self._frame, near_x_mm=x_now)
+        if picked is None:
+            self.get_logger().warning(f"비전 판정 거부 — {why}")
+            return None
+        self.get_logger().info(
+            f"비전 판정: 후보 "
+            + " / ".join(f"{g:+.2f}°" for g in cands)
+            + f" 중 **{picked:+.2f}°** 선택 — {why}")
+        return picked
+
     def _precheck_failed(self):
         """호밍 시작 전제 — yaw 의 **건 각도를 알아야** 탐색 방향이 정해진다.
 
@@ -400,10 +492,18 @@ class HomingNode(Node):
             if g is None:
                 n, info = identify_pose(self.pose_id, self.single.get('yaw'))
                 if n is None:
-                    # 안내는 `identify_pose` 가 경우별로 낸다 (별칭이면 선언,
-                    # 자세 사이면 자세로 옮기기) — 여기서 덧붙이면 중복된다
-                    return f"yaw {info}"
-                g, src = info['gun'], f"단회전 {pose_label(n)}"
+                    # ⚠ [2026-10-07] **별칭이면 비전으로 후보 중 하나를 고른다.**
+                    #   단회전이 못 주는 것은 **부호 한 비트**뿐이고(후보 둘은 항상
+                    #   하나가 음수각, 하나가 양수각), 비전은 그것만 고르면 된다.
+                    #   후보 밖의 답은 만들 수 없으므로 틀려도 범위를 벗어나지 않는다.
+                    #   ⚠ **X 호밍이 끝난 뒤에만 시도한다** — 비전은 X=0 에서만
+                    #     검증됐다. X 가 다르면 건의 모습이 달라져 틀린다.
+                    picked = self._vision_pick(info)
+                    if picked is None:
+                        return f"yaw {pose_reason(info)}"
+                    g, src = picked, '비전 판정'
+                else:
+                    g, src = info['gun'], f"단회전 {pose_label(n)}"
             # ⚠⚠ [2026-10-07] **12시 근처에서 출발하면 방향을 유도하지 않는다.**
             #   전에는 항상 `edge_gun` 과 비교해 방향을 유도했는데, `edge_gun` 은
             #   `axes.yaml` 의 **에지 단회전값에서 나오고 그 값은 낡을 수 있다.**
