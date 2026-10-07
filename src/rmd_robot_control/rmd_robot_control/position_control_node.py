@@ -874,11 +874,18 @@ class PositionControlNode(Node):
         # ⚠ 리셋 중에는 모터가 위치를 잡지 못한다. 그래서 **먼저 잠근다** — Z 는
         #   잠그지 않으면 그 사이에 자중으로 떨어진다.
         # ⚠ 움직이는 중에 부르지 말 것. 재부팅을 기다리느라 이 노드가 1초 멈춘다.
+        # ⚠⚠ [2026-10-07 실측] **리셋 뒤 브레이크 상태가 '해제' 로 보고된다.**
+        #   `recover z` 성공 직후 `브레이크 0x147: 해제` 가 찍혔다 (실제로는 거의
+        #   안 떨어졌으니 상태 바이트의 기본값으로 보이지만, Z 는 풀리면 출력축
+        #   12.7° 떨어지는 축이다). **리셋 뒤에 한 번 더 잠근다** — 공짜이고,
+        #   잠그는 쪽은 언제나 안전한 방향이다.
         recover_cmds = ([self.protocol.create_system_command(
                              CommandType.SYSTEM_RESET),
                          None,          # 재부팅 대기 표시
+                         cmd,           # 다시 잠금 (리셋이 해제로 올려놓는다)
                          self.protocol.create_system_command(
-                             CommandType.MOTOR_ENABLE)]
+                             CommandType.MOTOR_ENABLE),
+                         cmd]           # 여자 뒤에도 잠긴 상태로 끝낸다
                         if action == 'recover' else [])
 
         done, skipped, failed = [], [], []

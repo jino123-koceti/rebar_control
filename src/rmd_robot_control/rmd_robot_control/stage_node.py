@@ -241,6 +241,9 @@ class StageNode(Node):
         self.declare_parameter('enforce_envelope', True)
         self.declare_parameter('yaw_speed_dps', 60.0)     # 모터축. 실측 3.5s/208°
         self.declare_parameter('yaw_tol_deg', 3.0)        # 도달 판정 (모터축)
+        # ⚠ 건 각도 기준 도달 판정. 자세 판별 허용(±1.50°)보다 **안쪽**이어야
+        #   한다 — 아니면 '도달' 직후에 자세를 못 가려 다음 동작이 거부된다.
+        self.declare_parameter('yaw_gun_tol_deg', 1.0)
 
         g = self.get_parameter
         self.speed = float(g('move_speed_dps').value)
@@ -281,6 +284,7 @@ class StageNode(Node):
         self.enforce = bool(g('enforce_envelope').value)
         self.yaw_speed = float(g('yaw_speed_dps').value)
         self.yaw_tol = float(g('yaw_tol_deg').value)
+        self.yaw_gun_tol = float(g('yaw_gun_tol_deg').value)
 
         # yaw 도 같이 싣는다 — 관절 발행·브레이크·위치 구독 경로를 공유한다.
         # mm 환산이 없는 축이라 `mm_of`/`deg_of` 는 AXES 에만 쓴다.
@@ -372,6 +376,8 @@ class StageNode(Node):
         # 박스는 볼록하므로 이 안에서만 움직이면 모든 중간 자세에서 안전하다.
         self.yaw_win = None
         self._yaw_sent = 0.0
+        self._yaw_best = None
+        self._yaw_worse = 0
         if self.env is None:
             self.get_logger().warning(
                 "자세별 가동 범위가 없다 (axes.yaml 의 stage.envelope) — "
@@ -571,9 +577,14 @@ class StageNode(Node):
         self.yaw_want = want
         # ⚠ 현재 건 각도는 **기준점**에서 낸다. 위치 토픽(0x92)은 멈추면 묵고,
         #   단회전은 별칭이 있다 — 둘 다 여기서 쓰면 안 된다.
+        # ⚠⚠ [2026-10-07 정정] **부호가 뒤집혀 있었다** (`현재 − 목표`).
+        #   부호 근거(같은 날 호밍 로그): 탐색 방향 `+1` 로 명령했을 때 yaw 가
+        #   건 -17.84° → 에지(-5.05°) 쪽, 즉 **건 각도가 증가하는 방향**으로
+        #   움직였다. 따라서 `+명령 → +건각도` 이고 델타는 `목표 − 현재` 다.
         self.yaw_tgt = (self.deg['yaw']
-                        + (self.gun_now() - g[want]['gun']) * info['gear'])
+                        + (g[want]['gun'] - self.gun_now()) * info['gear'])
         self.yaw_moving = True
+        self._yaw_best, self._yaw_worse = None, 0
         # ⚠ `t_grant_lost` 도 같이 초기화한다 — 안 하면 묵은 값이 남아
         #   회전 시작 즉시 "제어 권한 없음" 으로 멈춘다 (2026-10-04, 권한 판정을
         #   '잃은 지 얼마나 됐는가' 로 바꿀 때 이 경로를 빼먹었다).
@@ -657,8 +668,9 @@ class StageNode(Node):
 
         self.yaw_speed = float(self.get_parameter('yaw_speed_dps').value)
         self.yaw_want = None            # 자세 번호가 아니라 각도 목표다
+        # ⚠ 위 자세 경로와 같은 부호 오류였다 — `목표 − 현재` 다.
         self.yaw_tgt = (self.deg['yaw']
-                        + (now_gun - want_gun) * info['gear'])
+                        + (want_gun - now_gun) * info['gear'])
         self.yaw_moving = True
         self.t_start = self.t_arm = self.t_grant_lost = time.time()
         self._yaw_sent = 0.0
@@ -709,9 +721,34 @@ class StageNode(Node):
             self._brake('release', 'yaw')
             return
         self._request_control('auto')
-        err = self.yaw_tgt - self.deg['yaw']
-        if abs(err) <= self.yaw_tol:
-            return self._yaw_done(f'도달 (남은 모터축 {err:+.2f}°)')
+        # ⚠⚠ [2026-10-07] **건 각도로 폐루프 제어한다.** 예전에는 시작할 때 모터
+        #   목표를 한 번 계산하고 그 목표에 닿으면 끝냈다(개루프). 그래서 결과가
+        #   어긋나면 돌아올 길이 없었고, 자세를 못 맞춘 채 "도달" 로 넘어가
+        #   **미션 9점이 0점**이 됐다 (yaw 가 자세 사이에 남자 그 뒤 모든 동작이
+        #   거부됐다). 오차가 있으면 **실패로 넘기지 않고 수렴할 때까지 제어한다.**
+        info = self.pose_id or {}
+        gun = self.gun_now()
+        want_gun = ((info.get('poses') or {}).get(self.yaw_want) or {}).get('gun')
+        if gun is None or want_gun is None:
+            # 기준점이 없으면 건 각도를 모른다 — 옛 방식(모터 목표)으로 판정한다
+            err = self.yaw_tgt - self.deg['yaw']
+            if abs(err) <= self.yaw_tol:
+                return self._yaw_done(f'도달 (남은 모터축 {err:+.2f}°)')
+        else:
+            gerr = want_gun - gun
+            if abs(gerr) <= self.yaw_gun_tol:
+                return self._yaw_done(f'도달 (남은 건 {gerr:+.2f}°)')
+            # ⚠⚠ **멀어지면 멈춘다.** 부호가 틀렸거나 기구 문제인데, yaw 는 끝
+            #   리미트가 없어서 계속 밀면 기구부에 박는다 (2026-09-30: 10.7A/86°C).
+            if self._yaw_best is None or abs(gerr) < self._yaw_best - 0.05:
+                self._yaw_best, self._yaw_worse = abs(gerr), 0
+            elif abs(gerr) > self._yaw_best + 0.5:
+                self._yaw_worse += 1
+                if self._yaw_worse >= 3:
+                    return self._yaw_done(
+                        f'오차가 커진다 (건 {gerr:+.2f}°, 최선 '
+                        f'{self._yaw_best:.2f}°) — 부호·기준점·기구 확인')
+            self.yaw_tgt = self.deg['yaw'] + gerr * float(info['gear'])
         if time.time() - self._yaw_sent > 0.4:
             self._yaw_sent = time.time()
             self.pos_pubs['yaw'].publish(
