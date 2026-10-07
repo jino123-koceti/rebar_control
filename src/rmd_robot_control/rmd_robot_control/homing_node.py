@@ -295,7 +295,13 @@ class HomingNode(Node):
             self.get_logger().error(f"호밍 거부 — {why}")
             self.detail = why
             return
-        bad = self._precheck_failed()
+        # ⚠ [2026-10-07] yaw 전제는 **여기서 보지 않고 yaw 차례로 미룬다.**
+        #   순서를 z→x→yaw→y 로 바꾼 이유가 "X 를 먼저 맞춰야 비전이 yaw 별칭을
+        #   가린다" 인데, 시작 시점에 검사하면 **X 호밍 전**이라 비전을 쓸 수 없고
+        #   전체가 거부된다. 실제로 그래서 축이 하나도 안 움직이고 즉시 실패했다.
+        #   `defer_yaw=True` 는 yaw 자세를 못 가려도 통과시키고, 그 판정을
+        #   `_next_axis` 가 yaw 를 꺼낼 때 다시 한다 (그때는 X 가 맞춰져 있다).
+        bad = self._precheck_failed(defer_yaw=True)
         if bad:
             self.get_logger().error(f"호밍 거부 — {bad}")
             self.detail = bad
@@ -392,6 +398,12 @@ class HomingNode(Node):
             return
         prev = self.axis
         self.axis = self.queue.pop(0)
+        # ⚠ yaw 는 **이 시점에** 전제를 본다 — X 가 맞춰진 뒤라야 비전이 별칭을
+        #   가릴 수 있다. 시작 시점에 보면 X 호밍 전이라 못 가리고 전체가 죽는다.
+        if self.axis == 'yaw':
+            bad = self._precheck_failed()
+            if bad:
+                return self._fail(f"yaw 차례 전제 불충족 — {bad}")
         if prev is not None and prev != self.axis:
             self._brake('lock', prev)           # 끝난 축은 바로 잠근다
         self._brake('release', self.axis)       # 움직일 축만 푼다
@@ -472,7 +484,7 @@ class HomingNode(Node):
             + f" 중 **{picked:+.2f}°** 선택 — {why}")
         return picked
 
-    def _precheck_failed(self):
+    def _precheck_failed(self, defer_yaw=False):
         """호밍 시작 전제 — yaw 의 **건 각도를 알아야** 탐색 방향이 정해진다.
 
         에지가 자세 범위 **안쪽**(건 -5.8°)이라 방향이 ± 두 가지다. 틀리면
@@ -500,6 +512,12 @@ class HomingNode(Node):
                     #     검증됐다. X 가 다르면 건의 모습이 달라져 틀린다.
                     picked = self._vision_pick(info)
                     if picked is None:
+                        if defer_yaw:
+                            # 아직 X 를 안 맞췄다 — yaw 차례에 다시 본다
+                            self.get_logger().info(
+                                "yaw 자세는 아직 모른다 — X 호밍 뒤에 다시 본다 "
+                                "(그때 비전으로 별칭을 가린다)")
+                            return None
                         return f"yaw {pose_reason(info)}"
                     g, src = picked, '비전 판정'
                 else:
