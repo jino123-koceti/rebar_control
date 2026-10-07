@@ -23,6 +23,12 @@ systemd `rebar-teleop.service` 가 이 파일을 띄운다. 전원만 넣으면 
         기본으로 켜두면 "갑자기 아무것도 안 움직인다" 가 된다.
         실장비에서 범퍼·STOP·비상정지 차단을 확인한 뒤 true 로 바꿀 것.
   lateral_speed_dps, lateral_i_hard_a, lateral_max_torque   횡이동 파라미터
+  use_gun:=true|false      결속건 트리거(Pololu) (기본 true)
+      끄면 Pololu 노드가 안 뜨고 결속 시퀀스가 **발사만 건너뛴다** — 이동·자세
+      변경·Z 하강/상승은 그대로 돈다. 결속건을 떼고 동작만 볼 때 쓴다.
+      ⚠ 발사 방향은 **수축**이다 (2026-10-07 실측) → `gun_speed: -1.0`.
+        2차년도 코드는 `+1.0` 이라 그대로 쓰면 발사와 원복이 뒤바뀐다.
+  use_mission:=true|false  경로 미션(drive_node + navigator) (기본 true)
   use_camera:=true|false   작업영역 카메라(Gemini 2L) 를 같이 띄울지 (기본 true)
       yaw 자세 **별칭 판정**에 쓴다 — 1번·4번은 단회전만으로 못 가려서, X 호밍
       뒤 영상 한 장으로 후보 둘 중 하나를 고른다. 이게 있어야 사용자가 전원
@@ -72,7 +78,10 @@ def generate_launch_description():
                               description='작업영역 카메라(Gemini 2L) 동시 기동'),
         # 결속건을 쓸지. 끄면 Pololu 노드도 안 뜨고 결속 시퀀스도 발사를 건너뛴다
         # (이동·하강·상승은 그대로 돈다 — 동작 확인용으로 유용하다).
-        DeclareLaunchArgument('use_gun', default_value='false',
+        # ⚠ [2026-10-07] 기본 **true**. 리허설 흐름이 결속까지 포함하므로 켜 둔다.
+        #   Pololu 가 안 붙어 있어도 노드만 못 뜨고 **나머지는 정상 동작한다**
+        #   (respawn 이 붙어 재시도한다). 결속건을 떼고 동작만 볼 때 false 로.
+        DeclareLaunchArgument('use_gun', default_value='true',
                               description='결속건 트리거(Pololu) 사용'),
         # 경로 미션(주행 + 결속). 끄면 drive_node·navigator 가 안 뜬다 —
         # 상부 축만 쓰는 작업에서는 주행 노드가 CAN 을 쓰지 않게 둘 수 있다.
