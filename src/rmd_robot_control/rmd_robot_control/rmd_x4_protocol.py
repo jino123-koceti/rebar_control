@@ -23,6 +23,10 @@ class CommandType(IntEnum):
     MOTOR_STOP = 0x81
     MOTOR_SHUTDOWN = 0x80
     MOTOR_ENABLE = 0x88
+    # ⚠ **에러 복구는 이것이다.** V4.3 §2.26 System Reset — 모터 프로그램을
+    #   재시작한다(전원 재투입과 같은 효과, 응답 없음). 멀티턴이 날아가므로
+    #   복구 뒤에는 **전체 호밍이 필수**다.
+    SYSTEM_RESET = 0x76
 
     # PID 및 가속도 명령
     READ_PID_PARAMETERS = 0x30
@@ -38,7 +42,10 @@ class CommandType(IntEnum):
 
     # 상태 읽기 명령
     READ_MOTOR_STATUS = 0x9C
-    CLEAR_MOTOR_FAULT = 0x9B
+    # ⚠⚠ **V4.3 에 `0x9B` 라는 명령은 없다.** 2026-10-07 에 Z 의 엔코더 데이터
+    #   오류(0x4000)에 네 번 보냈지만 아무 효과가 없었다 — 당연하다. 쓰지 말 것.
+    #   리셋은 `SYSTEM_RESET`(0x76) 이다.
+    CLEAR_MOTOR_FAULT = 0x9B        # [무효 — V4.3 에 없음]
     READ_MOTOR_ERROR = 0x9D
     READ_MOTOR_VOLTAGE = 0x9E
     READ_MOTOR_TEMPERATURE = 0x9F

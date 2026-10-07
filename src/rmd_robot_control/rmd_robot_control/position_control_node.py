@@ -748,6 +748,23 @@ class PositionControlNode(Node):
     # 코드에도 둔다 — 설정 파일을 못 읽어도 Z 가 실수로 풀리면 안 된다.
     NEVER_AUTO_RELEASE = ('z',)
 
+    # `System_errorState` (uint16) — `CAN BUS Motor Motion Protocol V4.3` §2.14.
+    # ⚠ 2차년도 표에는 0x4000 이 'Reserved' 로 적혀 있었다. V4.3 에는 정의가 있다 —
+    #   **Encoder Data Error** 다. 과온도가 아니다 (과온도는 0x0800·0x1000).
+    ERROR_FLAGS = (
+        (0x0002, '모터 스톨'),
+        (0x0004, '저전압'),
+        (0x0008, '과전압'),
+        (0x0010, '과전류'),
+        (0x0040, '출력 초과'),
+        (0x0080, '캘리브레이션 파라미터 쓰기 오류'),
+        (0x0100, '과속'),
+        (0x0800, '부품 과온도'),
+        (0x1000, '모터 과온도'),
+        (0x2000, '엔코더 캘리브레이션 오류'),
+        (0x4000, '엔코더 데이터 오류'),
+    )
+
     ENCODER_CPR = 262144            # 18bit. 0x61 을 이 값으로 나눈 나머지가 단회전 절대값
 
     def _read_encoder_single(self):
@@ -849,8 +866,17 @@ class PositionControlNode(Node):
         #   자중으로 떨어진다. 브레이크는 **잠긴 채로 둔다** (움직일 사람이 푼다).
         # ⚠ 과온도(0x4000 계열)라면 식기 전에는 0x9B 가 먹지 않는다 — 그때는
         #   실패가 정상이고, 식히고 다시 불러야 한다.
+        # ⚠⚠ [2026-10-07 정정] **`0x9B` 가 아니라 `0x76`(System Reset) 이다.**
+        #   V4.3 에 `0x9B` 라는 명령 자체가 없다 — Z 의 엔코더 데이터 오류에 네 번
+        #   보냈지만 아무 효과가 없었던 이유다. 0x76 은 모터 프로그램을 재시작해
+        #   전원 재투입과 같은 효과를 낸다 (§2.26, 응답 없음).
+        # ⚠ **복구 뒤에는 전체 호밍이 필수다** — 리셋으로 멀티턴이 날아간다.
+        # ⚠ 리셋 중에는 모터가 위치를 잡지 못한다. 그래서 **먼저 잠근다** — Z 는
+        #   잠그지 않으면 그 사이에 자중으로 떨어진다.
+        # ⚠ 움직이는 중에 부르지 말 것. 재부팅을 기다리느라 이 노드가 1초 멈춘다.
         recover_cmds = ([self.protocol.create_system_command(
-                             CommandType.CLEAR_MOTOR_FAULT),
+                             CommandType.SYSTEM_RESET),
+                         None,          # 재부팅 대기 표시
                          self.protocol.create_system_command(
                              CommandType.MOTOR_ENABLE)]
                         if action == 'recover' else [])
@@ -869,6 +895,9 @@ class PositionControlNode(Node):
                 time.sleep(0.05)                 # 잠금이 먹은 뒤에 여자를 끊는다
                 ok = self.can_manager.send_frame(mid, shutdown_cmd)
             for extra in (recover_cmds if ok else []):
+                if extra is None:
+                    time.sleep(1.0)              # 0x76 뒤 재부팅을 기다린다
+                    continue
                 time.sleep(0.05)                 # 잠금이 먹은 뒤에 되살린다
                 ok = self.can_manager.send_frame(mid, extra) and ok
             if ok:
@@ -878,7 +907,8 @@ class PositionControlNode(Node):
             time.sleep(0.05)
 
         verb = {'release': '해제', 'lock': '잠금', 'shutdown': '잠금+차단',
-                'recover': '복구(잠금+0x9B+0x88, 잠긴 채로 둔다)'}[action]
+                'recover': '복구(잠금+0x76리셋+0x88) — 멀티턴 날아감, '
+                           '전체 호밍 필요'}[action]
         if done:
             self.get_logger().info(f"브레이크 {verb}: {', '.join(done)}")
         if skipped:
@@ -2044,13 +2074,28 @@ class PositionControlNode(Node):
                         b.data = rel
                         pub.publish(b)
                 if len(data) >= 8:
-                    error_state = data[7]  # Error byte
+                    # ⚠⚠ **errorState 는 uint16 이다** — DATA[6] 저위, DATA[7] 고위.
+                    #   [2026-10-07 정정] 예전에는 `data[7]` 하나만 읽고 그 바이트의
+                    #   하위 비트들을 "Low Voltage/Overcurrent/Overtemp/..." 로
+                    #   해석했다. 그 플래그들은 **저위 바이트**에 있으므로 표시가
+                    #   전부 거짓이었다 — Z 가 `0x4000` 일 때 `Error State=0x40,
+                    #   Overtemp=0` 으로 찍혀 "과온도가 아니다" 로 읽혔는데, 애초에
+                    #   과온도 비트를 보고 있지도 않았다.
+                    #   근거: `CAN BUS Motor Motion Protocol V4.3` §2.14 (0x9A) —
+                    #   ros2_ws_2nd/rmd_can/rmd_can_protocol_v3/ 에 변환본이 있다.
+                    error_state = data[6] | (data[7] << 8)
                     if error_state != 0:
+                        hit = [m for b, m in self.ERROR_FLAGS if error_state & b]
+                        unknown = error_state & ~sum(b for b, _ in self.ERROR_FLAGS)
+                        if unknown:
+                            hit.append(f'미정의 0x{unknown:04X}')
+                        # 온도·전압을 **같이** 찍는다. 과온도인지 아닌지는 이게 있어야
+                        # 가려진다 (DATA[1] 모터온도 · DATA[2] MOS온도 · DATA[4:6] 전압).
                         self.get_logger().error(
-                            f'MOTOR ERROR 0x{motor_id:03X}: Error State=0x{error_state:02X} '
-                            f'(Low Voltage={error_state&0x01}, Overcurrent={error_state&0x02}, '
-                            f'Overtemp={error_state&0x04}, Encoder={error_state&0x08}, '
-                            f'Overload={error_state&0x10}, Other={error_state&0xE0})'
+                            f'MOTOR ERROR 0x{motor_id:03X}: errorState=0x{error_state:04X} '
+                            f'[{" · ".join(hit) or "해당 없음"}] '
+                            f'모터 {data[1]}°C / MOS {data[2]}°C / '
+                            f'{(data[4] | (data[5] << 8)) / 10.0:.1f}V'
                         )
                     else:
                         self.get_logger().info(f'모터 0x{motor_id:03X} 에러 없음')
