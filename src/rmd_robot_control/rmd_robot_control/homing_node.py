@@ -232,6 +232,7 @@ class HomingNode(Node):
                 (lambda k: (lambda m: self.brake_ok.__setitem__(k, m.data)))(name), 10)
         self.pose_id = load_pose_id('yaw')       # yaw 자세 판별 (12시 ±3° 전제를 대체)
         self.search_limit = load_search_limit('yaw')
+        self._recovered = set()   # 이번 호밍에서 자동 복구한 축
         (self.ready_order, self.ready_off,
          self.ready_yaw_motor, self.ready_speed) = load_ready_pose()
         self._off_used = {}            # 축 → OFFSET 에서 실제 적용한 오프셋
@@ -311,6 +312,8 @@ class HomingNode(Node):
         self._request_t = time.time()
         self._request_control('homing')
         self.queue = list(ALL_ORDER)
+        # 자동 복구 기록은 **호밍마다** 비운다 — 축마다 한 번씩 다시 쓸 수 있다
+        self._recovered = set()
         if not self._limits_fresh():
             self._fail("리미트 토픽이 갱신되지 않습니다 — ezi_io_node 확인")
             return
@@ -465,6 +468,59 @@ class HomingNode(Node):
             f"{dirs.pop():+d} 이므로 자세 번호 없이 진행한다")
         return float(g)
 
+    def _x_now(self):
+        """지금 X 위치(mm, 원점 기준) 또는 None.
+
+        ⚠ `self.pos` 는 **모터 각도**(토픽값)이지 mm 가 아니다. 원점 대비 차이를
+          `mm_per_deg` 로 환산해야 한다. 환산값이 없으면 넘기지 않고 비전이
+          면적 기준으로 되돌아가게 둔다.
+        """
+        deg, ref = self.pos.get('x'), self.refs.get('x')
+        mmpd = load_mm_per_deg('x')
+        if deg is None or ref is None or not mmpd:
+            return None
+        return abs(deg - ref) * float(mmpd)
+
+    def _vision_check(self, g):
+        """**매 호밍마다** yaw 를 비전으로 교차검증한다 → True/False/None.
+
+        왜 항상 하는가 (2026-10-07 사용자 결정): 별칭일 때만 부르면 ① 카메라가
+        죽은 것을 **별칭 구간에 들어가서야** 알게 되고(그때는 호밍이 막힌다),
+        ② 엔코더 각도를 검증할 기회를 매번 버린다. 이날 기준점이 두 번 어긋났고
+        (전원 차단 중 7° 밀림), 그걸 잡아낼 수 있는 유일한 장치가 이것이다.
+
+        ⚠ **판정이 안 되면 막지 않는다.** `|건| < 14.4°` 에서는 주축각이 경계
+          사이에 들어와 `pick_sign` 이 보류한다 — 그 구간은 애초에 단회전이
+          유일하게 가리므로 비전이 필요 없다. 카메라가 없을 때도 알리고 넘어간다.
+          여기서 막으면 카메라가 불안한 동안 호밍이 아예 안 된다.
+        ⚠ **엇갈리면 거부한다.** 엔코더가 음수각이라는데 비전이 양수각이라면
+          둘 중 하나가 거짓이다 — 추측해 돌리면 기구부에 박는다(끝 리미트 없음).
+        """
+        if self._frame is None:
+            self.get_logger().warning(
+                '비전 점검 불가 — /camera/color/image_raw 가 없다. '
+                '엔코더만으로 진행한다 (별칭 구간이면 거부된다). 카메라 확인 필요')
+            return None
+        try:
+            from .yaw_pose_vision import gun_blob, pick_sign
+        except ImportError as exc:
+            self.get_logger().warning(f'비전 모듈을 못 불러왔다: {exc}')
+            return None
+        blob = gun_blob(self._frame)
+        info = (f'면적 {blob[0]:.0f} · 주축각 {blob[1]:+.1f}°' if blob
+                else '건 덩어리를 못 찾았다 (조명·크롭 확인)')
+        sign, why = pick_sign(self._frame, near_x_mm=self._x_now())
+        if sign is None:
+            self.get_logger().info(f'비전 점검 보류 — {why} ({info})')
+            return None
+        msg = (f'비전 점검: 엔코더 건 {g:+.2f}° vs 비전 '
+               f'{"음수" if sign < 0 else "양수"}각 · {info}')
+        if (sign < 0) == (g < 0):
+            self.get_logger().info(msg + ' → 일치')
+            return True
+        self.get_logger().error(msg + ' → **불일치**')
+        return False
+
     def _vision_pick(self, detail):
         """별칭 후보 둘 중 하나를 **영상으로** 고른다 → 건 각도(도) 또는 None.
 
@@ -504,12 +560,7 @@ class HomingNode(Node):
         # ⚠ `self.pos` 는 **모터 각도**(토픽값)이지 mm 가 아니다. 원점 대비
         #   차이를 `mm_per_deg` 로 환산해야 한다. 환산값이 없으면 넘기지 않고
         #   `choose` 가 면적 기준으로 되돌아가게 둔다.
-        x_now = None
-        deg, ref = self.pos.get('x'), self.refs.get('x')
-        mmpd = load_mm_per_deg('x')
-        if deg is not None and ref is not None and mmpd:
-            x_now = abs(deg - ref) * float(mmpd)
-        picked, why = choose(cands, self._frame, near_x_mm=x_now)
+        picked, why = choose(cands, self._frame, near_x_mm=self._x_now())
         if picked is None:
             self.get_logger().warning(f"비전 판정 거부 — {why}")
             return None
@@ -578,6 +629,13 @@ class HomingNode(Node):
             #   유도할 이유가 없다. 보장된 전제를 낡을 수 있는 데이터로 덮어쓰지 않는다.
             #   12시에서 멀면(전제 밖) 그때만 유도한다 — 그 경우는 어차피 전제 검사가
             #   막으므로 실질적으로 쓰이지 않지만, 호출부 계약은 유지한다.
+            # ⚠⚠ **비전 교차검증을 여기서 매번 한다** (출처가 무엇이든).
+            #   X 호밍이 끝난 뒤라 비전이 유효한 시점이고, 방향을 정하기
+            #   **전**이라 엇갈리면 돌리기 전에 멈출 수 있다.
+            if self._vision_check(g) is False:
+                return ('yaw 엔코더와 비전이 엇갈린다 — 기준점'
+                        '(noon_single)·커플링·카메라를 확인하세요. '
+                        '추측해 돌리지 않는다')
             tol = float(self.pose_id.get('tol_gun') or 3.0)
             fixed = int(AXES['yaw'].get('dir') or -1)
             if abs(g) <= tol:
@@ -730,8 +788,27 @@ class HomingNode(Node):
             told = self.brake_ok.get(self.axis)
             if told is False:
                 if elapsed > self.arm_sec * 6:
+                    # ⚠⚠ **자동 복구를 축마다 한 번 시도한다** (2026-10-07).
+                    #   Z 가 `errorState=0x4000`(엔코더 데이터 오류)에 들어가면
+                    #   브레이크가 안 풀리고 호밍이 여기서 죽는다. 그날 반복해서
+                    #   났고 `0x76` 리셋으로 매번 복구됐다 — 사람이 매번 명령을
+                    #   치는 대신 호밍이 스스로 한 번 시도한다.
+                    # ⚠ **여기서만 자동으로 한다.** `0x76` 은 멀티턴을 날리므로
+                    #   호밍이 끝난 뒤에 자동 리셋하면 원점 기준이 무효가 되고
+                    #   mm 환산이 조용히 틀어진다 — 그게 더 위험하다. 이 시점은
+                    #   그 축이 아직 기준을 안 잡았으므로 리셋이 무해하다.
+                    # ⚠ 한 번만. 또 안 풀리면 기구·배선 문제이므로 사람이 본다.
+                    if self.axis not in self._recovered:
+                        self._recovered.add(self.axis)
+                        self.get_logger().warning(
+                            f"{self.axis}: 브레이크가 안 풀린다 — 모터 리셋"
+                            f"(0x76)으로 자동 복구를 한 번 시도한다")
+                        self._brake('recover', self.axis)
+                        self.t_phase = time.time() + 1.5   # 재부팅 대기
+                        return
                     self._fail(f"{self.axis}: 브레이크가 {elapsed:.1f}초 동안 풀리지 "
-                               f"않았다 — 0x77 이 먹는지 확인하세요")
+                               f"않았다 — 0x77·모터 에러를 확인하세요 "
+                               f"(0x76 자동 복구도 실패)")
                 return
             if elapsed >= self.arm_sec:
                 if self.limit[cfg['home_limit']]:

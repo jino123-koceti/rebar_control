@@ -598,12 +598,15 @@ class StageNode(Node):
         self.yaw_want = want
         # ⚠ 현재 건 각도는 **기준점**에서 낸다. 위치 토픽(0x92)은 멈추면 묵고,
         #   단회전은 별칭이 있다 — 둘 다 여기서 쓰면 안 된다.
-        # ⚠⚠ [2026-10-07 정정] **부호가 뒤집혀 있었다** (`현재 − 목표`).
-        #   부호 근거(같은 날 호밍 로그): 탐색 방향 `+1` 로 명령했을 때 yaw 가
-        #   건 -17.84° → 에지(-5.05°) 쪽, 즉 **건 각도가 증가하는 방향**으로
-        #   움직였다. 따라서 `+명령 → +건각도` 이고 델타는 `목표 − 현재` 다.
+        # ⚠⚠ **부호는 `현재 − 목표` 가 맞다. 바꾸지 말 것.**
+        #   [2026-10-07 오판 기록] 이것을 `목표 − 현재` 로 "고쳤다가" 실장비에서
+        #   1번→2번이 반대로 돌았다 (`모터축 +130.1°` 명령 → 건 -16.77°→-17.32°).
+        #   즉 **`+모터 → −건`** 이다. 오판의 근거는 호밍 로그의 "탐색 방향 +1 로
+        #   건 각도가 증가했다" 였는데, 호밍은 **속도 명령**(`/joint_*/speed`)이고
+        #   여기는 **위치 명령**(`/joint_*/position`)이라 부호 규약이 다르다.
+        #   **한 경로의 부호를 다른 경로에 끌어다 쓰지 말 것.**
         self.yaw_tgt = (self.deg['yaw']
-                        + (g[want]['gun'] - self.gun_now()) * info['gear'])
+                        + (self.gun_now() - g[want]['gun']) * info['gear'])
         self.yaw_moving = True
         self._yaw_best, self._yaw_worse = None, 0
         # ⚠ `t_grant_lost` 도 같이 초기화한다 — 안 하면 묵은 값이 남아
@@ -689,9 +692,9 @@ class StageNode(Node):
 
         self.yaw_speed = float(self.get_parameter('yaw_speed_dps').value)
         self.yaw_want = None            # 자세 번호가 아니라 각도 목표다
-        # ⚠ 위 자세 경로와 같은 부호 오류였다 — `목표 − 현재` 다.
+        # ⚠ 위 자세 경로와 **같은 규약**이다 — `현재 − 목표`. 바꾸지 말 것.
         self.yaw_tgt = (self.deg['yaw']
-                        + (want_gun - now_gun) * info['gear'])
+                        + (now_gun - want_gun) * info['gear'])
         self.yaw_moving = True
         self.t_start = self.t_arm = self.t_grant_lost = time.time()
         self._yaw_sent = 0.0
@@ -770,7 +773,8 @@ class StageNode(Node):
                     return self._yaw_done(
                         f'오차가 커진다 (건 {gerr:+.2f}°, 최선 '
                         f'{self._yaw_best:.2f}°) — 부호·기준점·기구 확인')
-            self.yaw_tgt = self.deg['yaw'] + gerr * float(info['gear'])
+            # ⚠ 부호 규약: `+모터 → −건` 이므로 **−gerr** 를 더한다
+            self.yaw_tgt = self.deg['yaw'] - gerr * float(info['gear'])
         if time.time() - self._yaw_sent > 0.4:
             self._yaw_sent = time.time()
             self.pos_pubs['yaw'].publish(
