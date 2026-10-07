@@ -13,6 +13,7 @@ from std_msgs.msg import Float64MultiArray, Float32, Int32, Empty, String, Bool
 from rebar_base_interfaces.msg import SafetyState
 from geometry_msgs.msg import Twist
 from std_srvs.srv import Trigger
+import json
 import struct
 import time
 import threading
@@ -384,6 +385,10 @@ class PositionControlNode(Node):
         #       브레이크는 잠긴 채로 남는다 — 움직일 사람이 푼다.
         self.brake_cmd_sub = self.create_subscription(
             String, '/brake_cmd', self._on_brake_cmd, 10)
+
+        # 모터 에러 상태를 **토픽으로** 낸다 (바뀔 때만). `z_watchdog` 가 본다.
+        self.motor_err_pub = self.create_publisher(String, '/motor_error', 10)
+        self._err_seen = {}
 
         # 상부축 가감속 — 값을 찾는 동안 손으로 바꿀 수 있게 열어 둔다.
         #   ros2 topic pub --once /motor_accel std_msgs/String "{data: 'all 2000'}"
@@ -2091,6 +2096,16 @@ class PositionControlNode(Node):
                     #   근거: `CAN BUS Motor Motion Protocol V4.3` §2.14 (0x9A) —
                     #   ros2_ws_2nd/rmd_can/rmd_can_protocol_v3/ 에 변환본이 있다.
                     error_state = data[6] | (data[7] << 8)
+                    # ⚠ **토픽으로도 낸다.** 로그만 있으면 다른 노드가 못 본다 —
+                    #   Z 의 `0x4000` 을 감시해 자동 복구하는 `z_watchdog` 가 쓴다.
+                    #   상태가 **바뀔 때만** 보낸다 (에러는 100ms 마다 쏟아진다).
+                    if self._err_seen.get(motor_id) != error_state:
+                        self._err_seen[motor_id] = error_state
+                        self.motor_err_pub.publish(String(data=json.dumps({
+                            'id': motor_id, 'state': error_state,
+                            'motor_c': data[1], 'mos_c': data[2],
+                            'volt': (data[4] | (data[5] << 8)) / 10.0,
+                        })))
                     if error_state != 0:
                         hit = [m for b, m in self.ERROR_FLAGS if error_state & b]
                         unknown = error_state & ~sum(b for b, _ in self.ERROR_FLAGS)

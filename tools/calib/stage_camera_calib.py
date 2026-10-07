@@ -86,6 +86,10 @@ SNAP = os.path.expanduser(
     '~/ros2_ws/src/rebar_control/data/calibration/snapshot.png')
 AXES = ('x', 'y', 'z')
 
+# ⚠ 깊이를 X·Y 적합에 쓸지. **False 가 기본** — 위 `_solve_axis` 주석 참고.
+#   되돌리려면 True 로만 바꾸면 된다 (짝 데이터는 그대로 쓴다).
+USE_DEPTH = False
+
 
 class Calib(Node):
     def __init__(self):
@@ -439,7 +443,23 @@ class Calib(Node):
         건을 이미 근처에 보낸 뒤 미세 보정만 하므로 정렬 오차가 작아 값이 좋다).
         """
         extra = [p for p in poses if p != base]
-        U = 4 + len(extra)
+        # ⚠⚠ [2026-10-07] **깊이를 X·Y 에서 뺀다. Z 는 상수로 둔다.**
+        #   실측이 원인을 정확히 가리켰다 — 1번 자세 3점에서
+        #       깊이 401 → X오차 -12.5 / 444 → -14.4 / 534 → -30.8
+        #   **X 오차가 깊이에 비례**(기울기 -0.144mm/mm)하는데 Y 오차는 ±2mm 로
+        #   깊이와 무관했다. 이유가 행렬에 있다: X 행의 깊이 계수가 +0.0933 인데
+        #   Y 행은 -0.0009(~0)다. 즉 **Y 는 이미 깊이를 안 쓰고 있어서 정확했다.**
+        #   왜 X 의 깊이 계수가 틀렸나: 교차점이 거의 한 평면(철근 격자)에 있어
+        #   깊이가 cx·cy 의 선형함수다 → **깊이 열이 중복**되어 최소제곱이 아무
+        #   값이나 고른다. git 로그의 `깊이가 몰려 A 의 z 열이 안 잡혔다` 가 이것.
+        #   평면에서는 깊이가 X·Y 결정에 **정보를 더하지 않는다** — 빼는 것이 맞다.
+        #   2차년도도 `calibrate_without_depth.py` 로 그렇게 했다.
+        # ⚠ Z 는 데크플레이트 위라 **같은 평면**이므로 자세별 상수로 둔다
+        #   (사용자 결정). 상수항 + 자세 오프셋만 푼다.
+        # ⚠ **yaml 스키마는 그대로다** — X·Y 행의 깊이 열을 0, Z 행을 전부 0 으로
+        #   두고 b[2] 에 상수를 넣는다. 그래서 `tying_planner` 는 고칠 것이 없다.
+        ncam = 0 if k == 2 else (3 if USE_DEPTH else 2)
+        U = ncam + 1 + len(extra)
         M, y = [], []
         for p in poses:
             bad = self.stale_idx(p)
@@ -447,10 +467,10 @@ class Calib(Node):
                 if i in bad or k not in self._axes_of(q):
                     continue
                 r = [0.0] * U
-                r[0:3] = q['cam']
-                r[3] = 1.0
+                r[0:ncam] = q['cam'][:ncam]
+                r[ncam] = 1.0
                 if p != base:
-                    r[4 + extra.index(p)] = 1.0
+                    r[ncam + 1 + extra.index(p)] = 1.0
                 M.append(r)
                 y.append(q['stage'][k])
         if len(M) < U:
@@ -461,8 +481,10 @@ class Calib(Node):
             return None
         e = M @ sol - y
         off = {base: 0.0}
-        off.update({p: float(sol[4 + i]) for i, p in enumerate(extra)})
-        return dict(a=sol[:3], b=float(sol[3]), off=off, n=len(y),
+        off.update({p: float(sol[ncam + 1 + i]) for i, p in enumerate(extra)})
+        a3 = np.zeros(3)
+        a3[:ncam] = sol[:ncam]
+        return dict(a=a3, b=float(sol[ncam]), off=off, n=len(y),
                     e=e, dof=len(y) - U)
 
     def fit_shared(self):

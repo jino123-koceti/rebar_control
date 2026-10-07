@@ -30,6 +30,10 @@ setup(
             'lateral_node = rmd_robot_control.lateral_node:main',
             'remote_teleop_node = rmd_robot_control.remote_teleop_node:main',
             'homing_node = rmd_robot_control.homing_node:main',
+            # 보조 — Z 가 엔코더 데이터 오류(0x4000)에 빠지면 0x76 리셋으로
+            # 자동 복구한다. 리셋은 멀티턴을 날리므로 단회전으로 '축이 안
+            # 움직였다' 를 검증한 뒤 원점 보정량을 발행한다.
+            'z_watchdog = rmd_robot_control.z_watchdog:main',
             # L3 — 상부 스테이지를 mm 목표로 보낸다 (검출점 이동용)
             'stage_node = rmd_robot_control.stage_node:main',
             # L4 — 결속 지점 하나를 자세 선택 → 회전 → 이동으로 묶는다.

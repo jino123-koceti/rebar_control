@@ -233,6 +233,11 @@ class HomingNode(Node):
         self.pose_id = load_pose_id('yaw')       # yaw 자세 판별 (12시 ±3° 전제를 대체)
         self.search_limit = load_search_limit('yaw')
         self._recovered = set()   # 이번 호밍에서 자동 복구한 축
+        # ⚠ `z_watchdog` 가 `0x76` 리셋 뒤 **원점 보정량**을 보낸다. 리셋은
+        #   멀티턴을 날리므로 원점을 그만큼 밀어야 mm 환산이 보존된다. 보내는
+        #   쪽이 단회전으로 '축이 안 움직였다' 를 검증한 뒤에만 발행한다.
+        self.create_subscription(String, '/homing/ref_shift',
+                                 self._on_ref_shift, 10)
         (self.ready_order, self.ready_off,
          self.ready_yaw_motor, self.ready_speed) = load_ready_pose()
         self._off_used = {}            # 축 → OFFSET 에서 실제 적용한 오프셋
@@ -247,6 +252,7 @@ class HomingNode(Node):
         self.phase = Phase.IDLE
         self.axis = None
         self.queue = []
+        self.skip_ready = False   # zref 전용 — 준비자세를 건너뛴다
         self.t_phase = 0.0
         self.refs = {}
         self.detail = ''
@@ -288,11 +294,37 @@ class HomingNode(Node):
         #   실제로 그랬다: `/homing_cmd x` 만 보냈더니 X 호밍 뒤 준비자세가 돌았고,
         #   Y 는 원점이 없어 못 움직이는데 yaw 가 1번 자세로 회전해 상부 프레임을 쳤다.
         #   조용히 'all' 로 바꿔치기하지 않는 이유: 명령의 뜻이 달라지면 더 위험하다.
+        # ⚠⚠ [2026-10-07] **`zref` 만 예외다 — Z 원점만 센서로 다시 잡는다.**
+        #   사용자 지적: Z 는 결속점마다 `z_clear` 로 0mm(= z_min 센서)까지 올라갔다
+        #   내려간다. 즉 **원점이 센서로 매 사이클 재확인되는 축**이고, 절대 원점을
+        #   보존할 필요가 없다. `0x76` 리셋으로 멀티턴이 날아갔을 때 전체 호밍(60초)
+        #   대신 이것으로 몇 초에 복구한다.
+        #   왜 안전한가: ① 움직이는 축이 Z 하나다 ② 방향이 **후퇴(위)** 라 철근·
+        #   프레임에서 멀어진다 ③ **준비자세를 돌리지 않는다** — 단축 호밍이 금지된
+        #   이유가 바로 준비자세가 Y 없이 yaw 를 돌린 사고였다.
+        if cmd == 'zref':
+            if 'z' not in AXES:
+                self.get_logger().error('zref 거부 — z 축 정의가 없다')
+                return
+            self._want_control = True
+            self._request_t = time.time()
+            self._request_control('homing')
+            self.queue = ['z']
+            self.skip_ready = True            # ⚠ 준비자세를 돌리지 않는다
+            self._recovered = set()
+            if not self._limits_fresh():
+                self._fail('리미트 토픽이 갱신되지 않습니다 — ezi_io_node 확인')
+                return
+            self.get_logger().warning(
+                'zref — Z 원점만 센서로 다시 잡는다 (준비자세 없음, Z 만 움직임)')
+            self._next_axis()
+            return
         if cmd != 'all':
             why = (f"'{cmd}' — 호밍은 전 축('all')으로만 한다. 축마다 간섭 구간이 "
                    f"달라서 일부만 호밍한 상태로 움직이면 프레임이 부딪친다."
+                   f" (Z 원점만 다시 잡으려면 'zref')"
                    if cmd in AXES else
-                   f"알 수 없는 명령: '{cmd}' — 받는 것은 'all' 과 'stop' 뿐이다")
+                   f"알 수 없는 명령: '{cmd}' — 받는 것은 'all'·'zref'·'stop' 뿐이다")
             self.get_logger().error(f"호밍 거부 — {why}")
             self.detail = why
             return
@@ -312,6 +344,7 @@ class HomingNode(Node):
         self._request_t = time.time()
         self._request_control('homing')
         self.queue = list(ALL_ORDER)
+        self.skip_ready = False
         # 자동 복구 기록은 **호밍마다** 비운다 — 축마다 한 번씩 다시 쓸 수 있다
         self._recovered = set()
         if not self._limits_fresh():
@@ -397,6 +430,15 @@ class HomingNode(Node):
             prev = self.axis
             if prev is not None:
                 self._cmd_speed(prev, 0.0)
+            if self.skip_ready:               # zref — 원점만 잡고 끝낸다
+                self.skip_ready = False
+                self._lock_all()
+                self._release_control()
+                self._enter(Phase.DONE, 'zref 완료 — Z 원점만 다시 잡았다')
+                self.get_logger().warning(
+                    f"zref 완료 — Z 원점 {self.refs.get('z')}. "
+                    f"다른 축 원점은 그대로다")
+                return
             self._start_ready()
             return
         prev = self.axis
@@ -467,6 +509,28 @@ class HomingNode(Node):
             f"yaw 자세 사이 (건 {g:+.2f}°) — 이웃 자세가 둘 다 방향 "
             f"{dirs.pop():+d} 이므로 자세 번호 없이 진행한다")
         return float(g)
+
+    def _on_ref_shift(self, msg):
+        """원점을 보정한다 (모터축 도). `z_watchdog` 의 0x76 리셋 뒤에 온다.
+
+        ⚠ **호밍된 축에만 적용한다.** 원점이 없으면 보정할 것도 없고, 없는 원점을
+          만들어 주면 호밍 안 한 축이 호밍된 것처럼 보인다 — 그게 더 위험하다.
+        """
+        try:
+            d = json.loads(msg.data) or {}
+            a, delta = str(d.get('axis')), float(d.get('delta_deg'))
+        except (ValueError, TypeError):
+            return
+        if a not in self.refs:
+            self.get_logger().warning(
+                f'{a} 원점 보정 무시 — 그 축은 호밍되지 않았다 (전체 호밍 필요)')
+            return
+        old = self.refs[a]
+        self.refs[a] = old + delta
+        self.get_logger().warning(
+            f'{a} 원점 보정: {old:+.2f}° → {self.refs[a]:+.2f}° '
+            f'({delta:+.2f}°) — {d.get("why", "")}')
+        self._publish_status()
 
     def _x_now(self):
         """지금 X 위치(mm, 원점 기준) 또는 None.

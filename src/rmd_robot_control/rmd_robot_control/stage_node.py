@@ -244,6 +244,10 @@ class StageNode(Node):
         # ⚠ 건 각도 기준 도달 판정. 자세 판별 허용(±1.50°)보다 **안쪽**이어야
         #   한다 — 아니면 '도달' 직후에 자세를 못 가려 다음 동작이 거부된다.
         self.declare_parameter('yaw_gun_tol_deg', 1.0)
+        # 차단 뒤 스프링백이 정착할 때까지 기다리는 시간
+        self.declare_parameter('yaw_settle_sec', 0.8)
+        # 정착 후 재보정 최대 횟수. 안 줄어들면 기구 문제다
+        self.declare_parameter('yaw_settle_passes', 3)
 
         g = self.get_parameter
         self.speed = float(g('move_speed_dps').value)
@@ -285,6 +289,8 @@ class StageNode(Node):
         self.yaw_speed = float(g('yaw_speed_dps').value)
         self.yaw_tol = float(g('yaw_tol_deg').value)
         self.yaw_gun_tol = float(g('yaw_gun_tol_deg').value)
+        self.yaw_settle_sec = float(g('yaw_settle_sec').value)
+        self.yaw_max_pass = int(g('yaw_settle_passes').value)
 
         # yaw 도 같이 싣는다 — 관절 발행·브레이크·위치 구독 경로를 공유한다.
         # mm 환산이 없는 축이라 `mm_of`/`deg_of` 는 AXES 에만 쓴다.
@@ -378,6 +384,8 @@ class StageNode(Node):
         self._yaw_sent = 0.0
         self._yaw_best = None
         self._yaw_worse = 0
+        self._yaw_settle = None   # (시작시각, 사유) — 차단 뒤 정착 확인
+        self._yaw_pass = 0        # 정착 후 재보정 횟수
         if self.env is None:
             self.get_logger().warning(
                 "자세별 가동 범위가 없다 (axes.yaml 의 stage.envelope) — "
@@ -477,7 +485,12 @@ class StageNode(Node):
             return self._reject(f'모르는 자세 {want}')
         if self.yaw_multi is None:
             return self._reject('yaw 멀티턴을 못 받고 있다')
-        self._anchor(want, '사람이 선언')
+        # ⚠ [2026-10-07] **실측 각도를 넘긴다.** 빠져 있어서 선언이 늘 자세의
+        #   공칭 각도를 박았다 — 단회전이 유일하게 갈리면 정확한 각도를 아는데도
+        #   버리고 있었다. 그날 2번 자세를 선언했더니 참값 -4.92° 대신 -6.33° 가
+        #   들어가 **1.41° (건 끝 16mm) 틀어진 채** 고정됐다. `_yaw_done` 은
+        #   원래 넘기고 있었는데 이 경로만 누락이었다 (`_anchor` 주석 참고).
+        self._anchor(want, '사람이 선언', gun=self._measured_gun(want))
         self._publish_status()
 
     def _measured_gun(self, pose):
@@ -609,6 +622,7 @@ class StageNode(Node):
                         + (self.gun_now() - g[want]['gun']) * info['gear'])
         self.yaw_moving = True
         self._yaw_best, self._yaw_worse = None, 0
+        self._yaw_settle, self._yaw_pass = None, 0
         # ⚠ `t_grant_lost` 도 같이 초기화한다 — 안 하면 묵은 값이 남아
         #   회전 시작 즉시 "제어 권한 없음" 으로 멈춘다 (2026-10-04, 권한 판정을
         #   '잃은 지 얼마나 됐는가' 로 바꿀 때 이 경로를 빼먹었다).
@@ -730,6 +744,17 @@ class StageNode(Node):
         return None
 
     def _yaw_tick(self):
+        # ⚠⚠ [2026-10-07] **차단 뒤 정착을 확인하고 다시 맞춘다.**
+        #   `0x80` 으로 여자를 끊는 순간 커플링·백래시 변형이 풀려 축이 되돌아간다
+        #   (실측 1→2번 +2.2° · 2→3번 +4.35°). 폐루프가 0.00° 까지 수렴해도
+        #   **멈추면 밀리니** 구조적으로 못 맞췄다. 그러면 자세 판별이 '미확인'
+        #   으로 떨어지고 `stage_node` 가 **그 뒤 모든 동작을 거부**한다 —
+        #   그날 결속 9점이 0점이 된 경로가 정확히 이것이다.
+        #   사람이 `yaw_declare` 로 구제할 수 있지만 **미션 중에는 못 한다.**
+        #   그래서 수렴·차단 **뒤에** 한 겹 더 둔다: 정착을 기다려 다시 재고,
+        #   벗어나 있으면 재회전한다. 스프링백은 이동량의 일부라 매회 줄어든다.
+        if self._yaw_settle is not None:
+            return self._yaw_settle_tick()
         stop = self._safety_stop()
         if stop:
             return self._yaw_done(f'안전 — {stop}')
@@ -762,7 +787,8 @@ class StageNode(Node):
         else:
             gerr = want_gun - gun
             if abs(gerr) <= self.yaw_gun_tol:
-                return self._yaw_done(f'도달 (남은 건 {gerr:+.2f}°)')
+                # 바로 끝내지 않는다 — 잠그고 차단한 뒤 **정착을 확인**한다
+                return self._yaw_park(f'도달 (남은 건 {gerr:+.2f}°)')
             # ⚠⚠ **멀어지면 멈춘다.** 부호가 틀렸거나 기구 문제인데, yaw 는 끝
             #   리미트가 없어서 계속 밀면 기구부에 박는다 (2026-09-30: 10.7A/86°C).
             if self._yaw_best is None or abs(gerr) < self._yaw_best - 0.05:
@@ -785,6 +811,50 @@ class StageNode(Node):
             self.detail = (f"{pose_label(self.yaw_want)}로 회전 중"
                            + (f" (건 {gun:+.2f}°, 남은 건 {gerr:+.2f}°)"
                               if gun is not None and gerr is not None else ''))
+
+    def _yaw_park(self, reason):
+        """멈추고 잠그고 차단한 뒤 **정착 확인 단계로 넘긴다** (끝내지 않는다)."""
+        self.spd_pubs['yaw'].publish(Float32(data=0.0))
+        self._brake('lock', 'yaw')
+        self._brake('shutdown', 'yaw')
+        self._yaw_settle = (time.time(), reason)
+        self.detail = f'{pose_label(self.yaw_want)} 정착 대기'
+
+    def _yaw_settle_tick(self):
+        """차단 뒤 정착을 기다려 재측정하고, 벗어나 있으면 재회전한다.
+
+        ⚠ 횟수를 제한한다. 안 줄어들면 기구 문제이므로 사람이 봐야 한다 —
+          무한 재시도는 그걸 덮고 전류만 올린다.
+        """
+        t0, reason = self._yaw_settle
+        if time.time() - t0 < self.yaw_settle_sec:
+            return
+        self._yaw_settle = None
+        info = self.pose_id or {}
+        gun = self.gun_now()
+        want_gun = ((info.get('poses') or {}).get(self.yaw_want) or {}).get('gun')
+        if gun is None or want_gun is None:
+            return self._yaw_done(reason)
+        gerr = want_gun - gun
+        if abs(gerr) <= self.yaw_gun_tol:
+            return self._yaw_done(f'{reason} · 정착 후 건 {gerr:+.2f}°')
+        if self._yaw_pass >= self.yaw_max_pass:
+            return self._yaw_done(
+                f'{reason} ⚠ 정착 후 건 {gerr:+.2f}° — 재보정 '
+                f'{self._yaw_pass}회로 못 잡았다 (기구·백래시 확인)')
+        self._yaw_pass += 1
+        self.get_logger().warning(
+            f'yaw 정착 후 건 {gerr:+.2f}° 벗어났다 (스프링백) — '
+            f'{self._yaw_pass}/{self.yaw_max_pass}회차 재보정')
+        # ⚠ 부호 규약: `+모터 → −건` 이므로 −gerr 를 더한다
+        self.yaw_tgt = self.deg['yaw'] - gerr * float(info['gear'])
+        self.t_start = self.t_arm = self.t_grant_lost = time.time()
+        self._yaw_sent = 0.0
+        self._yaw_best, self._yaw_worse = None, 0
+        self.detail = (f'{pose_label(self.yaw_want)} 재보정 '
+                       f'{self._yaw_pass}/{self.yaw_max_pass}회차')
+        self._brake('release', 'yaw')
+        self._request_control('auto')
 
     def _yaw_done(self, reason):
         """멈추고 **잠그고 0x80 까지** 보낸다 — 0x78 만으로는 전류가 계속 흐른다."""
