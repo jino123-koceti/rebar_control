@@ -111,7 +111,7 @@ yaw 는 **원점이 구동범위 한가운데**(12시 −4.62°)에 있고 **리
 
 | 방향 | 토픽 | 형 | 비고 |
 |---|---|---|---|
-| 입력 | `/homing_cmd` | String | `all` / 축이름 / `stop` |
+| 입력 | `/homing_cmd` | String | `all` / `stop` — ⚠ **축이름 단일 호밍은 2026-10-06 부터 거부된다.** 축마다 간섭 구간이 달라 일부만 호밍한 상태로 움직이면 프레임이 부딪친다 (실제 사고 1건) |
 | 입력 | `/limit_sensors/*` | Bool | x_min·x_max·y_min·y_max·z_min·z_max·yaw_home |
 | 입력 | `/motor_*/encoder_single` | Int32 | 자세 판별용 (전원 무관) |
 | 입력 | `/motor_*_position` | **Float32** | ⚠ Float64 로 구독하면 한 건도 안 온다 |

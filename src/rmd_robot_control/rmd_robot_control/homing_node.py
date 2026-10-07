@@ -251,6 +251,20 @@ class HomingNode(Node):
         if self.phase not in (Phase.IDLE, Phase.DONE, Phase.FAILED):
             self.get_logger().warning(f"호밍 진행 중({self.axis}) — '{cmd}' 무시")
             return
+        # ⚠ [2026-10-06 사용자 지시] **호밍은 항상 전 축이다.** 단일 축 명령은 거부한다.
+        #   축마다 간섭 구간이 달라서(x_min 은 yaw 자세와 무관하지만 y_min/y_max 는
+        #   yaw 12시에서만 안전하다) 일부만 호밍한 상태로 진행하면 프레임끼리 부딪친다.
+        #   실제로 그랬다: `/homing_cmd x` 만 보냈더니 X 호밍 뒤 준비자세가 돌았고,
+        #   Y 는 원점이 없어 못 움직이는데 yaw 가 1번 자세로 회전해 상부 프레임을 쳤다.
+        #   조용히 'all' 로 바꿔치기하지 않는 이유: 명령의 뜻이 달라지면 더 위험하다.
+        if cmd != 'all':
+            why = (f"'{cmd}' — 호밍은 전 축('all')으로만 한다. 축마다 간섭 구간이 "
+                   f"달라서 일부만 호밍한 상태로 움직이면 프레임이 부딪친다."
+                   if cmd in AXES else
+                   f"알 수 없는 명령: '{cmd}' — 받는 것은 'all' 과 'stop' 뿐이다")
+            self.get_logger().error(f"호밍 거부 — {why}")
+            self.detail = why
+            return
         bad = self._precheck_failed()
         if bad:
             self.get_logger().error(f"호밍 거부 — {bad}")
@@ -260,13 +274,7 @@ class HomingNode(Node):
         self._want_control = True
         self._request_t = time.time()
         self._request_control('homing')
-        if cmd == 'all':
-            self.queue = list(ALL_ORDER)
-        elif cmd in AXES:
-            self.queue = [cmd]
-        else:
-            self.get_logger().error(f"알 수 없는 명령: '{cmd}'")
-            return
+        self.queue = list(ALL_ORDER)
         if not self._limits_fresh():
             self._fail("리미트 토픽이 갱신되지 않습니다 — ezi_io_node 확인")
             return
@@ -295,12 +303,26 @@ class HomingNode(Node):
         Y 는 yaw 가 12시일 때만 리미트에 닿는다고 기록돼 있어, 검증된 조건에서
         Y 를 먼저 옮기는 쪽이 안전하다.
         """
-        self._ready_queue = [a for a in self.ready_order
-                             if self._ready_target(a) is not None]
-        skip = [a for a in self.ready_order if a not in self._ready_queue]
+        # ⚠ [2026-10-06] **앞 축을 못 움직이면 뒤 축도 돌리지 않는다.**
+        #   전에는 못 가는 축만 큐에서 빼고 **나머지를 그대로 실행**했다. 그래서
+        #   Y 에 원점이 없던 상태(`/homing_cmd x` 만 보냈을 때)에 Y 가 빠지고
+        #   yaw 만 돌았고, **Y 가 y_min 에 있는 채로 회전해 상부 프레임을 쳤다.**
+        #   순서의 이유가 바로 "Y 를 먼저 빼놔야 yaw 가 돌 수 있다" 인데, 그 전제가
+        #   깨진 걸 경고만 찍고 넘어간 것이 결함이었다.
+        #   그래서 **앞에서부터 연속으로 가능한 구간(prefix)만** 실행한다. 중간에
+        #   하나라도 못 가면 거기서 끊는다 — Y 를 못 가면 yaw 는 안 돈다.
+        ready = []
+        for a in self.ready_order:
+            if self._ready_target(a) is None:
+                break
+            ready.append(a)
+        self._ready_queue = ready
+        skip = self.ready_order[len(ready):]
         if skip:
             self.get_logger().warning(
-                f"준비자세 건너뜀: {', '.join(skip)} (원점 레퍼런스나 환산값이 없다)")
+                f"준비자세 중단: {', '.join(skip)} 를 하지 않는다 "
+                f"(앞 축 '{skip[0]}' 에 원점 레퍼런스나 환산값이 없다). "
+                f"앞 축을 못 옮긴 상태로 뒤 축을 돌리면 기구가 간섭한다.")
         if not self._ready_queue:
             self._finish()
             return
@@ -382,10 +404,31 @@ class HomingNode(Node):
                     # 자세 사이면 자세로 옮기기) — 여기서 덧붙이면 중복된다
                     return f"yaw {info}"
                 g, src = info['gun'], f"단회전 {pose_label(n)}"
+            # ⚠⚠ [2026-10-07] **12시 근처에서 출발하면 방향을 유도하지 않는다.**
+            #   전에는 항상 `edge_gun` 과 비교해 방향을 유도했는데, `edge_gun` 은
+            #   `axes.yaml` 의 **에지 단회전값에서 나오고 그 값은 낡을 수 있다.**
+            #   커플링이 미끄러져 에지값이 무효가 되자 `edge_gun` 이 +8.81°(실제
+            #   −5.24°)로 계산돼 방향이 **반대로** 뒤집혔고, 축이 12시에서 3번·4번
+            #   자세를 지나 **기구부에 박고 스톨**했다. 그 충격이 커플링을 더
+            #   미끄러뜨려 악순환이 됐다.
+            #   호밍 전제는 "사용자가 12시 ±tol 에 놓는다" 이고, 감지 구간은 항상
+            #   **2번 자세 쪽(건 음수)** 이다. 즉 **전제가 지켜지면 방향은 고정**이고
+            #   유도할 이유가 없다. 보장된 전제를 낡을 수 있는 데이터로 덮어쓰지 않는다.
+            #   12시에서 멀면(전제 밖) 그때만 유도한다 — 그 경우는 어차피 전제 검사가
+            #   막으므로 실질적으로 쓰이지 않지만, 호출부 계약은 유지한다.
+            tol = float(self.pose_id.get('tol_gun') or 3.0)
+            fixed = int(AXES['yaw'].get('dir') or -1)
+            if abs(g) <= tol:
+                AXES['yaw']['dir'] = fixed
+                self.get_logger().info(
+                    f"yaw {src} — 건 {g:+.2f}° (12시 ±{tol:.1f}° 안) → "
+                    f"탐색 방향 {fixed:+d} **고정** (axes.yaml seek_dir). "
+                    f"에지는 건 {self.pose_id['edge_gun']:+.2f}° 로 기록돼 있다")
+                return None
             d = 1 if g < self.pose_id['edge_gun'] else -1
             AXES['yaw']['dir'] = d
             self.get_logger().info(
-                f"yaw {src} — 건 {g:+.2f}° → 탐색 방향 {d:+d}, "
+                f"yaw {src} — 건 {g:+.2f}° (12시에서 멀다) → 탐색 방향 {d:+d} 유도, "
                 f"에지까지 건 {self.pose_id['edge_gun'] - g:+.2f}°")
             return None
         return precheck_violation(self.precheck, self.single)
