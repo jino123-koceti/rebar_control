@@ -248,6 +248,14 @@ class StageNode(Node):
         self.declare_parameter('yaw_settle_sec', 0.8)
         # 정착 후 재보정 최대 횟수. 안 줄어들면 기구 문제다
         self.declare_parameter('yaw_settle_passes', 3)
+        # ⚠⚠ **오버슈트 선보정** (건 도). 차단하면 축이 **가던 방향으로 더 흘러
+        #   간다** — 실측 5건이 전부 진행 방향이었다 (1→2 -3.92 vs 목표 -6.33,
+        #   2→3 +6.83 vs +4.60, 3→4 +17.71 vs +15.18, 4→3 +0.79 vs +4.60,
+        #   2→1 -18.20 vs -16.77). 백래시가 반대로 미는 것이 아니다.
+        #   그래서 **그만큼 덜 가게 조준**하면 흘러간 자리가 목표가 된다 —
+        #   왕복(넘어갔다 되돌아옴)이 사라지고 한 번에 들어온다.
+        #   정착 재보정은 **그대로 남긴다** — 선보정이 빗나가도 받쳐준다.
+        self.declare_parameter('yaw_overshoot_gun_deg', 2.3)
 
         g = self.get_parameter
         self.speed = float(g('move_speed_dps').value)
@@ -291,6 +299,7 @@ class StageNode(Node):
         self.yaw_gun_tol = float(g('yaw_gun_tol_deg').value)
         self.yaw_settle_sec = float(g('yaw_settle_sec').value)
         self.yaw_max_pass = int(g('yaw_settle_passes').value)
+        self.yaw_over = float(g('yaw_overshoot_gun_deg').value)
 
         # yaw 도 같이 싣는다 — 관절 발행·브레이크·위치 구독 경로를 공유한다.
         # mm 환산이 없는 축이라 `mm_of`/`deg_of` 는 AXES 에만 쓴다.
@@ -618,8 +627,12 @@ class StageNode(Node):
         #   건 각도가 증가했다" 였는데, 호밍은 **속도 명령**(`/joint_*/speed`)이고
         #   여기는 **위치 명령**(`/joint_*/position`)이라 부호 규약이 다르다.
         #   **한 경로의 부호를 다른 경로에 끌어다 쓰지 말 것.**
+        # ⚠ **오버슈트만큼 덜 간다.** 진행 방향을 부호로 잡아 그 반대로 뺀다.
+        d_gun = g[want]['gun'] - self.gun_now()          # 가야 할 건 각도(부호 포함)
+        pre = math.copysign(min(self.yaw_over, abs(d_gun) / 2.0), d_gun) \
+            if d_gun else 0.0
         self.yaw_tgt = (self.deg['yaw']
-                        + (self.gun_now() - g[want]['gun']) * info['gear'])
+                        + (self.gun_now() - (g[want]['gun'] - pre)) * info['gear'])
         self.yaw_moving = True
         self._yaw_best, self._yaw_worse = None, 0
         self._yaw_settle, self._yaw_pass = None, 0
