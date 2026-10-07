@@ -34,7 +34,11 @@ IFACE_DEFAULT = "can2"
 CFG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lateral_home.json")
 
 M1, M2 = 0x143, 0x144
-DEG_PER_MM = 7.2          # 0x143 기준: 360° = 리드스크류 1바퀴 = 50mm
+# [정정 2026-10-06] 3차년도 장비는 **1회전 = 100mm** 다 (사용자 확인 2026-10-04).
+# 7.2 는 2차년도(50mm/회전) 값이었다. `navigator.py` 의 `lateral_mm_per_turn` 은
+# 100.0 으로 맞아 있었고 이 도구만 어긋나 있었다 — **표시 전용**이라 이동 계산에
+# 영향은 없었지만 mm 가 실제의 절반으로 보였다.
+DEG_PER_MM = 3.6          # 360° = 리드스크류 1바퀴 = 100mm
 ENC_CPR = 262144          # 멀티턴 엔코더 1회전 counts (18bit) — 0x60/0x61 실측 확인
 DEFAULT_SPEED = 100       # dps (기존 코드의 200 보다 보수적)
 ABORT_CURRENT_A = 2.5
