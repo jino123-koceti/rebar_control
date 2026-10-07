@@ -35,6 +35,10 @@ systemd `rebar-teleop.service` 가 이 파일을 띄운다. 전원만 넣으면 
       투입 때마다 yaw 를 12시로 맞추지 않아도 호밍이 돈다.
       ⚠ 카메라가 없어도 **호밍 자체는 돈다** — 비전은 별칭일 때만 부르는 보조
         수단이고, 없으면 기존 거부 경로(12시로 옮기거나 선언)로 간다.
+  use_ui:=true|false       웹 UI 브릿지 (기본 true), ui_port:=8080
+      노트북 브라우저에서 `http://<젯슨IP>:8080` 으로 호밍·미션·정지·상태를 본다.
+      ⚠ **UI 정지를 1차 수단으로 삼지 말 것** — 가장 빠른 정지는 리모콘 비상정지다.
+        UI 는 와이파이→HTTP→ROS 를 거치고, 통신이 끊기면 눌러도 안 간다.
 """
 
 import os
@@ -87,6 +91,11 @@ def generate_launch_description():
         # 상부 축만 쓰는 작업에서는 주행 노드가 CAN 을 쓰지 않게 둘 수 있다.
         DeclareLaunchArgument('use_mission', default_value='true',
                               description='경로 미션(drive_node + navigator) 기동'),
+        # 웹 UI. 명령을 **중계만** 하므로 띄워 둬도 장비는 움직이지 않는다 —
+        # 사람이 브라우저에서 눌러야 나간다.
+        DeclareLaunchArgument('use_ui', default_value='true',
+                              description='웹 UI 브릿지(HTTP) 기동'),
+        DeclareLaunchArgument('ui_port', default_value='8080'),
     ]
 
     motor = Node(
@@ -422,10 +431,25 @@ def generate_launch_description():
         respawn=True, respawn_delay=5.0,
     )
 
+    # ── 웹 UI ───────────────────────────────────────────────────────────
+    # 왜 HTTP 중계인가: ROS 2 기본 탐색은 **멀티캐스트**다. 공유기·AP 를 거치면
+    # 막히거나 흘리지 않는 경우가 흔해 "같은 네트워크인데 토픽이 안 보인다" 가
+    # 된다. 리허설 당일에 그걸 디버깅하게 된다. HTTP 는 유니캐스트라 라우터만
+    # 통과하면 되고, 노트북에 ROS 2 를 깔 필요도 없다.
+    # respawn 이 안전한 이유: 이 노드는 뜨면서 아무 명령도 쏘지 않는다. 호밍은
+    # 사람이 눌러야 돈다 — 안 그러면 크래시 루프가 재호밍 루프가 된다.
+    ui = Node(
+        package='rmd_robot_control', executable='ui_bridge',
+        name='ui_bridge', output='screen',
+        parameters=[{'port': LaunchConfiguration('ui_port')}],
+        condition=IfCondition(LaunchConfiguration('use_ui')),
+        respawn=True, respawn_delay=3.0,
+    )
+
     return LaunchDescription(args + [
         LogInfo(msg=['리모콘 조작 구성 기동 — 안전 차단: ', use_safety,
                      ' / 호밍은 자동으로 돌지 않는다 (/homing_cmd 로 시작)']),
         motor, lateral, remote_bridge, remote_teleop, ezi_io, safety, mode_arbiter,
         homing, stage, tying, planner, camera, pololu,
-        drive, navigator, detector,
+        drive, navigator, detector, ui,
     ])

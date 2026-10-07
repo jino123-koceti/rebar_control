@@ -133,18 +133,71 @@ ros2 topic echo /mission/status --field data
 ros2 topic pub --once /mission/start std_msgs/Empty "{}"
 ```
 
-### (b) 웹 UI 로 만들 거면
+### (b) 웹 UI — **이미 장비에 들어 있다** (권장)
 
-브라우저는 ROS 토픽을 직접 못 읽는다. 둘 중 하나가 필요하다.
+브라우저만 있으면 된다. 노트북에 ROS 2 를 깔 필요도, UI 를 만들 필요도 없다.
 
-- **`rosbridge_suite`** — 웹소켓으로 토픽을 그대로 노출한다. `roslibjs` 로 붙는다.
-  설치 필요: `sudo apt install ros-humble-rosbridge-suite`
-- **작은 HTTP 중계를 장비에 두기** — 상태를 모아 `GET /state` 로 주고 `POST /cmd/...`
-  로 명령을 쏘는 노드. 표준 라이브러리만으로 되고 의존이 적다.
+```
+http://192.168.0.16:8080      (동글 WiFi — 주 경로)
+http://192.168.0.12:8080      (내장 WiFi — 예비)
+```
 
-⚠ 어느 쪽이든 **장비에서 돌아야 한다** (로봇과 같은 도메인에 있어야 하므로).
-필요하면 장비 쪽에 노드를 추가해 줄 수 있다 — UI 는 노트북에서 만들고,
-중계만 장비에 두는 구성이 깔끔하다.
+`ui_bridge` 노드가 `teleop.launch.py` 에서 **자동으로 뜬다** (`use_ui:=false` 로 끈다,
+포트는 `ui_port:=8080`). 화면은 브릿지가 같이 서비스한다.
+
+**왜 DDS 직결이 아니라 HTTP 인가:** ROS 2 기본 탐색은 **멀티캐스트**다. 공유기·AP 를
+거치면 막히거나 흘리지 않는 경우가 흔해 "같은 네트워크인데 토픽이 안 보인다" 가
+된다 — 리허설 당일에 그걸 디버깅하게 된다. HTTP 는 유니캐스트라 라우터만
+통과하면 된다. 노트북에 ROS 2 가 있으면 (a) 가 더 단순하니 그쪽을 써도 된다.
+
+#### 엔드포인트
+
+| | 하는 일 | 응답 |
+|---|---|---|
+| `GET /` | UI 페이지 (`ui_page.html`) | HTML |
+| `GET /state` | 아래 5개 상태를 한 덩어리로 | JSON |
+| `POST /cmd/homing` | `/homing_cmd "all"` | `{"ok":true}` |
+| `POST /cmd/mission` | `/mission/start` | `{"ok":true}` |
+| `POST /cmd/stop` | `/homing_cmd "stop"` + `/mission/abort` + `/stage/stop` | `{"ok":true}` |
+
+알 수 없는 `/cmd/*` 는 `400 {"ok":false}` 다. **CORS 는 열려 있다**(`*`) — UI 를
+노트북에서 띄우든 장비에서 받아가든 둘 다 된다.
+
+```bash
+curl -s http://192.168.0.16:8080/state | python3 -m json.tool
+curl -X POST http://192.168.0.16:8080/cmd/stop
+```
+
+#### `GET /state` 응답
+
+2장의 JSON 들을 그대로 담고, **얼마나 오래됐는지를 같이 준다.**
+
+```json
+{"homing": {…}, "mission": {…}, "stage": {…}, "drive": {…},
+ "estop": false,
+ "age_sec": {"stage": 0.1, "homing": 0.3, "drive": 0.2, "mission": 1.4, "safety": 0.1},
+ "now": 1791366064.0}
+```
+
+- `age_sec` 는 **토픽별 마지막 수신 경과 초**다. ⚠ **값만 보면 안 된다** — 3초를
+  넘으면 끊긴 것으로 띄울 것. 로봇이 멈춘 것과 UI 가 못 받는 것은 화면상
+  똑같아 보이는데 원인이 전혀 다르다 (2장 3절 5번).
+- 아직 한 번도 안 온 토픽은 `{}` 이고 `age_sec` 에 키가 **없다**.
+- 깨진 JSON 은 버린다 — 옛 값이 남고 `age_sec` 만 늙는다. 쓰레기를 뿜는 노드가
+  죽은 노드처럼 보이는 것이 맞는 해석이다.
+- `estop` 은 `null` 일 수 있다 (`/safety/state` 를 아직 못 받음 = 모름).
+  **`null` 을 `false` 로 취급하지 말 것.**
+
+#### 직접 UI 를 만들 거면
+
+`GET /state` 를 2~5Hz 로 폴링하고 `POST /cmd/*` 로 쏘면 끝이다. 기본 화면이
+`src/rmd_robot_control/rmd_robot_control/ui_page.html` 에 **단일 파일**로 있으니
+그걸 고치거나 베껴 쓰면 된다 (빌드 과정도 의존도 없다). `rosbridge_suite` 로
+토픽을 그대로 노출하는 길도 있지만(`sudo apt install ros-humble-rosbridge-suite`),
+명령·상태가 위 5개뿐이라 그만한 무게가 필요하지 않다.
+
+⚠ 기본 화면은 **호밍·미션 버튼을 두 번 눌러야** 명령을 보낸다 (4초 내). 장비를
+움직이는 명령이라 손이 스쳐서 나가면 안 된다. **정지는 한 번에** 나간다.
 
 ---
 
@@ -154,12 +207,19 @@ ros2 topic pub --once /mission/start std_msgs/Empty "{}"
 전원 ON
    ↓  (약 1분 — 교차점 검출 모델 적재에 40초쯤 걸린다. 그 전에 미션을 걸면
    ↓   첫 검출이 버려져 "검출이 안 온다" 로 실패한다)
-[전체 호밍]   /homing_cmd "all"
+[전체 호밍]   /homing_cmd "all"        ← UI 의 [전체 호밍]
    ↓  refs 4개가 찰 때까지 (약 1~2분)
-[미션 시작]   /mission/start
+[미션 시작]   /mission/start           ← UI 의 [결속 미션 시작]
    ↓  test_path.txt 경로: 시점 결속 → 후진 500mm 결속 → 전진 500mm 결속
 완료
 ```
+
+브라우저로 할 거면 `http://192.168.0.16:8080` 하나만 열면 된다 — 터미널 명령은
+필요 없다. 호밍 전에는 UI 상단에 "호밍 전이다" 가 떠 있다.
+
+⚠ **UI 정지를 1차 수단으로 삼지 말 것.** 가장 빠르고 확실한 정지는 **리모콘
+비상정지**다. UI 는 와이파이→HTTP→ROS 를 거치므로 그만큼 느리고, 통신이 끊기면
+눌러도 안 간다. 보조 수단이다.
 
 **호밍 전에 yaw 를 12시로 맞출 필요는 없다.** 1번·4번 자세는 단회전만으로 못 가리는데,
 X 를 먼저 호밍한 뒤 작업영역 카메라 영상으로 가린다. 못 가리면 **거부**되고 그때만

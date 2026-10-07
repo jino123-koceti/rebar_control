@@ -1,0 +1,210 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>철근 결속 로봇</title>
+<!--
+  ui_bridge 가 그대로 서비스하는 단일 페이지. 빌드 과정도 의존도 없다.
+  규격은 docs/guides/UI_INTERFACE.md.
+
+  왜 확인 단계가 있나: 호밍·미션은 **장비를 움직인다.** 손가락이 스치기만 해도
+  움직이면 안 된다. 반대로 정지는 **한 번에** 가야 하므로 확인을 두지 않는다.
+-->
+<style>
+  :root {
+    --bg:#15171c; --card:#1e2128; --line:#30343d; --fg:#e8eaed;
+    --dim:#9aa0a8; --ok:#38b764; --warn:#f0a020; --bad:#e04040;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg);
+         font:15px/1.5 system-ui, "Noto Sans KR", sans-serif; }
+  h1 { font-size:17px; margin:0 0 12px; display:flex; gap:10px; align-items:center; }
+  #link { margin-left:auto; font-size:13px; font-weight:400; }
+  .btns { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:14px; }
+  button { font:600 17px/1.2 inherit; color:var(--fg); padding:20px 12px;
+           border:1px solid var(--line); border-radius:10px; background:var(--card);
+           cursor:pointer; }
+  button:active { transform:translateY(1px); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  #stop { grid-column:1/-1; background:var(--bad); border-color:var(--bad);
+          font-size:21px; padding:26px 12px; }
+  button.armed { background:var(--warn); border-color:var(--warn); color:#1b1200; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:12px 14px; margin-bottom:10px; }
+  .card h2 { font-size:12px; letter-spacing:.08em; color:var(--dim);
+             margin:0 0 8px; text-transform:uppercase; }
+  .row { display:flex; gap:10px; justify-content:space-between; padding:3px 0; }
+  .row b { font-weight:600; }
+  .pills { display:flex; flex-wrap:wrap; gap:6px; }
+  .pill { font-size:13px; padding:3px 9px; border-radius:99px;
+          border:1px solid var(--line); color:var(--dim); }
+  .pill.on { background:var(--ok); border-color:var(--ok); color:#042; }
+  .dim { color:var(--dim); }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  #banner { padding:14px; border-radius:10px; margin-bottom:12px;
+            font-weight:600; display:none; }
+  #banner.show { display:block; }
+  #steps { list-style:none; margin:0; padding:0; font-size:14px; }
+  #steps li { padding:3px 0; display:flex; gap:10px; }
+  #steps li span { color:var(--dim); margin-left:auto; }
+  #steps li.now { color:var(--warn); }
+</style>
+
+<h1>철근 결속 로봇 <span class="dim">3차년도</span>
+  <span id="link" class="dim">연결 확인 중</span></h1>
+
+<div id="banner"></div>
+
+<div class="btns">
+  <button id="homing">전체 호밍</button>
+  <button id="mission">결속 미션 시작</button>
+  <button id="stop">정 지</button>
+</div>
+
+<div class="card">
+  <h2>준비 상태</h2>
+  <div class="row"><span>호밍</span><b id="homed">—</b></div>
+  <div class="pills" id="homedpills"></div>
+  <div class="row"><span>비상정지</span><b id="estop">—</b></div>
+  <div class="row"><span>yaw 자세</span><b id="pose">—</b></div>
+  <div class="row"><span>상부 위치</span><b id="mm">—</b></div>
+</div>
+
+<div class="card">
+  <h2>호밍</h2>
+  <div class="row"><span id="hstate" class="dim">—</span><b id="haxis"></b></div>
+  <div class="row"><span id="hdetail" class="dim"></span></div>
+</div>
+
+<div class="card">
+  <h2>미션</h2>
+  <div class="row"><span id="mphase" class="dim">—</span><b id="mprog"></b></div>
+  <ul id="steps"></ul>
+  <div class="row"><span id="mdetail" class="dim"></span></div>
+</div>
+
+<div class="card">
+  <h2>주행</h2>
+  <div class="row"><span>목표 / 이동</span><b id="dmm">—</b></div>
+  <div class="row"><span>직진 이탈</span><b id="ddrift">—</b></div>
+</div>
+
+<div class="card">
+  <h2>거부 누적</h2>
+  <div class="row"><span>상부</span><b id="srej">—</b></div>
+  <div class="row"><span>주행</span><b id="drej">—</b></div>
+  <div class="row"><span id="sdetail" class="dim"></span></div>
+</div>
+
+<script>
+// 브릿지에서 받아가면(권장) 빈 문자열이면 된다 — 젯슨 IP 가 바뀌어도 안 고친다.
+// 노트북에서 파일로 열었을 때만 아래 기본값을 쓴다 (동글 WiFi, 2026-10-07).
+// ?host=http://192.168.0.12:8080 으로 덮어쓸 수 있다 — 내장 WiFi 로 붙을 때.
+const HOST = new URLSearchParams(location.search).get('host')
+          || (location.protocol === 'file:' ? 'http://192.168.0.16:8080' : '');
+
+const $ = id => document.getElementById(id);
+const STALE = 3.0;            // 초. 이보다 오래되면 통신 끊김으로 본다
+
+async function post(what) {
+  try { await fetch(HOST + '/cmd/' + what, {method:'POST'}); }
+  catch (e) { alert('명령을 보내지 못했다 — 통신 확인\n' + e); }
+}
+
+// 움직이는 명령은 두 번 눌러야 나간다. 4초 안에 다시 안 누르면 풀린다.
+function arm(btn, label, what) {
+  let t = null;
+  btn.onclick = () => {
+    if (t) { clearTimeout(t); t = null; btn.classList.remove('armed');
+             btn.textContent = label; post(what); return; }
+    btn.classList.add('armed');
+    btn.textContent = '한 번 더 눌러 실행';
+    t = setTimeout(() => { t = null; btn.classList.remove('armed');
+                           btn.textContent = label; }, 4000);
+  };
+}
+arm($('homing'),  '전체 호밍',      'homing');
+arm($('mission'), '결속 미션 시작', 'mission');
+$('stop').onclick = () => post('stop');     // 정지는 확인 없이 바로
+
+const banner = (txt, cls) => {
+  const b = $('banner');
+  b.className = txt ? 'show' : '';
+  if (txt) { b.textContent = txt; b.style.background = `var(--${cls})`;
+             b.style.color = cls === 'warn' ? '#1b1200' : '#fff'; }
+};
+
+function render(s) {
+  const age = s.age_sec || {};
+  const stale = k => !(k in age) || age[k] > STALE;
+
+  // 1. 통신 — 로봇이 멈춘 것과 UI 가 못 받는 것은 다른 문제다
+  const dead = ['homing','stage'].filter(stale);
+  $('link').textContent = dead.length ? '상태 안 옴: ' + dead.join(', ') : '연결됨';
+  $('link').className = dead.length ? 'bad' : 'ok';
+
+  const st = s.stage || {}, h = s.homing || {}, m = s.mission || {}, d = s.drive || {};
+
+  // 2. 호밍 여부 — 4개가 다 차야 완료다
+  const homed = st.homed || [];
+  $('homed').textContent = `${homed.length} / 4` + (homed.length === 4 ? ' 완료' : ' — 미완');
+  $('homed').className = homed.length === 4 ? 'ok' : 'warn';
+  $('homedpills').innerHTML = ['x','y','z','yaw'].map(a =>
+      `<span class="pill${homed.includes(a) ? ' on' : ''}">${a}</span>`).join('');
+
+  // 3. 비상정지 — 걸려 있으면 호밍도 미션도 거부된다
+  $('estop').textContent = s.estop === null || s.estop === undefined
+      ? '상태 없음' : (s.estop ? '걸림' : '해제');
+  $('estop').className = s.estop ? 'bad' : (s.estop === false ? 'ok' : 'dim');
+
+  $('pose').textContent = st.pose_detail
+      || (st.pose === 0 ? '12시' : st.pose ? st.pose + '번' : '모름');
+  const mm = st.current_mm;
+  $('mm').textContent = mm ? `X ${mm.x?.toFixed(1)}  Y ${mm.y?.toFixed(1)}  Z ${mm.z?.toFixed(1)} mm`
+                           : '호밍 전 — 알 수 없음';
+
+  $('hstate').textContent = h.state || '—';
+  $('haxis').textContent = h.axis || '';
+  $('hdetail').textContent = h.detail || '';
+  $('hdetail').className = h.state === 'failed' ? 'bad' : 'dim';
+
+  $('mphase').textContent = m.phase || '—';
+  $('mprog').textContent = m.total
+      ? `${(m.current ?? -1) + 1} / ${m.total}` : '';
+  $('steps').innerHTML = (m.steps || []).map((x, i) =>
+      `<li class="${i === m.current ? 'now' : ''}">${x.step}<span>${x.state}</span></li>`
+    ).join('');
+  $('mdetail').textContent = m.detail || '';
+  $('mdetail').className = m.phase === 'failed' ? 'bad' : 'dim';
+
+  $('dmm').textContent = d.goal_mm === undefined || d.goal_mm === null ? '—'
+      : `${d.goal_mm.toFixed(0)} / ${(d.moved_mm ?? 0).toFixed(0)} mm`;
+  $('ddrift').textContent = d.drift_mm === undefined || d.drift_mm === null ? '—'
+      : d.drift_mm.toFixed(1) + ' mm';
+  $('ddrift').className = Math.abs(d.drift_mm || 0) > 20 ? 'warn' : '';
+
+  // 4. 거부 — 조용히 안 움직이는 경우의 대부분이 거부다
+  $('srej').textContent = st.rejects ?? '—';
+  $('drej').textContent = d.rejects ?? '—';
+  $('srej').className = st.rejects ? 'warn' : '';
+  $('sdetail').textContent = st.detail || '';
+
+  // 5. 가장 중요한 한 줄만 위에 띄운다
+  if (dead.length)                 banner('장비 상태가 안 온다 — 통신·노드 확인', 'bad');
+  else if (s.estop)                banner('비상정지 걸림 — 풀어야 호밍·미션이 나간다', 'bad');
+  else if (h.state === 'failed')   banner('호밍 실패: ' + (h.detail || ''), 'bad');
+  else if (m.phase === 'failed')   banner('미션 실패: ' + (m.detail || ''), 'bad');
+  else if (homed.length < 4)       banner('호밍 전이다 — 전체 호밍부터', 'warn');
+  else                             banner('', '');
+}
+
+async function tick() {
+  try { render(await (await fetch(HOST + '/state')).json()); }
+  catch (e) {
+    $('link').textContent = '브릿지 연결 안 됨';
+    $('link').className = 'bad';
+    banner('브릿지에 못 붙었다 — ui_bridge 가 떠 있는지 확인', 'bad');
+  }
+}
+tick();
+setInterval(tick, 400);          // 2~5Hz 면 충분하다
+</script>

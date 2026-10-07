@@ -8,6 +8,8 @@ setup(
     name=package_name,
     version='0.1.0',
     packages=[package_name],
+    # ui_bridge 가 __file__ 옆에서 찾는다. 빠지면 UI 가 500 을 낸다
+    package_data={package_name: ['ui_page.html']},
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
@@ -45,6 +47,10 @@ setup(
             # L4 — 웨이포인트 미션을 순서대로 실행한다. 시연은 자율이 아니라
             # 미리 정한 순서로 간다 ('tie' / 'drive <mm>' / 'lateral <회전>').
             'navigator = rmd_robot_control.navigator:main',
+            # UI — 노트북 브라우저에서 호밍·미션·정지. 공유기를 거치면
+            # DDS 멀티캐스트 탐색이 막히는 일이 흔해서 HTTP(유니캐스트)로
+            # 중계한다. 노트북에 ROS 2 를 깔 필요도 없다.
+            'ui_bridge = rmd_robot_control.ui_bridge:main',
         ],
     },
 )
