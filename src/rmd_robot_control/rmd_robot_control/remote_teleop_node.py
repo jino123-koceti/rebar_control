@@ -26,11 +26,14 @@
   S14   누르고 있는 동안 Z축 하강   → /joint_5/speed (0x147)
   S23   토글할 때마다 yaw 자세 **한 단계 위로** (1→2→3→4)  → /stage/yaw_pose
   S24   토글할 때마다 yaw 자세 **한 단계 아래로** (4→3→2→1) → /stage/yaw_pose
+  S21   **전체 호밍 시작** → /homing_cmd "all"
+  S22   **호밍 정지**     → /homing_cmd "stop"
+        ⚠ 리모콘으로 시작하는 것이 웹 UI 보다 안전하다 — 비상정지를 쥔 사람이
+          시작하게 된다. 축별 호밍은 넣지 않는다 (프레임끼리 부딪힌다).
 
   비상정지 → 전 축 정지. `remote_bridge` 가 판정해서 넘겨준다.
   송신기 꺼짐·START 전(DATA[0]=0x00)도 비상정지로 들어온다.
 
-  미구현: S21/S22(작업 시퀀스)
 ──────────────────────────────────────────────────────────────────────────
 
 Z축 주의: 리프팅축이라 브레이크를 풀면 자중으로 내려앉을 수 있다. 브레이크 해제는
@@ -144,6 +147,9 @@ class RemoteTeleop(Node):
         # yaw 자세 변경 (S23/S24) — 회전은 stage_node 가 한다
         self.pose_id = load_pose_id('yaw')
         self.yaw_pose_pub = self.create_publisher(Int32, '/stage/yaw_pose', 10)
+        # 호밍 시작/정지 (S21/S22). ⚠ 'all' 과 'stop' 만 보낸다 — 축 이름은
+        #   `homing_node` 가 거부하고, 애초에 축별 호밍은 프레임을 친다.
+        self.homing_pub = self.create_publisher(String, '/homing_cmd', 10)
         self.stage = None
         self.create_subscription(String, '/stage/status', self._on_stage, 10)
         self._pose_noted = set()
@@ -153,7 +159,6 @@ class RemoteTeleop(Node):
         self.prev = {n: False for n in BUTTON_ORDER}
         self.lat_busy = False
         self.lat_started = 0.0
-        self._warned = set()
         self._last_note = None
         # 중재기가 없으면 예전처럼 동작한다 (이 변경만으로 시스템이 멈추면 안 된다)
         self._has_control = True
@@ -364,11 +369,23 @@ class RemoteTeleop(Node):
             if btn[name] and not self.prev[name]:
                 self._step_pose(up)
 
-        # 미구현 토글은 한 번만 알린다
-        for name, why in (('S21', '작업 시퀀스 미구현'), ('S22', '작업 시퀀스 미구현')):
-            if btn[name] and name not in self._warned:
-                self._warned.add(name)
-                self.get_logger().warning(f"{name}: {why}")
+        # 호밍 — 누른 순간에만 (토글 에지)
+        # ⚠⚠ **리모콘으로 시작하는 것이 웹 UI 보다 안전하다** (2026-10-07 사용자
+        #   요청): 리모콘을 손에 든 사람이 비상정지를 쥐고 시작하게 된다. 웹 UI 는
+        #   와이파이→HTTP→ROS 를 거쳐 정지가 느리고 통신이 끊기면 안 간다.
+        # ⚠ **항상 전체 호밍**이다. 축을 골라 돌리면 자세별 간섭 구간이 달라
+        #   프레임끼리 부딪힌다 (`/homing_cmd x` 하나로 실제로 쳤다).
+        # ⚠ S22 는 **정지**다. 시작 버튼만 두고 정지를 안 두면 안 된다 — 멈추는
+        #   쪽은 언제나 안전한 방향이라 같이 넣었다.
+        for name, cmd, label in (('S21', 'all', '전체 호밍 시작'),
+                                 ('S22', 'stop', '호밍 정지')):
+            if btn[name] and not self.prev[name]:
+                if self.homing_pub.get_subscription_count() == 0:
+                    self.get_logger().warning(
+                        f"{name}: /homing_cmd 구독자 없음 — homing_node 확인")
+                else:
+                    self.homing_pub.publish(String(data=cmd))
+                    self.get_logger().warning(f"{name}: {label} (리모콘)")
 
         self.prev = btn
         self._note(f"Remote  주행 {lin:+.2f}/{ang:+.2f}  "

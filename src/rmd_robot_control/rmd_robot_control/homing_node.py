@@ -513,8 +513,20 @@ class HomingNode(Node):
         if sign is None:
             self.get_logger().info(f'비전 점검 보류 — {why} ({info})')
             return None
+        # ⚠⚠ [2026-10-07 정정] **모호 구간 밖에서는 거부하지 않는다.**
+        #   `pick_sign` 은 "별칭 후보 **둘 중** 고르기" 용이고 "건 각도가 음수냐" 를
+        #   재는 범용 검출기가 아니다. 그 경계는 후보쌍이 구조적으로 갈리는 것을
+        #   전제로 잡혀 있다. 처음엔 이 구분 없이 비교했다가 **12시(건 +0.28°)에서
+        #   호밍이 거부됐다** — 거기서는 g 의 부호 자체가 무의미하다(±0.3° 는 잡음).
+        #   모호 구간은 `|건| ≥ 9.0°` 다 (구동범위 [-19.8,+18.2], 주기 28.8° 에서
+        #   유도 — `yaw_pose_vision` 머리말 참고). 그 밖에서는 **기록만** 한다.
+        AMB_GUN = 9.0
         msg = (f'비전 점검: 엔코더 건 {g:+.2f}° vs 비전 '
                f'{"음수" if sign < 0 else "양수"}각 · {info}')
+        if abs(g) < AMB_GUN:
+            self.get_logger().info(
+                msg + f' → 판정 대상 아님 (|건| < {AMB_GUN:.1f}°, 기록만)')
+            return None
         if (sign < 0) == (g < 0):
             self.get_logger().info(msg + ' → 일치')
             return True
