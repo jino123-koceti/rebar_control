@@ -23,16 +23,26 @@ systemd `rebar-teleop.service` 가 이 파일을 띄운다. 전원만 넣으면 
         기본으로 켜두면 "갑자기 아무것도 안 움직인다" 가 된다.
         실장비에서 범퍼·STOP·비상정지 차단을 확인한 뒤 true 로 바꿀 것.
   lateral_speed_dps, lateral_i_hard_a, lateral_max_torque   횡이동 파라미터
+  use_camera:=true|false   작업영역 카메라(Gemini 2L) 를 같이 띄울지 (기본 true)
+      yaw 자세 **별칭 판정**에 쓴다 — 1번·4번은 단회전만으로 못 가려서, X 호밍
+      뒤 영상 한 장으로 후보 둘 중 하나를 고른다. 이게 있어야 사용자가 전원
+      투입 때마다 yaw 를 12시로 맞추지 않아도 호밍이 돈다.
+      ⚠ 카메라가 없어도 **호밍 자체는 돈다** — 비전은 별칭일 때만 부르는 보조
+        수단이고, 없으면 기존 거부 경로(12시로 옮기거나 선언)로 간다.
 """
 
 import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, LogInfo
+from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription,
+                            LogInfo)
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import (LaunchConfiguration, PathJoinSubstitution,
+                                  PythonExpression)
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
@@ -54,6 +64,12 @@ def generate_launch_description():
         DeclareLaunchArgument('lateral_speed_dps', default_value='50'),
         DeclareLaunchArgument('lateral_i_hard_a', default_value='24.0'),
         DeclareLaunchArgument('lateral_max_torque', default_value='255'),
+        # ⚠ 기본 true 다. yaw 별칭 판정이 이 카메라에 달려 있고, 그게 "전원
+        #   투입 때마다 사람이 12시로 맞추는 일" 을 없애는 수단이기 때문이다.
+        #   카메라가 말썽이면 false 로 끄면 되고, 꺼도 호밍은 돈다 (별칭일 때만
+        #   거부되어 기존 경로로 간다).
+        DeclareLaunchArgument('use_camera', default_value='true',
+                              description='작업영역 카메라(Gemini 2L) 동시 기동'),
     ]
 
     motor = Node(
@@ -283,9 +299,35 @@ def generate_launch_description():
         respawn=True, respawn_delay=2.0,
     )
 
+    # ── 작업영역 카메라 (Gemini 2L) ──────────────────────────────────────
+    # ⚠⚠ **serial_number 가 없으면 안 된다.** Orbbec 305 두 대도 같은 벤더라
+    #   serial 없이 띄우면 SDK 가 305 를 열고, 305 에는 이 프로파일이 없어
+    #   거부한다. 그때 메시지가 "USB 2.0 으로 연결된 것 같다" 라서 대역폭 문제로
+    #   오진하기 쉽다 (2026-10-04 에 그렇게 두 번 헛짚었다 — 허브는 멀쩡했다).
+    # ⚠ 해상도·fps 는 USB 2.0 에서 **둘 다 흐르는** 조합이다. 모자라면 fps 가
+    #   떨어지는 게 아니라 **스트림이 아예 안 열린다** (UVC 가 대역폭을 미리
+    #   예약한다). depth 640x400@10 + color 1280x800@10 → 둘 다 약 9.9fps.
+    camera = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            PathJoinSubstitution([FindPackageShare('orbbec_camera'),
+                                  'launch', 'gemini2L.launch.py'])
+        ]),
+        launch_arguments={
+            'serial_number': 'CPAV563008Y',
+            'depth_registration': 'true',
+            'depth_width': '640', 'depth_height': '400', 'depth_fps': '10',
+            'color_width': '1280', 'color_height': '800', 'color_fps': '10',
+            'enable_ir': 'false',
+            'enable_left_ir': 'false', 'enable_right_ir': 'false',
+            'enable_point_cloud': 'false',
+            'enable_colored_point_cloud': 'false',
+        }.items(),
+        condition=IfCondition(LaunchConfiguration('use_camera')),
+    )
+
     return LaunchDescription(args + [
         LogInfo(msg=['리모콘 조작 구성 기동 — 안전 차단: ', use_safety,
                      ' / 호밍은 자동으로 돌지 않는다 (/homing_cmd 로 시작)']),
         motor, lateral, remote_bridge, remote_teleop, ezi_io, safety, mode_arbiter,
-        homing, stage, tying, planner,
+        homing, stage, tying, planner, camera,
     ])
