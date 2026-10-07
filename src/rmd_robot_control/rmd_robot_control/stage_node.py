@@ -757,13 +757,29 @@ class StageNode(Node):
         if self.yaw_moving:
             if 'z' in want:
                 return self._reject('회전 중에는 Z 를 받지 않는다 (건이 원을 그린다)')
+            # ⚠ [2026-10-07] **거부하지 않고 창 안으로 끼운다.** 전에는 거부했는데,
+            #   거부를 상위(`tying_sequence`)가 중단으로 받아 **결속점 하나가 통째로
+            #   죽었다** — 실제로 x=373.8mm 가 창 상한 373.2mm 를 **0.6mm** 넘겨
+            #   4번 자세 점이 하강도 못 하고 실패했다. 0.6mm 로 점을 버리는 것은
+            #   과한 처벌이다.
+            #   클램프가 안전한 근거: 창은 지나가는 자세들의 교집합이고 **박스는
+            #   볼록**하므로, 창 안의 어느 점이든 모든 중간 자세에서 안전하다.
+            #   남은 거리는 회전이 끝난 뒤 `MOVE_XY` 가 간다 (시퀀스가 그렇게 짜여 있다).
             win = self.yaw_win
             if win:
+                cut = []
                 for ax in ('x', 'y'):
-                    if ax in want and not (win[ax][0] <= want[ax] <= win[ax][1]):
-                        return self._reject(
-                            f'회전 중 {ax}={want[ax]:.1f}mm 는 회전 안전창 '
-                            f'{win[ax][0]:.1f}~{win[ax][1]:.1f}mm 밖이다')
+                    if ax not in want:
+                        continue
+                    lo, hi = win[ax]
+                    v = min(max(want[ax], lo), hi)
+                    if abs(v - want[ax]) > 1e-6:
+                        cut.append(f'{ax} {want[ax]:.1f}→{v:.1f}mm')
+                        want[ax] = v
+                if cut:
+                    self.get_logger().info(
+                        f"회전 안전창으로 끼움: {', '.join(cut)} "
+                        f"(나머지는 회전 후에 간다)")
             return self._merge(want)
 
         self._begin(want, 'mm')
@@ -1154,6 +1170,14 @@ class StageNode(Node):
             'yaw_anchor': self.yaw_anchor_src or None,
             'pose_want': want,            # 지금 위치에서 결속할 자세
             'pose_want_why': want_why,
+            # ⚠ [2026-10-07] 회전 안전창을 **발행한다.** 전에는 상위가 같은 창을
+            #   `transit_window()` 로 **따로 계산**했는데, 회전이 시작된 뒤에
+            #   현재 자세를 읽어서 다른 값이 나왔다(못 읽으면 목표자세 단독 창으로
+            #   폴백 — 교집합보다 넓다). 그 넓은 창에 맞춘 목표를 여기서 거부해
+            #   결속점이 죽었다. **강제하는 쪽이 값을 내보내고 상위가 그것을 쓴다.**
+            'yaw_win': ({k: [round(v[0], 1), round(v[1], 1)]
+                         for k, v in self.yaw_win.items()}
+                        if (self.yaw_moving and self.yaw_win) else None),
             'limit_mm': lim,              # 지금 자세에서 갈 수 있는 X·Y 범위
             'limit_why': lim_why,         # 그 범위가 어디서 왔는가
             'enforce_envelope': self.enforce,

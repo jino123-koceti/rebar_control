@@ -408,8 +408,12 @@ class PositionControlNode(Node):
         #   `motor_ids` 순서를 알아야 집을 수 있다 (2026-10-04 에 0x141 부터로
         #   가정해 두 칸 틀렸고, Z 전류를 0 으로 오진했다). 축별 소비자는 이
         #   토픽을 쓴다.
-        # ⚠ 0x145(X) 는 온도 필드가 0xEC 고정인 불량 개체다 — 전류는 쓸 수 있으나
-        #   0.9A 오프셋이 있다. 절대값보다 **증가분**으로 판단해야 한다.
+        # [갱신 2026-10-06] 0x145(X) 의 "온도 0xEC 고정 / 전류 0.9A 오프셋" 은
+        #   **죽은 X4-10 개체의 결함**이었다. X4-36 으로 교체한 뒤 온도는 28~31°C 로
+        #   정상이고 유휴 전류도 0.13A 다 → X 도 온도 기반 보호를 쓸 수 있다.
+        #   ⚠ 다만 감속비가 12.5 → 36 으로 바뀌어 **같은 힘에 전류가 2.88배 덜
+        #   흐른다.** 런치의 `collide_current_a_x` 4.8A 는 그대로면 걸리지 않는다 —
+        #   실측해서 내려야 한다 (`tools/motor/accel_sweep.py` 가 구간별 피크를 준다).
         self.current_pubs = {
             mid: self.create_publisher(Float32, f"motor_{hex(mid)}/current", 10)
             for mid in self.motor_ids

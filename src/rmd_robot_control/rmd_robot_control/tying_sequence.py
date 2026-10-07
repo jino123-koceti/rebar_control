@@ -515,8 +515,18 @@ class TyingSequence(Node):
             return
         # 회전이 시작된 뒤 **한 번** XY 를 창 안쪽 목표로 보낸다
         if self._yaw_turning() and not self._xy_in_win:
-            win, _passed = transit_window(self.env, self.pose_id,
-                                          self._pose(), self.want_pose)
+            # ⚠ [2026-10-07] **강제하는 쪽(`stage_node`)이 발행한 창을 먼저 쓴다.**
+            #   전에는 여기서 `transit_window()` 로 다시 계산했는데, 회전이 **시작된
+            #   뒤**의 현재 자세로 계산해 stage_node 가 접수 시점에 잡은 창과 달라졌다.
+            #   현재 자세를 못 읽으면 목표자세 단독 창으로 폴백했고 그건 교집합보다
+            #   **넓어서**, 거기 맞춰 보낸 목표를 stage_node 가 거부했다 — 4번 자세
+            #   결속점이 0.6mm 때문에 하강도 못 하고 죽었다.
+            pub = (self.stage or {}).get('yaw_win')
+            win = ({k: (float(v[0]), float(v[1])) for k, v in pub.items()}
+                   if isinstance(pub, dict) and pub else None)
+            if not win:
+                win, _passed = transit_window(self.env, self.pose_id,
+                                              self._pose(), self.want_pose)
             if not win:
                 win, _passed = transit_window(
                     self.env, self.pose_id, self.want_pose, self.want_pose)

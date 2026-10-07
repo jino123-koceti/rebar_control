@@ -135,6 +135,24 @@ def generate_launch_description():
     homing = Node(
         package='rmd_robot_control', executable='homing_node',
         name='homing_node', output='screen',
+        parameters=[{
+            # ⚠ [2026-10-06] 40 → 90 초. **세 선형축 모두 전 행정이 51~52초**인데
+            #   축당 타임아웃이 40초였다 — 리미트에서 멀면 도달 전에 실패한다.
+            #     탐색 30dps(출력축) × mm_per_deg →
+            #       X 8.72mm/s × 453.7mm = 52초
+            #       Y 6.68mm/s × 349.1mm = 52초
+            #       Z 2.72mm/s × 139.2mm = 51초
+            #   지금까지 안 터진 건 보통 리미트 근처에서 시작했기 때문이다
+            #   (2026-10-06 Z 통과도 z_min 이 이미 True 라 후퇴만 했다).
+            #   런치 아래쪽 `move_speed_dps` 주석에 이 52초 계산이 이미 적혀 있었는데
+            #   `stage_node` 만 30→60 으로 올리고 homing_node 는 놓쳤다.
+            # 속도를 올리는 대신 타임아웃을 올린 이유: **잼 감시가 별개로 걸려 있다.**
+            #   `stall_sec 4.0` / `stall_deg 0.8°` 로 축이 막히면 4초에 잡히므로
+            #   타임아웃은 중복 안전망이고, 늘려도 잼 보호는 그대로다. 반대로 탐색
+            #   속도를 올리면 리미트를 더 세게 지나친다 (X 는 감속이 139dps/s 라
+            #   90dps 에서 8.4mm 오버슈트 — 가속을 올린 뒤에 손대야 한다).
+            'axis_timeout_sec': 90.0,
+        }],
         respawn=True, respawn_delay=2.0,
     )
     stage = Node(
@@ -197,7 +215,20 @@ def generate_launch_description():
             #   문턱은 실측 정상 변동폭 위여야 한다 (Z 하강 0.9A · X 0.8A).
             'collide_rise_a_x': 1.5,
             'collide_rise_a_y': 1.2,
-            'collide_rise_a_z': 1.0,
+            # ⚠ [2026-10-07] Z 1.0 → 0.6A. 실장비에서 **실제 접촉이 있었는데 감지가
+            #   늦었다**(사용자 확인). Z 는 `down_only` 라 상승 중엔 판정하지 않고
+            #   평상시 전류가 0.46A(호밍 실측)로 낮아 여유가 있다.
+            'collide_rise_a_z': 0.6,
+            # ⚠ [2026-10-07] 감지 지연을 줄인 두 값.
+            #   전류 표본은 `0xA4` 응답으로만 갱신되고 `tick` 이 20Hz(50ms)라,
+            #   연속 2회를 요구하면 **최소 100ms** 가 걸린다. Z 가 20mm/s 면 그동안
+            #   2mm 더 들어가고, 거기에 기준선 EMA 가 접촉의 완만한 상승을 따라가며
+            #   상승분을 깎아 실제로는 더 늦는다.
+            #     rise_samples 2 → 1   : 지연 100ms → 50ms
+            #     base_tau 0.6 → 0.3s : 기준선이 접촉을 덜 따라간다
+            #   헛트립이 나면 rise_samples 를 2 로 되돌린다 (그게 먼저 조절할 값).
+            'collide_rise_samples': 1,
+            'collide_base_tau_sec': 0.3,
             # ⚠⚠ Z 는 **내려갈 때만** 판정한다. 올릴 때도 걸려서 결속점 3개가
             #   전부 실패했다 — 위에는 부딪힐 것이 없고, 건이 철근에 걸려
             #   빠져나올 때 전류가 오르는 것은 정상이다.
