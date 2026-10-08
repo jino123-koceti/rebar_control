@@ -117,14 +117,8 @@ class Navigator(Node):
         self.overlap_kinds = tuple(
             self.get_parameter('drive_overlap_kinds').value or ())
 
-        self.steps, bad = [], None
-        path = str(self.get_parameter('path_file').value or '')
-        try:
-            texts = (self._from_path(path) if path
-                     else (self.get_parameter('mission').value or []))
-            self.steps = [Step(t) for t in texts]
-        except (ValueError, OSError) as e:
-            bad = str(e)
+        self.steps = []
+        bad = self._load_steps()
 
         self.drive_pub = self.create_publisher(Float32, '/drive/step', 10)
         self.plan_pub = self.create_publisher(Empty, '/plan/start', 10)
@@ -165,6 +159,28 @@ class Navigator(Node):
                 + ' → '.join(s.text for s in self.steps))
 
     # ---- 경로 파일 ---------------------------------------------------------
+    def _load_steps(self):
+        """`path_file` 을 읽어 단계 목록을 만든다. 실패 사유 문자열 또는 None.
+
+        ⚠⚠ [2026-10-08] **미션 시작마다 다시 읽는다.** 예전에는 `__init__` 에서
+        한 번만 읽어서, `ros2 param set /navigator path_file` 로 경로를 바꿔도
+        **조용히 안 먹었다** (옛 단계 목록이 그대로 남는다). 전진왕복
+        (`test_path.txt`)과 사각형(`test_path_rect.txt`)을 오가려면 그때마다
+        서비스를 재시작하고 재호밍해야 했다.
+        같은 함정을 `tying_planner` 의 캘리브레이션 모델에서도 겪었다 — 거기도
+        기동 때 읽은 값이 남아 고친 모델로 돌지 않았다.
+        ⚠ 읽기에 실패하면 **쓰던 단계를 유지한다** — 비우면 미션이 "비어 있다"
+          로 죽는다. 사유는 돌려주어 호출부가 로그에 남긴다.
+        """
+        path = str(self.get_parameter('path_file').value or '')
+        try:
+            texts = (self._from_path(path) if path
+                     else (self.get_parameter('mission').value or []))
+            self.steps = [Step(t) for t in texts]
+            return None
+        except (ValueError, OSError) as e:
+            return str(e)
+
     def _from_path(self, path):
         """`번호, x, y` (mm) 목록을 미션 단계로 바꾼다.
 
@@ -237,6 +253,11 @@ class Navigator(Node):
     def _start(self):
         if self.phase == 'run':
             return self.get_logger().warning('이미 실행 중이다')
+        # 경로를 **여기서 다시 읽는다** (위 `_load_steps` 주석 참고)
+        bad = self._load_steps()
+        if bad:
+            self.get_logger().warning(f'경로를 다시 읽지 못했다 — {bad}. '
+                                      '쓰던 단계로 진행한다')
         if not self.steps:
             return self._fail('미션이 비어 있다')
         self.cur = -1
