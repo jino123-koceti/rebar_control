@@ -66,6 +66,7 @@ class PololuNode(Node):
                     self.get_logger().error(msg)
                 else:
                     self.get_logger().info(msg)
+        self._diag_done = False      # 첫 구동에서 한 번만 전체 진단을 남긴다
         self.get_logger().info('Pololu node started successfully')
     
     def velocity_callback(self, msg, motor_id):
@@ -88,14 +89,19 @@ class PololuNode(Node):
                     self.get_logger().warning(
                         f'Motor {motor_id}: 보드 상태를 못 읽었다 — '
                         '응답 없음 (배선·전원 확인)')
-                else:
-                    # 보드가 무엇을 하고 있다고 생각하는지 (`diagnostics` 주석 참고)
+                elif not self._diag_done:
+                    # ⚠ 첫 구동에서 한 번만 (발사마다면 직렬 왕복 5회가 더 붙는다).
+                    #   2026-10-08: 목표·현재 ±3200 인데 VIN·온도가 꿈쩍 안 해서
+                    #   전류 미흐름 = 보드 바깥으로 가렸다 (출력 배선 오류였다).
+                    #   전류 변수는 이 컨트롤러에 아예 없다 (0J44 §6.4).
+                    self._diag_done = True
                     d = motor.diagnostics()
                     self.get_logger().info(
-                        f'Motor {motor_id}: 보드 상태 — 목표 {d["target"]} / '
+                        f'Motor {motor_id}: 첫 구동 보드 상태 — 목표 {d["target"]} / '
                         f'현재 {d["speed"]} / VIN {d["vin_mv"]}mV / '
                         f'{d["temp_c"]}°C / limit 0x'
-                        + ('----' if d['limit'] is None else f'{d["limit"]:04X}'))
+                        + ('----' if d['limit'] is None else f'{d["limit"]:04X}')
+                        + '  (VIN 이 안 처지고 온도가 안 오르면 전류가 안 흐른다)')
                 if err:
                     self.get_logger().error(
                         f'Motor {motor_id}: **보드 에러 0x{err:04X} '
