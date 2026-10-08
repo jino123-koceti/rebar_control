@@ -42,6 +42,13 @@ COMPACT_GET_VAR = b'\xA1'  # Get Variable (Compact)
 VAR_ERROR_STATUS = 0        # 지금 걸려 있는 에러 (이게 0 이 아니면 안 움직인다)
 VAR_ERRORS_OCCURRED = 1     # 걸렸던 적이 있는 에러 (읽으면 지워진다)
 VAR_LIMIT_STATUS = 3        # 리미트·킬 스위치 상태
+# ⚠ 아래 네 개가 "보드가 무시하는가 / 보드는 돌리는데 바깥이 안 도는가" 를 가른다.
+#   Target Speed 가 0 이면 보드가 우리 명령을 **안 받아들인 것**이고(입력 모드가
+#   Serial/USB 가 아니거나 safe-start), ±3200 인데 안 움직이면 **보드 바깥**이다.
+VAR_TARGET_SPEED = 20       # 목표 속도 (-3200~3200, 부호있음)
+VAR_SPEED = 21              # 현재 속도 (-3200~3200, 부호있음)
+VAR_INPUT_VOLTAGE = 23      # VIN (mV)
+VAR_TEMPERATURE = 24        # 온도 (0.1°C)
 
 # Error Status / Errors Occurred 비트 (Pololu 0J44 문서)
 ERROR_FLAGS = (
@@ -242,6 +249,27 @@ class Daisy(object):
     def errors_occurred(self):
         """걸렸던 적 있는 에러 비트. **읽으면 보드에서 지워진다.**"""
         return self.get_variable(VAR_ERRORS_OCCURRED)
+
+    @staticmethod
+    def _signed(v):
+        """16비트 무부호 → 부호있는 값."""
+        return None if v is None else (v - 65536 if v >= 32768 else v)
+
+    def diagnostics(self):
+        """보드가 **지금 무엇을 하고 있다고 생각하는지**. 못 읽으면 값이 None.
+
+        ⚠ 변수 번호는 Pololu 0J44 문서 기준이다 (20 목표속도 / 21 현재속도 /
+          23 VIN mV / 24 온도 0.1°C). 번호가 틀리면 값이 엉뚱하게 나오므로
+          **VIN 을 실제 공급전압과 대조해 번호가 맞는지 먼저 확인할 것.**
+        """
+        return {
+            'target': self._signed(self.get_variable(VAR_TARGET_SPEED)),
+            'speed': self._signed(self.get_variable(VAR_SPEED)),
+            'vin_mv': self.get_variable(VAR_INPUT_VOLTAGE),
+            'temp_c': (lambda t: None if t is None else t / 10.0)(
+                self.get_variable(VAR_TEMPERATURE)),
+            'limit': self.get_variable(VAR_LIMIT_STATUS),
+        }
 
     def drive(self, speed):
         """Drive motor in direction based on speed (-3200, 3200)

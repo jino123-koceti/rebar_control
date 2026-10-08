@@ -79,20 +79,24 @@ class PololuNode(Node):
             motor.drive(speed)
 
             # ⚠⚠ [2026-10-08] **보드에 에러가 걸렸는지 물어본다.**
-            #   Simple Motor Controller 는 에러가 걸리면 속도 명령을 **조용히
-            #   무시한다** — 쓰기는 성공하므로 로그에 아무 흔적이 없다. 실제로
-            #   그 때문에 결속 미션이 "성공" 으로 보고하면서 한 발도 안 당겼다.
-            #   시연에서 트리거가 안 먹으면 결속 자체가 안 되므로, **움직이라고
-            #   한 순간에** 보드 상태를 확인해 경고로 올린다.
-            #   정지 명령(speed 0)에는 묻지 않는다 — 정지는 안전쪽이고 직렬
-            #   왕복을 발사 흐름에 두 번 더 넣을 이유가 없다.
+            #   에러가 걸리면 속도 명령을 **조용히 무시한다** — 쓰기는 성공하므로
+            #   로그에 흔적이 없고, 그 때문에 결속 미션이 "성공" 으로 보고하면서
+            #   한 발도 안 당겼다. 정지 명령에는 묻지 않는다 (안전쪽이다).
             if speed != 0:
                 err = motor.error_status()
                 if err is None:
                     self.get_logger().warning(
                         f'Motor {motor_id}: 보드 상태를 못 읽었다 — '
                         '응답 없음 (배선·전원 확인)')
-                elif err:
+                else:
+                    # 보드가 무엇을 하고 있다고 생각하는지 (`diagnostics` 주석 참고)
+                    d = motor.diagnostics()
+                    self.get_logger().info(
+                        f'Motor {motor_id}: 보드 상태 — 목표 {d["target"]} / '
+                        f'현재 {d["speed"]} / VIN {d["vin_mv"]}mV / '
+                        f'{d["temp_c"]}°C / limit 0x'
+                        + ('----' if d['limit'] is None else f'{d["limit"]:04X}'))
+                if err:
                     self.get_logger().error(
                         f'Motor {motor_id}: **보드 에러 0x{err:04X} '
                         f'[{decode_errors(err)}] — 이 상태에서는 속도 명령이 '
