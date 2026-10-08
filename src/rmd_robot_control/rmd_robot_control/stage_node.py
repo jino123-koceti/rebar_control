@@ -509,14 +509,36 @@ class StageNode(Node):
         self._publish_status()
 
     def _measured_gun(self, pose):
-        """단회전이 유일하게 갈리고 그 자세와 맞으면 **실측 각도**, 아니면 None.
+        """그 자세에 서 있다고 **아는** 상태에서 단회전으로 읽은 **실측 각도**.
+        읽을 수 없으면 None.
 
         공칭 각도보다 정확하다 (위 `_anchor` 참고). 자세가 다르게 나오면 쓰지
         않는다 — 엉뚱한 각도를 기준점으로 박는 것이 더 나쁘다.
+
+        ⚠⚠ [2026-10-08] **별칭 자세(1번·4번)도 각도는 읽을 수 있다.**
+        `identify_pose` 가 거부하는 것은 "1번인가 4번인가" 뿐이고, 각도 후보는
+        `candidates` 로 함께 돌려준다. **자세는 이 함수의 인자로 이미 주어졌으므로**
+        후보 중 그 자세 공칭에 맞는 것을 고르면 된다. 별칭 간격이 28.8° 인데
+        자세 허용오차는 1.5° 이므로 맞는 후보는 **항상 하나뿐**이다 — 엉뚱한
+        가지를 고를 수 없다 (하나가 아니면 포기한다).
+
+        왜 필요한가 — 공칭으로 덮는 동안 1번 자세는 보고 오차가 늘 0.00° 였지만
+        멀티턴으로 복원한 실제 각도는 2026-10-08 하루에 **1.52°(건끝 16.7mm)**
+        를 오갔고 회전마다 한 방향으로 쌓였다 (참값을 버리니 다음 회전 목표가
+        틀린 값에서 계산된다). 실측되는 2번·3번은 0.65° / 0.04° 였다.
         """
         got, info = identify_pose(self.pose_id, self.yaw_single)
         if got == pose and isinstance(info, dict):
             return info.get('gun_now')
+        if isinstance(info, dict) and info.get('ambiguous'):
+            want = ((self.pose_id or {}).get('poses') or {}).get(pose, {}).get('gun')
+            tol = (self.pose_id or {}).get('tol_gun')
+            if want is None or tol is None:
+                return None
+            near = [g for g in (info.get('candidates') or [])
+                    if abs(g - want) <= tol]
+            if len(near) == 1:
+                return near[0]
         return None
 
     def gun_now(self):
