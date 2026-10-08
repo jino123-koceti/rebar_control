@@ -436,6 +436,14 @@ def generate_launch_description():
     # `path_file` 을 읽어 `drive`/`tie`/`lateral` 단계로 풀고 순서대로 돌린다.
     # 시작은 `/mission/start`. ⚠ 비워 두면 경로를 안 읽고 `mission` 파라미터
     # (기본 `['tie']`)만 돈다 — 리허설에서 "주행을 안 한다" 로 보인다.
+    # ⚠ `rmd_share` 는 `<ws>/install/rmd_robot_control/share/rmd_robot_control`
+    #   이라 **4단계** 올라가야 워크스페이스 뿌리다. 3단계만 올라갔다가
+    #   `install/src/...` 가 나와 파일을 못 찾았다 — 그러면 navigator 가 조용히
+    #   `mission` 기본값(`['tie']`)만 돌아 **"주행을 안 한다"** 로 보인다.
+    _paths = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.dirname(rmd_share)))),
+        'src', 'rebar_control', 'path_generation')
     navigator = Node(
         package='rmd_robot_control', executable='navigator',
         name='navigator', output='screen',
@@ -444,10 +452,16 @@ def generate_launch_description():
             #   이라 **4단계** 올라가야 워크스페이스 뿌리다. 3단계만 올라갔다가
             #   `install/src/...` 가 나와 파일을 못 찾았다 — 그러면 navigator 가
             #   조용히 `mission` 기본값(`['tie']`)만 돌아 **"주행을 안 한다"** 로 보인다.
-            'path_file': os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(
-                    os.path.dirname(rmd_share)))),
-                'src', 'rebar_control', 'path_generation', 'test_path.txt'),
+            'path_file': os.path.join(_paths, 'test_path.txt'),
+            # ⚠⚠ [2026-10-08] **이름 → 파일 맵.** 웹 UI 가 `/mission/path` 로
+            #   이름만 보내고 navigator 가 이 맵으로 바꿔 읽는다. 맵이 비면
+            #   UI 선택이 "파일이 없다" 로 거부된다.
+            #   순서가 짝이다 — `path_named[i]` 가 `path_files[i]` 다.
+            'path_named': ['line', 'rect'],
+            'path_files': [os.path.join(_paths, 'test_path.txt'),
+                           os.path.join(_paths, 'test_path_rect.txt')],
+            # 반복은 기본 꺼짐 — 켜고 끄는 것은 UI(`/mission/repeat`) 다.
+            'repeat': False,
         }],
         condition=IfCondition(LaunchConfiguration('use_mission')),
         respawn=True, respawn_delay=2.0,

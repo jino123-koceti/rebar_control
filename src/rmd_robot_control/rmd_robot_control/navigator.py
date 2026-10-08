@@ -42,11 +42,13 @@
 """
 
 import json
+import os
 import time
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Empty, Float32, Int32, String
+from rclpy.parameter import Parameter
+from std_msgs.msg import Bool, Empty, Float32, Int32, String
 from rebar_base_interfaces.msg import SafetyState
 
 
@@ -89,6 +91,16 @@ class Navigator(Node):
         #   바뀌는 구간은 거부한다 (조용히 둘로 쪼개면 경로가 사람 의도와
         #   달라질 수 있다 — 어느 쪽을 먼저 갈지는 공간이 정한다).
         self.declare_parameter('path_file', '')
+        # ⚠⚠ [2026-10-08] **경로를 이름으로 고른다** (`/mission/path`, 웹 UI 용).
+        #   파라미터 서비스를 쓰지 않는 이유: 이 노드 묶음은 전부 토픽 기반이고,
+        #   UI 에서 파라미터 서비스를 부르면 타임아웃·블로킹을 또 다뤄야 한다.
+        #   이름 → 파일 맵을 런치가 주고, UI 는 이름만 보낸다.
+        self.declare_parameter('path_named', ['line', 'rect'])
+        self.declare_parameter('path_files', ['', ''])
+        # 경로를 끝까지 돌면 **다시 처음부터** 돈다 (`/mission/repeat`, 웹 UI 용).
+        # ⚠ 중단·안전정지는 반복을 끊는다 — 실패를 무한히 되풀이하면 사람이
+        #   멈추기 전까지 같은 사고를 반복한다.
+        self.declare_parameter('repeat', False)
         self.declare_parameter('tie_at_waypoints', True)
         self.declare_parameter('lateral_mm_per_turn', 100.0)
         self.declare_parameter('lateral_max_turns', 4)
@@ -117,6 +129,12 @@ class Navigator(Node):
         self.overlap_kinds = tuple(
             self.get_parameter('drive_overlap_kinds').value or ())
 
+        names = list(self.get_parameter('path_named').value or [])
+        files = list(self.get_parameter('path_files').value or [])
+        self.paths = {n: f for n, f in zip(names, files) if n and f}
+        self.path_name = None       # 지금 고른 이름 (맵에 있으면)
+        self.repeat = bool(self.get_parameter('repeat').value)
+        self.laps = 0               # 완주 횟수 (반복 중 몇 바퀴째인지)
         self.steps = []
         bad = self._load_steps()
 
@@ -141,6 +159,10 @@ class Navigator(Node):
                                  lambda m: self._start(), 10)
         self.create_subscription(Empty, '/mission/abort',
                                  lambda m: self._abort('중단 명령'), 10)
+        self.create_subscription(String, '/mission/path',
+                                 self._on_path, 10)
+        self.create_subscription(Bool, '/mission/repeat',
+                                 self._on_repeat, 10)
 
         self.phase = 'idle'         # idle / run / done / failed
         self.cur = -1
@@ -250,8 +272,61 @@ class Navigator(Node):
         self.safety = msg
 
     # ---- 진행 --------------------------------------------------------------
-    def _start(self):
+    def _on_path(self, msg):
+        """경로를 이름(또는 절대경로)으로 바꾼다.
+
+        ⚠ **실행 중에는 바꾸지 않는다.** 단계 목록을 돌리는 중에 갈아치우면
+          `self.cur` 가 엉뚱한 단계를 가리킨다.
+        ⚠ 읽기에 실패하면 **원래 경로로 되돌린다** — 반쯤 바뀐 상태로 두면
+          다음 미션이 어느 경로로 도는지 알 수 없다.
+        """
+        want = (msg.data or '').strip()
+        if not want:
+            return
         if self.phase == 'run':
+            self.get_logger().warning(f'경로 변경 거부 — 미션 실행 중이다 ({want})')
+            return
+        path = self.paths.get(want, want)       # 이름이 아니면 경로로 본다
+        if not os.path.isfile(path):
+            self.get_logger().error(
+                f'경로를 바꾸지 못했다 — 파일이 없다: {path} '
+                f'(쓸 수 있는 이름 {sorted(self.paths)})')
+            return
+        before = str(self.get_parameter('path_file').value or '')
+        self.set_parameters([Parameter('path_file', Parameter.Type.STRING, path)])
+        bad = self._load_steps()
+        if bad:
+            self.set_parameters(
+                [Parameter('path_file', Parameter.Type.STRING, before)])
+            self._load_steps()
+            self.get_logger().error(f'경로를 바꾸지 못했다 — {bad}. 원래대로 되돌렸다')
+            return
+        self.path_name = want if want in self.paths else None
+        self.detail = f'경로 {want} — {len(self.steps)}단계'
+        self.get_logger().info(
+            f'경로 변경 — {want} ({path}) → {len(self.steps)}단계')
+        self._publish()
+
+    def _on_repeat(self, msg):
+        """반복을 켜고 끈다. **실행 중에도 바꿀 수 있다** — 끄면 지금 바퀴를
+        끝내고 멈춘다 (중간에 끊지 않는다). 켜면 다음 완주부터 이어 돈다."""
+        want = bool(msg.data)
+        if want == self.repeat:
+            return
+        self.repeat = want
+        self.get_logger().info(
+            f"반복 {'켜짐' if want else '꺼짐'}"
+            + (' — 지금 바퀴를 끝내고 멈춘다' if not want and self.phase == 'run'
+               else ''))
+        self._publish()
+
+    def _start(self, lap=False):
+        """미션을 시작한다. `lap=True` 는 **반복으로 이어 도는 재시작**이다.
+
+        ⚠ 반복 재시작은 `phase` 가 아직 'run' 이라 '이미 실행 중' 가드를 그냥
+          두면 거부된다. 그래서 그 경로만 통과시키고, 바퀴수도 유지한다.
+        """
+        if self.phase == 'run' and not lap:
             return self.get_logger().warning('이미 실행 중이다')
         # 경로를 **여기서 다시 읽는다** (위 `_load_steps` 주석 참고)
         bad = self._load_steps()
@@ -260,6 +335,8 @@ class Navigator(Node):
                                       '쓰던 단계로 진행한다')
         if not self.steps:
             return self._fail('미션이 비어 있다')
+        if not lap:
+            self.laps = 0           # 새 미션 — 바퀴수를 처음부터 센다
         self.cur = -1
         self.phase = 'run'
         for s in self.steps:
@@ -285,8 +362,17 @@ class Navigator(Node):
             self.steps[self.cur].state = '완료'
         self.cur += 1
         if self.cur >= len(self.steps):
+            self.laps += 1
+            # ⚠⚠ 반복은 **완주했을 때만** 이어간다. `_abort` 는 phase 를
+            #   'failed' 로 바꾸므로 여기에 오지 않는다 — 실패를 되풀이하지 않는다.
+            if self.repeat:
+                self.detail = (f'{len(self.steps)}단계 완료 — '
+                               f'{self.laps}바퀴, 반복 켜짐 → 다시 시작')
+                self.get_logger().info(f"[lap] {self.detail}")
+                self._publish()
+                return self._start(lap=True)
             self.phase = 'done'
-            self.detail = f'{len(self.steps)}단계 완료'
+            self.detail = f'{len(self.steps)}단계 완료 ({self.laps}바퀴)'
             self.get_logger().info(f"[done] {self.detail}")
             return self._publish()
         s = self.steps[self.cur]
@@ -423,6 +509,11 @@ class Navigator(Node):
             'current': self.cur if 0 <= self.cur < len(self.steps) else None,
             'steps': [s.as_dict() for s in self.steps],
             'detail': self.detail,
+            'path_name': self.path_name,
+            'path_file': str(self.get_parameter('path_file').value or ''),
+            'path_choices': sorted(self.paths),
+            'repeat': self.repeat,
+            'laps': self.laps,
         }, ensure_ascii=False)))
 
 

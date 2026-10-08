@@ -27,6 +27,8 @@
   POST /cmd/homing  전체 호밍
   POST /cmd/mission 미션 시작
   POST /cmd/stop    정지 (세 토픽 동시)
+  POST /cmd/path/line | /cmd/path/rect     경로 선택 (직선 왕복 / 사각형)
+  POST /cmd/repeat/on | /cmd/repeat/off    반복 켜고 끄기
 
 사용
   ros2 run rmd_robot_control ui_bridge
@@ -41,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Empty, String
+from std_msgs.msg import Bool, Empty, String
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE_FILE = os.path.join(HERE, 'ui_page.html')
@@ -65,6 +67,10 @@ class Bridge(Node):
         self.mission_pub = self.create_publisher(Empty, '/mission/start', 10)
         self.abort_pub = self.create_publisher(Empty, '/mission/abort', 10)
         self.stage_stop = self.create_publisher(Empty, '/stage/stop', 10)
+        # ⚠ 경로·반복은 **navigator 가 이름으로 받는다** (파라미터 서비스 아님).
+        #   UI 에서 파라미터 서비스를 부르면 타임아웃·블로킹을 또 다뤄야 한다.
+        self.path_pub = self.create_publisher(String, '/mission/path', 10)
+        self.repeat_pub = self.create_publisher(Bool, '/mission/repeat', 10)
 
         for key, topic in (('homing', '/homing_status'),
                            ('mission', '/mission/status'),
@@ -116,6 +122,23 @@ class Bridge(Node):
                 'age_sec': age, 'now': round(now, 1)}
 
     def command(self, what):
+        # ⚠ 경로·반복은 인자가 붙는다 (`path/rect`, `repeat/on`). 값이 틀리면
+        #   **아무것도 쏘지 않고 거절한다** — 모르는 값을 기본값으로 바꿔 보내면
+        #   사람이 고른 것과 장비가 도는 것이 달라진다.
+        if what.startswith('path/'):
+            name = what.split('/', 1)[1]
+            if name not in ('line', 'rect'):
+                return False
+            self.path_pub.publish(String(data=name))
+            self.get_logger().info(f'UI 명령: 경로 {name}')
+            return True
+        if what.startswith('repeat/'):
+            val = what.split('/', 1)[1]
+            if val not in ('on', 'off'):
+                return False
+            self.repeat_pub.publish(Bool(data=(val == 'on')))
+            self.get_logger().info(f'UI 명령: 반복 {val}')
+            return True
         if what == 'homing':
             self.homing_pub.publish(String(data='all'))
         elif what == 'mission':
@@ -165,7 +188,9 @@ def make_handler(node):
 
         def do_POST(self):
             if self.path.startswith('/cmd/'):
-                ok = node.command(self.path.rsplit('/', 1)[-1])
+                # ⚠ `rsplit('/', 1)[-1]` 로는 `path/rect` 가 `rect` 로 잘린다 —
+                #   접두사 뒤 **전부**를 넘겨야 인자가 살아 있다
+                ok = node.command(self.path[len('/cmd/'):].strip('/'))
                 self._send(200 if ok else 400,
                            json.dumps({'ok': ok}).encode(), 'application/json')
             else:

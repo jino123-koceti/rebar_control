@@ -61,6 +61,23 @@
 </div>
 
 <div class="card">
+  <h2>경로</h2>
+  <!-- 선택은 장비를 움직이지 않으니 2단 확인을 걸지 않는다. 실제로 움직이는
+       것은 [결속 미션 시작] 이고 그쪽에만 확인이 붙어 있다. -->
+  <div class="btns">
+    <button id="pline">직선 왕복</button>
+    <button id="prect">사각형</button>
+  </div>
+  <div class="row"><span>지금 경로</span><b id="pname">—</b></div>
+  <div class="row"><span>단계</span><b id="psteps">—</b></div>
+  <label class="row" style="cursor:pointer">
+    <span>반복 (계속 왕복)</span>
+    <input type="checkbox" id="prep">
+  </label>
+  <div class="row"><span id="plaps" class="dim"></span></div>
+</div>
+
+<div class="card">
   <h2>준비 상태</h2>
   <div class="row"><span>호밍</span><b id="homed">—</b></div>
   <div class="pills" id="homedpills"></div>
@@ -126,6 +143,15 @@ function arm(btn, label, what) {
 arm($('homing'),  '전체 호밍',      'homing');
 arm($('mission'), '결속 미션 시작', 'mission');
 $('stop').onclick = () => post('stop');     // 정지는 확인 없이 바로
+$('pline').onclick = () => post('path/line');
+$('prect').onclick = () => post('path/rect');
+// ⚠ 체크박스는 **사람이 누를 때만** 보낸다. 상태 갱신으로 바꿀 때는
+//   `_fromState` 를 세워 보내지 않는다 — 안 그러면 되돌림 루프가 생긴다.
+let _fromState = false;
+$('prep').onchange = () => {
+  if (_fromState) return;
+  post('repeat/' + ($('prep').checked ? 'on' : 'off'));
+};
 
 const banner = (txt, cls) => {
   const b = $('banner');
@@ -191,6 +217,24 @@ function render(s) {
     ).join('');
   $('mdetail').textContent = m.detail || '';
   $('mdetail').className = m.phase === 'failed' ? 'bad' : 'dim';
+
+  // ── 경로 ──────────────────────────────────────────────────────────────
+  // ⚠ 이름이 없을 수도 있다 (런치 맵에 없는 파일을 직접 넣은 경우) — 그때는
+  //   파일명을 보여 준다. "—" 로 두면 어느 경로로 도는지 모르게 된다.
+  const LBL = {line: '직선 왕복', rect: '사각형'};
+  const pf = (m.path_file || '').split('/').pop();
+  $('pname').textContent = m.path_name ? LBL[m.path_name] || m.path_name
+                                       : (pf || '—');
+  $('psteps').textContent = m.total ? `${m.total}단계` : '—';
+  $('pline').classList.toggle('armed', m.path_name === 'line');
+  $('prect').classList.toggle('armed', m.path_name === 'rect');
+  // 상태에서 받은 값으로 체크박스를 맞춘다 (사람이 누른 것으로 오해하지 않게)
+  if (typeof m.repeat === 'boolean' && $('prep').checked !== m.repeat) {
+    _fromState = true; $('prep').checked = m.repeat; _fromState = false;
+  }
+  $('plaps').textContent = m.laps ? `${m.laps}바퀴 완주` : '';
+  // 실행 중에는 경로를 못 바꾼다 (navigator 가 거부한다) — 버튼을 잠근다
+  $('pline').disabled = $('prect').disabled = (m.phase === 'run');
 
   $('dmm').textContent = d.goal_mm === undefined || d.goal_mm === null ? '—'
       : `${d.goal_mm.toFixed(0)} / ${(d.moved_mm ?? 0).toFixed(0)} mm`;
