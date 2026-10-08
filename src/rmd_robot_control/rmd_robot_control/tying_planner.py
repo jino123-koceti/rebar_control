@@ -245,6 +245,20 @@ class TyingPlanner(Node):
         self.park_pose = int(g('park_pose').value)
         self.detect_x = float(g('detect_x_mm').value)
         self.detect_y = float(g('detect_y_mm').value)
+        # ⚠⚠ [2026-10-08] **모델(yaml)도 미션마다 다시 읽는다.** 파라미터는 위에서
+        #   다시 읽는데 이것만 `__init__` 에 남아 있었다. 캘리브레이션은 하루에도
+        #   여러 번 갱신되는데(오늘 짝이 9→31개로 늘고 결속 깊이를 -58→-62 로
+        #   바꿨다) 기동 때 읽은 값이 그대로 남아 **고친 모델로 안 돌았다.**
+        #   실패가 조용하다는 점이 같다 — 2026-10-04 `plan_only` 와 같은 함정이다.
+        #   읽기에 실패하면 **쓰던 모델을 유지한다** (중간에 파일을 저장하는 순간과
+        #   겹칠 수 있으므로 비우면 미션이 통째로 죽는다).
+        fresh = self._load_model(str(g('model_yaml').value))
+        if fresh is not None:
+            self.model = fresh
+        elif self.model is None:
+            self.get_logger().error('캘리브레이션 모델을 읽을 수 없다')
+        else:
+            self.get_logger().warning('모델 재적재 실패 — 쓰던 모델을 유지한다')
 
         self.plans, self.cur = [], -1
         self.grid = None
