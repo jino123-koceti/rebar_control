@@ -32,6 +32,38 @@ COMPACT_FORWARD = b'\x85'   # Drive motor forward (Compact)
 COMPACT_BACKWARD = b'\x86'  # Drive motor reverse (Compact)
 COMPACT_START = b'\x83'     # Exit Safe-Start (Compact)
 COMPACT_STOP = b'\xE0'      # Stop motor (Compact)
+GET_VAR = b'\x21'          # Get Variable (Pololu Protocol)
+COMPACT_GET_VAR = b'\xA1'  # Get Variable (Compact)
+
+# ⚠⚠ [2026-10-08] **보드 상태를 읽을 수 있어야 한다.**
+#   예전에는 읽기가 없어서 "쓰기는 성공하는데 건이 안 움직인다" 를 더 파고들 수
+#   없었다. Simple Motor Controller 는 에러가 걸리면 속도 명령을 **조용히 무시**
+#   하므로, 보드에 물어보는 것이 유일한 확인 방법이다.
+VAR_ERROR_STATUS = 0        # 지금 걸려 있는 에러 (이게 0 이 아니면 안 움직인다)
+VAR_ERRORS_OCCURRED = 1     # 걸렸던 적이 있는 에러 (읽으면 지워진다)
+VAR_LIMIT_STATUS = 3        # 리미트·킬 스위치 상태
+
+# Error Status / Errors Occurred 비트 (Pololu 0J44 문서)
+ERROR_FLAGS = (
+    (0x0001, 'Safe Start Violation'),
+    (0x0002, 'Required Channel Invalid'),
+    (0x0004, 'Serial Error'),
+    (0x0008, 'Command Timeout'),
+    (0x0010, 'Limit/Kill Switch'),
+    (0x0020, 'Low VIN'),
+    (0x0040, 'High VIN'),
+    (0x0080, 'Over Temperature'),
+    (0x0100, 'Motor Driver Error'),
+    (0x0200, 'ERR Line High'),
+)
+
+
+def decode_errors(bits):
+    """에러 비트 → 사람이 읽는 문자열."""
+    if not bits:
+        return '없음'
+    hit = [m for b, m in ERROR_FLAGS if bits & b]
+    return ' · '.join(hit) or f'알 수 없는 비트 0x{bits:04X}'
 
 
 class Daisy(object):
@@ -183,6 +215,33 @@ class Daisy(object):
         speed = max(min(3200, speed), 0)  # enforce bounds
         self._exit_safe_start()
         self._send_command(BACKWARD, COMPACT_BACKWARD, speed & 0x1F, (speed >> 5) & 0x7F)
+
+    def get_variable(self, var_id):
+        """Get Variable 로 16비트 값을 읽는다. 못 읽으면 None.
+
+        ⚠ 응답이 안 오면 **None 을 돌려주고 끝낸다** — 진단용이라 여기서 예외를
+          올리면 멀쩡한 구동까지 막는다. 포트 timeout 은 1초로 열려 있다.
+        """
+        try:
+            Daisy.ser.reset_input_buffer()
+            if self.use_compact:
+                self._write(COMPACT_GET_VAR + bytes([var_id]))
+            else:
+                self._write(PROTOCOL + self.dev_num + GET_VAR + bytes([var_id]))
+            raw = Daisy.ser.read(2)
+            if len(raw) != 2:
+                return None
+            return raw[0] | (raw[1] << 8)
+        except Exception:
+            return None
+
+    def error_status(self):
+        """지금 걸려 있는 에러 비트. 0 이면 정상, None 이면 못 읽음."""
+        return self.get_variable(VAR_ERROR_STATUS)
+
+    def errors_occurred(self):
+        """걸렸던 적 있는 에러 비트. **읽으면 보드에서 지워진다.**"""
+        return self.get_variable(VAR_ERRORS_OCCURRED)
 
     def drive(self, speed):
         """Drive motor in direction based on speed (-3200, 3200)

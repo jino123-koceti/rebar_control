@@ -4,7 +4,7 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32
-from pololu_ros2.pololu_driver import Daisy
+from pololu_ros2.pololu_driver import Daisy, decode_errors
 
 
 class PololuNode(Node):
@@ -50,6 +50,22 @@ class PololuNode(Node):
             self.subscribers.append(sub)
             self.get_logger().info(f'Subscribed to {topic} for motor {motor_id}')
         
+        # 기동 직후 보드 상태를 남긴다 — 전원·배선 문제를 발사 때까지 숨기지 않는다
+        for motor_id, motor in self.motors.items():
+            err, occ = motor.error_status(), motor.errors_occurred()
+            if err is None:
+                self.get_logger().warning(
+                    f'Motor {motor_id}: 보드 상태 응답 없음 — 배선·전원 확인')
+            else:
+                msg = (f'Motor {motor_id}: 보드 에러 0x{err:04X} '
+                       f'[{decode_errors(err)}]'
+                       + (f', 그동안 걸렸던 것 0x{occ:04X} '
+                          f'[{decode_errors(occ)}]'
+                          if occ is not None else ''))
+                if err:
+                    self.get_logger().error(msg)
+                else:
+                    self.get_logger().info(msg)
         self.get_logger().info('Pololu node started successfully')
     
     def velocity_callback(self, msg, motor_id):
@@ -59,7 +75,28 @@ class PololuNode(Node):
             speed = int(msg.data * 3200)
             speed = max(min(3200, speed), -3200)  # clamp
             
-            self.motors[motor_id].drive(speed)
+            motor = self.motors[motor_id]
+            motor.drive(speed)
+
+            # ⚠⚠ [2026-10-08] **보드에 에러가 걸렸는지 물어본다.**
+            #   Simple Motor Controller 는 에러가 걸리면 속도 명령을 **조용히
+            #   무시한다** — 쓰기는 성공하므로 로그에 아무 흔적이 없다. 실제로
+            #   그 때문에 결속 미션이 "성공" 으로 보고하면서 한 발도 안 당겼다.
+            #   시연에서 트리거가 안 먹으면 결속 자체가 안 되므로, **움직이라고
+            #   한 순간에** 보드 상태를 확인해 경고로 올린다.
+            #   정지 명령(speed 0)에는 묻지 않는다 — 정지는 안전쪽이고 직렬
+            #   왕복을 발사 흐름에 두 번 더 넣을 이유가 없다.
+            if speed != 0:
+                err = motor.error_status()
+                if err is None:
+                    self.get_logger().warning(
+                        f'Motor {motor_id}: 보드 상태를 못 읽었다 — '
+                        '응답 없음 (배선·전원 확인)')
+                elif err:
+                    self.get_logger().error(
+                        f'Motor {motor_id}: **보드 에러 0x{err:04X} '
+                        f'[{decode_errors(err)}] — 이 상태에서는 속도 명령이 '
+                        '무시된다 (건이 안 움직인다)')
             
             # Log every 20th command to avoid spam
             if hasattr(self, '_log_counter'):
