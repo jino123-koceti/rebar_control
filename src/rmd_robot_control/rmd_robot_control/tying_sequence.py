@@ -502,7 +502,17 @@ class TyingSequence(Node):
 
         회전이 끝나면 `MOVE_XY` 가 창 밖의 나머지를 간다.
         """
-        if self._pose() == self.want_pose:
+        # ⚠⚠ [2026-10-08] **자세 번호가 맞아도 멈출 때까지 기다린다.**
+        #   자세 판별 허용오차가 건 1.5°(건끝 약 16mm) 라 **아직 돌고 있는데**
+        #   `pose == want_pose` 가 참이 된다. 그대로 넘어가면 MOVE_XY → Z_DOWN 이
+        #   회전 중에 들어가고 `stage_node` 가 거부한다 — 그 점은 실패로 버려진다.
+        #   실측 2026-10-08 09:08~09:11 미션: 자세 변경이 있던 **3점이 모두** 이걸로
+        #   날아갔고(8/11), 마지막 로그가 `건 -6.32°, 남은 모터축 -39.1°` 였다.
+        #   같은 자세 점은 8/8 성공했다 — 원인이 이것뿐이라는 뜻이다.
+        #   ⚠ 정착 재보정(최대 3회차)이 끝나야 `yaw_moving` 이 내려가므로 이 대기는
+        #     그만큼 길어진다. 안 내려가면 점 타임아웃으로 넘어가니 실패 양상은
+        #     지금과 같고, 성공할 때만 더 정확해진다.
+        if self._pose() == self.want_pose and not self._yaw_turning():
             return self._enter(Step.MOVE_XY,
                                f'{pose_label(self.want_pose)} 도착 → 결속 지점으로')
         if self._stage_busy() and not self._yaw_turning():
