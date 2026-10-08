@@ -185,7 +185,19 @@ class Daisy(object):
         self._send_command(BACKWARD, COMPACT_BACKWARD, speed & 0x1F, (speed >> 5) & 0x7F)
 
     def drive(self, speed):
-        """Drive motor in direction based on speed (-3200, 3200)"""
+        """Drive motor in direction based on speed (-3200, 3200)
+
+        ⚠⚠ [2026-10-08] **매번 safe-start 를 먼저 푼다.**
+        Simple Motor Controller 는 **어떤 에러든** 걸리면 모터를 세우고
+        `Safe Start Violation` 을 걸어 두며, 그 뒤에는 "Exit safe start" 를 다시
+        받기 전까지 **속도 명령을 조용히 무시한다.** 에러 원인은 직렬 타임아웃,
+        저전압(VIN), 과온도, 리미트 입력 등이고 전부 일시적일 수 있다.
+        예전에는 `__init__` 에서 한 번만 풀었다 — 그래서 한 번 에러가 걸리면
+        쓰기는 계속 성공하는데 건은 영구히 안 움직였고, 로그에는 아무 흔적이
+        남지 않았다 (쓰기 실패가 아니므로). Pololu 공식 예제도 매 명령 전에
+        보낸다. 1바이트라 비용이 없다.
+        """
+        self._exit_safe_start()
         if speed < 0:
             self.backward(-speed)
         else:
