@@ -53,6 +53,8 @@ class Daisy(object):
 
     count = 0  # static variable to keep track of number of Daisys open
     ser = None  # initialize static variable ser to None
+    port = None       # 다시 열 때 쓰는 포트 (아래 `_open` 참고)
+    baudrate = 9600
 
     def __init__(self, dev_num, port="/dev/ttyUSB0", baudrate=9600, use_compact=True):
         """Set motor id and open serial connection if not already open
@@ -71,12 +73,58 @@ class Daisy(object):
         self.dev_num = bytes([dev_num])  # set device number to use in other commands
         self.use_compact = use_compact  # protocol mode
 
-        # if serial connection has not been made yet
+        # ⚠⚠ [2026-10-08] **포트 설정을 기억해 둔다 — 다시 열어야 할 때가 있다.**
+        #   이 핸들은 클래스 변수에 캐시되는데, USB 허브가 재열거되면 (상부 전원,
+        #   카메라 재삽입 등) 장치 노드가 ttyACM0 ↔ ttyACM1 로 바뀌고 **열어 둔
+        #   핸들이 죽는다.** 그러면 이후 모든 쓰기가 `Errno 5 I/O error` 로 실패하는데
+        #   예전에는 다시 열지 않아 **영구히 죽은 채** 남았다. udev 심링크
+        #   (`/dev/pololu_trigger`)는 경로만 고정해 주고 핸들은 지켜 주지 않는다.
+        #   실측 2026-10-08: 결속 미션 8점에서 `[fire] 결속건 작동` 이 전부 찍혔는데
+        #   Pololu 쓰기는 88번 모두 실패했다 — **한 점도 안 당겨졌고 미션은 성공으로
+        #   보고했다.** 시연에서 이보다 나쁜 실패 양상은 없다.
+        Daisy.port, Daisy.baudrate = port, baudrate
+        self._reopening = False              # `_write` 재진입 방지 (아래 참고)
+        # 데이지체인은 포트를 공유한다 — 이미 열려 있으면 그대로 쓴다
         if Daisy.ser is None or not Daisy.ser.isOpen():
-            Daisy.ser = serial.Serial(port, baudrate=baudrate, timeout=1)
-            Daisy.ser.write(BAUD_SYNC)  # sync old devices by writing 0x80
-
+            self._open()
         self._exit_safe_start()  # make it so pololu reacts to commands
+
+    @classmethod
+    def _open(cls):
+        """직렬 포트를 (필요하면 다시) 연다."""
+        if cls.ser is not None:
+            try:
+                cls.ser.close()
+            except Exception:
+                pass                        # 이미 죽은 핸들이면 닫기도 실패한다
+            cls.ser = None
+        cls.ser = serial.Serial(cls.port, baudrate=cls.baudrate, timeout=1)
+        cls.ser.write(BAUD_SYNC)            # sync old devices by writing 0x80
+
+    def _write(self, cmd):
+        """쓰고, 실패하면 **포트를 다시 열어 한 번 더** 시도한다.
+
+        ⚠ 한 번만 재시도한다. 계속 매달리면 토픽 콜백이 막히고, 실패가 계속되면
+          그건 배선·전원 문제이므로 사람이 봐야 한다 (노드가 ERROR 로 올린다).
+        """
+        try:
+            Daisy.ser.write(cmd)
+            Daisy.ser.flush()
+            return
+        except (OSError, serial.SerialException) as e:
+            if self._reopening:
+                raise                        # 재연결 중의 실패는 그대로 올린다
+            print(f"Pololu 쓰기 실패 ({e}) — 포트를 다시 엽니다: {Daisy.port}")
+        # ⚠ `_exit_safe_start` 가 다시 `_write` 를 타므로 **재진입을 막아야 한다** —
+        #   안 막으면 포트가 계속 죽어 있을 때 무한 재귀로 노드가 죽는다
+        self._reopening = True
+        try:
+            self._open()                     # 실패하면 예외가 호출부로 올라간다
+            Daisy.ser.write(cmd)
+            Daisy.ser.flush()
+            self._exit_safe_start()          # 재연결된 보드는 safe-start 상태다
+        finally:
+            self._reopening = False
 
     def __del__(self):
         """Decrement count, stop motor, and close port if it's the last connection"""
@@ -97,8 +145,7 @@ class Daisy(object):
         else:
             cmd = PROTOCOL + self.dev_num + command + bytes([databyte3, databyte4])
             print(f"DEBUG: Sending command: {cmd.hex()} (dev={self.dev_num[0]}, cmd={command.hex()}, data3={databyte3}, data4={databyte4})")
-        Daisy.ser.write(cmd)
-        Daisy.ser.flush()  # Ensure data is sent immediately
+        self._write(cmd)  # 실패하면 포트를 다시 열고 재시도한다
 
     def _send_command_single(self, command, compact_command):
         """Sends a one-byte command using the appropriate protocol."""
@@ -108,8 +155,7 @@ class Daisy(object):
         else:
             cmd = PROTOCOL + self.dev_num + command
             print(f"DEBUG: Sending single command: {cmd.hex()} (dev={self.dev_num[0]}, cmd={command.hex()})")
-        Daisy.ser.write(cmd)
-        Daisy.ser.flush()  # Ensure data is sent immediately
+        self._write(cmd)  # 실패하면 포트를 다시 열고 재시도한다
 
     def _exit_safe_start(self):
         """Exit safe start so you can freely send commands to Pololu.
