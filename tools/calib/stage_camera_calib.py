@@ -79,6 +79,9 @@ OUT = os.path.expanduser(
 # 다시 띄우면 이어서 할 수 있다. 자세당 6점을 손으로 맞추는 일이라 날리면 아깝다.
 STATE = os.path.expanduser(
     '~/ros2_ws/src/rebar_control/data/calibration/stage_camera_pairs.json')
+# 장비가 실제로 쓰는 모델 — 예측은 **이것** 기준이어야 보정량이 뜻을 갖는다
+MODEL = os.path.expanduser(
+    '~/ros2_ws/src/rebar_control/data/calibration/stage_camera.yaml')
 # 고정할 때마다 **번호가 찍힌 그림**을 남긴다. 숫자만 보고는 어느 교차점인지
 # 알 수 없어 사람이 건 끝을 맞출 수 없다. 그림과 번호가 **같은 스냅샷**에서
 # 나와야 어긋나지 않으므로 도구가 직접 그린다 (따로 그리면 정렬 순서가 다르다).
@@ -89,6 +92,26 @@ AXES = ('x', 'y', 'z')
 # ⚠ 깊이를 X·Y 적합에 쓸지. **False 가 기본** — 위 `_solve_axis` 주석 참고.
 #   되돌리려면 True 로만 바꾸면 된다 (짝 데이터는 그대로 쓴다).
 USE_DEPTH = False
+
+# ⚠⚠ **평면이 바뀌면 옛 짝은 무효다 — 날짜로 끊는다.**
+#   깊이빠진 모델은 "교차점이 어느 평면에 있다" 를 전제로 cx·cy 만으로 X·Y 를
+#   낸다. 그래서 **그 평면 전용**이다. 데크플레이트를 깔기 전(2026-10-04)의 26짝은
+#   같은 cx·cy 가 다른 물리점이라, 섞으면 모델을 평면 사이로 끌어당긴다 —
+#   실제로 그러자 1번 자세 잔차가 1.83mm → 12.21mm 로 나빠졌다.
+#   `archive` 는 전부 비우므로 쓸 수 없다(쓸 만한 10-07 이후 짝까지 날아간다).
+#   지우지도 않는다 — 사람이 리모콘으로 맞춘 기록이라 평면이 되돌아오면 되살린다.
+#   ⚠ 데크플레이트를 치우거나 배근 높이가 바뀌면 **이 날짜를 다시 잡아야 한다.**
+PLANE_SINCE = '2026-10-07 20:00:00'
+
+# ⚠⚠ [2026-10-07 사용자 결정] **Z 는 자세와 무관하게 이 상수다.**
+#   "데크플레이트 위 철근은 평면으로 봐도 되니까 하강깊이는 어디서나 같다."
+#   그래서 Z 를 **적합하지 않는다.** 적합에 맡기면 자세마다 Z 오프셋이 생기는데
+#   (2026-10-08: 2번이 -56.64, 나머지가 -58.80 으로 갈렸다) 그 차이는 물리가
+#   아니라 **사람이 눈으로 맞춘 하강 깊이의 측정오차**다 — yaw 회전은 높이를
+#   바꾸지 않으므로 자세별로 달라질 이유가 없다. 노이즈를 모델에 굳히는 셈이다.
+#   잔차는 그대로 보고한다(상수가 실측과 얼마나 다른지 봐야 하므로).
+#   ⚠ 데크플레이트를 치우거나 배근 높이가 바뀌면 **이 값부터 다시 잡아야 한다.**
+Z_CONST = -58.0
 
 
 class Calib(Node):
@@ -205,6 +228,26 @@ class Calib(Node):
         """그 자세에서 **무효가 된 짝의 번호**. 자세 각도가 재조정된 뒤의 것들이다."""
         return {i for i, g, w in self.stale().get(p, [])}
 
+    def off_plane(self, p):
+        """그 자세에서 **다른 평면에서 받은 짝의 번호** (`PLANE_SINCE` 이전)."""
+        return {i for i, q in enumerate(self.pairs.get(p, []))
+                if not (q.get('t') or '') or q['t'] < PLANE_SINCE}
+
+    def bad_idx(self, p):
+        """사람이 **무효로 표시한** 짝의 번호 (`bad` 가 참인 짝).
+
+        왜 지우지 않고 표시만 하는가: 어느 짝이 왜 틀렸는지가 다음 수집의 근거가
+        된다. 실제로 2026-10-07 2번 자세 3짝은 `_on_declare` 가 측정값 대신
+        **공칭 각도**(-6.33°)를 적어 넣은 동안 받은 것이라, 실제 건은 -4.92° —
+        1.41°(건끝 약 16mm) 어긋난 자리에서 맞춘 짝이었다. 기록이 남아 있어
+        '왜 2번만 Y 가 15mm 갈렸나' 를 역추적할 수 있었다.
+        """
+        return {i for i, q in enumerate(self.pairs.get(p, [])) if q.get('bad')}
+
+    def skip_idx(self, p):
+        """적합에서 뺄 짝 번호 — 자세 재정의분 + 다른 평면분 + 무효 표시분."""
+        return self.stale_idx(p) | self.off_plane(p) | self.bad_idx(p)
+
     def rows(self, p):
         """(cam, stage) 짝. **절대 위치**로 푼다 — 카메라와 스테이지가 둘 다
         상부체에 있어 장비가 움직여도 둘 사이 관계가 변하지 않는다.
@@ -212,7 +255,7 @@ class Calib(Node):
         `snap`(검출 당시 스테이지 위치)은 수식에 쓰지 않고 기록만 한다 — 나중에
         "이 짝이 어느 상황에서 나왔나" 를 되짚을 때 필요하다.
         """
-        bad = self.stale_idx(p)
+        bad = self.skip_idx(p)
         return [(q['cam'], q['stage'])
                 for i, q in enumerate(self.pairs.get(p, [])) if i not in bad]
 
@@ -245,8 +288,16 @@ class Calib(Node):
     # ---- 동작 --------------------------------------------------------------
     def snapshot(self):
         self.grid = None
+        # 툴이 막 떴을 때는 디스커버리가 끝나기 전이라 publish 가 유실된다 —
+        # 검출기가 /rebar/detect 를 구독하기까지 기다린 뒤에 쏜다
+        w = time.time() + 5.0
+        while rclpy.ok() and self.trig.get_subscription_count() == 0 and time.time() < w:
+            rclpy.spin_once(self, timeout_sec=0.05)
+        if self.trig.get_subscription_count() == 0:
+            print("  ⚠ crossing_detector 가 /rebar/detect 를 구독하지 않습니다")
         self.trig.publish(Empty())
-        t = time.time() + 6.0
+        # RF-DETR Medium 추론은 유휴 뒤 첫 장이 느리다
+        t = time.time() + 20.0
         while rclpy.ok() and self.grid is None and time.time() < t:
             rclpy.spin_once(self, timeout_sec=0.05)
         if self.grid is None:
@@ -404,6 +455,22 @@ class Calib(Node):
         if why:
             print(f"  사유: {why}")
 
+    def mark_bad(self, pose, idxs, why=''):
+        """그 자세의 짝 몇 개를 **무효로 표시**한다 (지우지 않는다)."""
+        v = self.pairs.get(pose) or []
+        hit = []
+        for i in idxs:
+            if not (0 <= i < len(v)):
+                print(f"  {pose}번 짝 {i} 는 범위를 벗어났습니다 (0~{len(v)-1})")
+                continue
+            v[i]['bad'] = True
+            v[i]['bad_why'] = why or '사람이 무효 표시'
+            hit.append(i)
+        if hit:
+            self._save_state()
+            print(f"  {pose}번 자세 짝 {hit} 무효 표시 — "
+                  f"적합에 쓰는 짝 {len(self.rows(pose))}개")
+
     def undo(self):
         p = self.pose()
         if p is None or not self.pairs.get(p):
@@ -419,9 +486,13 @@ class Calib(Node):
             return
         for p in sorted(self.pairs):
             rows = self.pairs[p]
-            zs = [c[2] for c, _ in rows]
-            nb = len(self.stale_idx(p))
-            print(f"  {p}번 자세: {len(rows)}개" + (f" (무효 {nb}개 제외)" if nb else "")
+            zs = [q['cam'][2] for q in rows]
+            ns, no = len(self.stale_idx(p)), len(self.off_plane(p))
+            nb = len(self.bad_idx(p))
+            tag = ''.join([f" (자세 재정의 {ns}개 제외)" if ns else '',
+                           f" (다른 평면 {no}개 제외)" if no else '',
+                           f" (무효 표시 {nb}개 제외)" if nb else ''])
+            print(f"  {p}번 자세: {len(rows)}개" + tag
                   + (f"  (카메라 z {min(zs):.0f}~{max(zs):.0f}mm)" if rows else ''))
             for i, (c, m) in enumerate(self.rows(p)):
                 print(f"     {i} cam({c[0]:+7.1f},{c[1]:+7.1f},{c[2]:7.1f})"
@@ -458,11 +529,20 @@ class Calib(Node):
         #   (사용자 결정). 상수항 + 자세 오프셋만 푼다.
         # ⚠ **yaml 스키마는 그대로다** — X·Y 행의 깊이 열을 0, Z 행을 전부 0 으로
         #   두고 b[2] 에 상수를 넣는다. 그래서 `tying_planner` 는 고칠 것이 없다.
-        ncam = 0 if k == 2 else (3 if USE_DEPTH else 2)
+        if k == 2:
+            # Z 는 풀지 않는다 (위 `Z_CONST` 주석). 잔차만 재서 보고한다
+            e = [q['stage'][2] - Z_CONST
+                 for p in poses
+                 for i, q in enumerate(self.pairs.get(p, []))
+                 if i not in self.skip_idx(p) and 2 in self._axes_of(q)]
+            return dict(a=np.zeros(3), b=float(Z_CONST),
+                        off={p: 0.0 for p in poses}, n=len(e),
+                        e=np.array(e, dtype=float), dof=len(e))
+        ncam = 3 if USE_DEPTH else 2
         U = ncam + 1 + len(extra)
         M, y = [], []
         for p in poses:
-            bad = self.stale_idx(p)
+            bad = self.skip_idx(p)
             for i, q in enumerate(self.pairs.get(p, [])):
                 if i in bad or k not in self._axes_of(q):
                     continue
@@ -513,12 +593,16 @@ class Calib(Node):
         off = {p: np.zeros(3) for p in poses}
         ns, dofs, errs = [], [], []
         for k in range(3):
-            pk = [p for p in poses
-                  if any(k in self._axes_of(q)
-                         for i, q in enumerate(self.pairs.get(p, []))
-                         if i not in self.stale_idx(p))]
-            if base not in pk:
-                return None            # 기준 자세에 그 성분이 없으면 못 푼다
+            if k == 2:
+                # Z 는 상수라 어느 자세에 Z 짝이 있든 상관없다
+                pk = poses
+            else:
+                pk = [p for p in poses
+                      if any(k in self._axes_of(q)
+                             for i, q in enumerate(self.pairs.get(p, []))
+                             if i not in self.skip_idx(p))]
+                if base not in pk:
+                    return None        # 기준 자세에 그 성분이 없으면 못 푼다
             r = self._solve_axis(k, pk, base)
             if r is None:
                 return None
@@ -642,6 +726,16 @@ class Calib(Node):
             f.write("#   위치가 다르다 (건이 yaw 축에 달려 회전한다). 그래서 자세별이다.\n")
             f.write("# ⚠ mm 는 원점 기준이라 재호밍·전원 재투입을 견딘다. 다만 원점\n")
             f.write("#   반복오차(~0.4mm)는 남는다.\n")
+            f.write("# ⚠⚠ **깊이를 X·Y 에서 뺐고 Z 는 상수다** (`USE_DEPTH=False`,\n")
+            f.write("#   `Z_CONST`). 교차점이 거의 한 평면이라 깊이가 cx·cy 의\n")
+            f.write("#   선형함수고, 깊이 열이 중복되어 최소제곱이 아무 값이나 고른다.\n")
+            f.write("#   실측이 그걸 가리켰다 — X 오차가 깊이에 비례(-0.144mm/mm)했고\n")
+            f.write("#   Y 오차는 깊이와 무관(±2mm)했는데, 옛 A 의 깊이계수가 X행\n")
+            f.write("#   +0.0933 / Y행 -0.0009 였다. **Y 는 이미 깊이를 안 써서 정확했다.**\n")
+            f.write("# ⚠⚠ **이 모델은 \"그 평면\" 전용이다.** 데크플레이트 유무나 배근\n")
+            f.write(f"#   높이가 바뀌면 다시 받아야 한다. 그래서 {PLANE_SINCE[:10]} 이전\n")
+            f.write("#   짝은 적합에서 제외한다 (`PLANE_SINCE`) — 파일에는 남아 있다.\n")
+            f.write(f"# ⚠ Z 는 자세와 무관하게 {Z_CONST}mm 고정 (사용자 결정, 적합 안 함).\n")
             f.write(f"# 실측 {time.strftime('%Y-%m-%d %H:%M')}\n")
             # 소비자가 쓰는 값. 모델이 무엇이든 자세별 (A, b) 한 쌍으로 낸다
             f.write("# model: shared = 공통 변환 + 자세별 오프셋 (기준).\n")
@@ -654,7 +748,11 @@ class Calib(Node):
                     f.write(f"  {p}:\n")
                     f.write(f"    A: {json.dumps([[round(v, 6) for v in r] for r in A.tolist()])}\n")
                     f.write(f"    b: {json.dumps([round(v, 4) for v in b.tolist()])}\n")
-                    f.write(f"    pairs: {len(self.pairs.get(p, []))}\n")
+                    used = len(self.rows(p))
+                    tot = len(self.pairs.get(p, []))
+                    f.write(f"    pairs: {used}"
+                            + (f"   # 기록 {tot} 중 적합에 쓴 수\n" if used != tot
+                               else "\n"))
                     f.write(f"    source: shared\n")
                 f.write(f"shared:\n")
                 f.write(f"  pairs: {sh['n']}\n")
@@ -682,25 +780,48 @@ class Calib(Node):
                     f.write(f"      stage: {json.dumps([round(v, 2) for v in m])}\n")
         print(f"\n  저장: {out_path}")
 
+    def committed(self, p):
+        """**장비가 실제로 쓰는 모델** (data/calibration/stage_camera.yaml) 을 읽는다.
+
+        ⚠⚠ 왜 세션 적합(`fit_shared`) 을 예측에 쓰지 않는가: pairs.json 에는
+        10-04 짝이 그대로 남아 있는데 그 짝들은 **다른 평면**(데크플레이트 전)
+        이라 깊이빠진 모델에는 무효다. 그걸 섞어 예측하면 장비가 쓰는 값과
+        달라지고(실측 X 386.6 vs yaml 381, 잔차 7.21mm), 그러면 **"실측 − 예측"
+        이 보정량이 아니게 된다.** 보정 루프는 운영 모델 기준으로만 뜻이 있다.
+        """
+        try:
+            import yaml as _y
+            d = _y.safe_load(open(MODEL, encoding='utf-8'))['poses'][p]
+            return np.array(d['A'], dtype=float), np.array(d['b'], dtype=float)
+        except Exception:
+            return None
+
     def predict(self, idx, pose=None):
-        """고정한 점을 **기준 모델(공통)** 으로 예측한다. 독립 모델은 자세당 4점이
-        필요하고 그때도 과적합이라 검증용일 뿐이다."""
-        sh = self.fit_shared()
-        if sh is None:
-            print("  아직 변환을 못 풉니다 (짝이 모자라거나 배치가 겹칩니다)")
-            return
+        """고정한 점을 **운영 모델(yaml)** 로 예측한다. yaml 이 없을 때만 세션
+        적합으로 내려간다 (독립 모델은 자세당 4점이 필요하고 그때도 과적합이다)."""
         p = self.pose() if pose is None else pose
-        if p not in sh['off']:
-            print(f"  {p}번 자세 오프셋이 없습니다 — 그 자세 짝이 1점은 있어야 합니다")
-            return
         if not (0 <= idx < len(self.frozen)):
             print(f"  번호가 범위를 벗어났습니다 (0~{len(self.frozen) - 1})")
             return
         x, y, z = self.frozen[idx][:3]
-        q = sh['A'] @ np.array([x, y, z]) + sh['b'] + sh['off'][p]
+        cm = self.committed(p)
+        if cm is not None:
+            A, b = cm
+            q = A @ np.array([x, y, z]) + b
+            src = f'운영 모델 {os.path.basename(MODEL)}'
+        else:
+            sh = self.fit_shared()
+            if sh is None:
+                print("  아직 변환을 못 풉니다 (짝이 모자라거나 배치가 겹칩니다)")
+                return
+            if p not in sh['off']:
+                print(f"  {p}번 자세 오프셋이 없습니다 — "
+                      f"그 자세 짝이 1점은 있어야 합니다")
+                return
+            q = sh['A'] @ np.array([x, y, z]) + sh['b'] + sh['off'][p]
+            src = f"세션 적합 · 잔차 RMS {sh['rms']:.2f}mm"
         print(f"  [{idx}] {p}번 자세에서 보낼 위치  "
-              f"X {q[0]:.1f}  Y {q[1]:.1f}  Z {q[2]:.1f} mm   "
-              f"(잔차 RMS {sh['rms']:.2f}mm)")
+              f"X {q[0]:.1f}  Y {q[1]:.1f}  Z {q[2]:.1f} mm   ({src})")
         m = self.mm()
         if m:
             d = q - np.array(m)
@@ -725,9 +846,36 @@ class Calib(Node):
             return
         m = self._Point()
         m.x, m.y, m.z = float(q[0]), float(q[1]), float('nan')
+        # ⚠⚠ `--cmd` 는 한 명령만 돌리고 바로 끝난다 — 퍼블리셔를 만든 직후에 쏘면
+        #   **디스커버리가 끝나기 전**이라 메시지가 조용히 사라진다. 실제로 `g 6`
+        #   이 그렇게 유실됐다 (stage_node 에 `이동 시작` 자체가 안 찍혔다).
+        #   그래서 ① 구독자가 붙을 때까지 기다리고 ② 쏜 뒤에도 조금 돌려서
+        #   전송을 끝낸 다음 ③ 노드가 정말 받았는지 **움직이기 시작했는지로**
+        #   확인한다. 보냈다고 믿고 넘어가면 사람이 허공을 미세조정한다.
+        w = time.time() + 5.0
+        while rclpy.ok() and self.goal.get_subscription_count() == 0 \
+                and time.time() < w:
+            rclpy.spin_once(self, timeout_sec=0.05)
+        if self.goal.get_subscription_count() == 0:
+            print("  ⚠ stage_node 가 /stage/goal 을 구독하지 않습니다 — "
+                  "보내지 않았습니다")
+            return
         self.goal.publish(m)
+        self.spin(0.5)
         print(f"  → X {q[0]:.1f}  Y {q[1]:.1f} mm 로 이동 명령 (Z 는 유지). "
               f"맞춘 뒤 `rxy {idx}` 로 기록하세요")
+        # 접수 확인: 2초 안에 움직이기 시작하거나 이미 그 자리에 있어야 한다
+        t = time.time() + 2.5
+        while rclpy.ok() and time.time() < t:
+            self.spin(0.1)
+            if (self.stage or {}).get('moving'):
+                return q
+        here = self.mm()
+        if here and max(abs(here[0] - q[0]), abs(here[1] - q[1])) <= 2.0:
+            print("     (이미 그 위치입니다)")
+            return q
+        print("  ⚠ 움직이기 시작하지 않았습니다 — 명령이 유실됐거나 "
+              "거부됐습니다. 로그를 확인하세요")
 
 
 def run_one(n, cmd):
@@ -747,6 +895,8 @@ def run_one(n, cmd):
         n.predict(int(cmd[1]))
     elif c == 'g' and len(cmd) > 1:
         n.goto(int(cmd[1]))
+    elif c == 'bad' and len(cmd) > 2:
+        n.mark_bad(int(cmd[1]), [int(v) for v in cmd[2:]])
     elif c == 'l':
         n.listing()
     elif c == 'archive':
