@@ -130,15 +130,23 @@ class Daisy(object):
 
     @classmethod
     def _open(cls):
-        """직렬 포트를 (필요하면 다시) 연다."""
-        if cls.ser is not None:
+        """직렬 포트를 (필요하면 다시) 연다.
+
+        ⚠⚠ [2026-10-08] **새 핸들이 열린 뒤에만 바꿔 넣는다.**
+        전에는 먼저 `cls.ser = None` 으로 비우고 열었다. 그래서 장치가 USB 에서
+        사라진 동안(상부 허브 가지가 통째로 떨어져 `/dev/pololu_trigger` 자체가
+        없어졌다) 열기가 실패하면 `ser` 가 **None 으로 남고**, 그 뒤 모든 쓰기가
+        `'NoneType' object has no attribute 'write'` 로 죽었다 — 장치가 돌아와도
+        복구되지 않았다. 실측 2026-10-08 10:59 에 그 상태로 트리거가 멈췄다.
+        """
+        new = serial.Serial(cls.port, baudrate=cls.baudrate, timeout=1)
+        old, cls.ser = cls.ser, new         # 성공한 뒤에 교체한다
+        if old is not None:
             try:
-                cls.ser.close()
+                old.close()
             except Exception:
                 pass                        # 이미 죽은 핸들이면 닫기도 실패한다
-            cls.ser = None
-        cls.ser = serial.Serial(cls.port, baudrate=cls.baudrate, timeout=1)
-        cls.ser.write(BAUD_SYNC)            # sync old devices by writing 0x80
+        new.write(BAUD_SYNC)                # sync old devices by writing 0x80
 
     def _write(self, cmd):
         """쓰고, 실패하면 **포트를 다시 열어 한 번 더** 시도한다.
@@ -146,11 +154,15 @@ class Daisy(object):
         ⚠ 한 번만 재시도한다. 계속 매달리면 토픽 콜백이 막히고, 실패가 계속되면
           그건 배선·전원 문제이므로 사람이 봐야 한다 (노드가 ERROR 로 올린다).
         """
+        # ⚠ `ser` 가 None 일 수 있다 — 열기에 실패한 적이 있으면 그렇다.
+        #   그때도 **재연결 경로로 간다** (예전에는 AttributeError 로 죽었다).
         try:
+            if Daisy.ser is None:
+                raise OSError('포트가 열려 있지 않다')
             Daisy.ser.write(cmd)
             Daisy.ser.flush()
             return
-        except (OSError, serial.SerialException) as e:
+        except (OSError, serial.SerialException, AttributeError) as e:
             if self._reopening:
                 raise                        # 재연결 중의 실패는 그대로 올린다
             print(f"Pololu 쓰기 실패 ({e}) — 포트를 다시 엽니다: {Daisy.port}")
