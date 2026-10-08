@@ -262,6 +262,13 @@ class StageNode(Node):
         #   0.22° 는 허용(±1.0°) 안이라 선보정 없이도 첫 패스에서 끝난다.
         #   ⚠ 속도를 다시 올리면 이 값도 다시 재야 한다.
         self.declare_parameter('yaw_overshoot_gun_deg', 0.0)
+        # ⚠⚠ [2026-10-08] **정착 재보정 회차는 판정과 속도를 따로 쓴다.**
+        #   재보정이 `yaw_tol_deg`(3.0 모터축 = 건 0.240°)를 물려받으면 그 아래로
+        #   못 내려가고 맴돈다. 속도도 낮춘다 — 오버슈트는 속도에 비례하고
+        #   (400dps 2.2° / 200dps 0.22°) 보정 이동량은 모터축 몇 도뿐이다.
+        #   실측 근거와 수치는 `teleop.launch.py` 의 `yaw_gun_tol_deg` 주석에.
+        self.declare_parameter('yaw_fine_tol_deg', 0.6)     # 회차 도달 판정 (모터축)
+        self.declare_parameter('yaw_fine_speed_dps', 60.0)  # 회차 회전 속도
 
         g = self.get_parameter
         self.speed = float(g('move_speed_dps').value)
@@ -306,6 +313,8 @@ class StageNode(Node):
         self.yaw_settle_sec = float(g('yaw_settle_sec').value)
         self.yaw_max_pass = int(g('yaw_settle_passes').value)
         self.yaw_over = float(g('yaw_overshoot_gun_deg').value)
+        self.yaw_fine_tol = float(g('yaw_fine_tol_deg').value)
+        self.yaw_fine_speed = float(g('yaw_fine_speed_dps').value)
 
         # yaw 도 같이 싣는다 — 관절 발행·브레이크·위치 구독 경로를 공유한다.
         # mm 환산이 없는 축이라 `mm_of`/`deg_of` 는 AXES 에만 쓴다.
@@ -823,13 +832,18 @@ class StageNode(Node):
         #   목표는 `_on_yaw_pose` 가 시작할 때 한 번 정하고 **위치 제어에 맡긴다**
         #   (0xA4 가 스스로 감속해 들어간다). 보정은 **멈춘 뒤에만** 한다
         #   (`_yaw_settle_tick`) — 그게 원래 더해야 했던 전부다.
+        # 정착 재보정 회차(`_yaw_pass > 0`)는 이동량이 작아 촘촘히·느리게 간다
+        fine = self._yaw_pass > 0
+        tol = self.yaw_fine_tol if fine else self.yaw_tol
+        spd = self.yaw_fine_speed if fine else self.yaw_speed
         err = self.yaw_tgt - self.deg['yaw']
-        if abs(err) <= self.yaw_tol:
-            return self._yaw_park(f'도달 (남은 모터축 {err:+.2f}°)')
+        if abs(err) <= tol:
+            return self._yaw_park(f'도달 (남은 모터축 {err:+.2f}°'
+                                  + (f', {self._yaw_pass}회차' if fine else '') + ')')
         if time.time() - self._yaw_sent > 0.4:
             self._yaw_sent = time.time()
             self.pos_pubs['yaw'].publish(
-                Float64MultiArray(data=[self.yaw_tgt, self.yaw_speed]))
+                Float64MultiArray(data=[self.yaw_tgt, spd]))
             g = self.gun_now()
             self.detail = (f"{pose_label(self.yaw_want)}로 회전 중"
                            + (f" (건 {g:+.2f}°, 남은 모터축 {err:+.1f}°)"
