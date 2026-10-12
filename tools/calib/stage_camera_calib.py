@@ -113,6 +113,16 @@ PLANE_SINCE = '2026-10-07 20:00:00'
 #   ⚠ 데크플레이트를 치우거나 배근 높이가 바뀌면 **이 값부터 다시 잡아야 한다.**
 Z_CONST = -85.0   # [사용자 결정 2026-10-08] -58 → -62 → -67 → -72 → -85
 
+# ⚠⚠ [사용자 지시 2026-10-12] **손으로 넣는 X·Y 보정.** 실장비에서 교차점 위치가
+#   한쪽으로 치우쳐 보일 때, 짝을 다시 받지 않고 바로 미는 값이다.
+#   X 범위는 -5.0~408.7mm 이므로 **+가 Xmax 방향**이다.
+#   짝(`pairs.json`)에는 손대지 않는다 — 적합 결과 위에 **더하기만** 한다.
+#   그래서 잔차 보고는 이 값을 반영하지 않는다 (적합이 아니라 사람이 준 치우침이다).
+#   ⚠⚠ **이 값이 걸린 뒤에 `rxy` 로 새 짝을 받으면 이중 보정이 된다** — 그 짝의
+#     스테이지 위치는 보정된 자리에서 맞춘 것이라 적합이 같은 치우침을 또 흡수한다.
+#     새 짝을 받을 거면 **먼저 이 값을 0 으로 돌리고** 받아야 한다.
+XY_OFFSET_MM = (10.0, 0.0)      # (X, Y) — Xmax 방향으로 10mm
+
 
 class Calib(Node):
     def __init__(self):
@@ -736,6 +746,12 @@ class Calib(Node):
             f.write(f"#   높이가 바뀌면 다시 받아야 한다. 그래서 {PLANE_SINCE[:10]} 이전\n")
             f.write("#   짝은 적합에서 제외한다 (`PLANE_SINCE`) — 파일에는 남아 있다.\n")
             f.write(f"# ⚠ Z 는 자세와 무관하게 {Z_CONST}mm 고정 (사용자 결정, 적합 안 함).\n")
+            if any(XY_OFFSET_MM):
+                f.write(f"# ⚠⚠ **손으로 넣은 치우침이 b 에 더해져 있다**: "
+                        f"X {XY_OFFSET_MM[0]:+.1f} · Y {XY_OFFSET_MM[1]:+.1f}mm "
+                        f"(`XY_OFFSET_MM`). X 는 +가 Xmax 방향.\n")
+                f.write("#   아래 잔차는 이 값을 **반영하지 않는다** — 적합이 아니라\n")
+                f.write("#   사람이 준 보정이다. 새 짝을 받을 거면 먼저 0 으로 돌릴 것.\n")
             f.write(f"# 실측 {time.strftime('%Y-%m-%d %H:%M')}\n")
             # 소비자가 쓰는 값. 모델이 무엇이든 자세별 (A, b) 한 쌍으로 낸다
             f.write("# model: shared = 공통 변환 + 자세별 오프셋 (기준).\n")
@@ -745,6 +761,8 @@ class Calib(Node):
                 for p in sorted(sh['off']):
                     A = sh['A']
                     b = sh['b'] + sh['off'][p]
+                    # 사람이 준 치우침을 더한다 (위 `XY_OFFSET_MM` 주석 참고)
+                    b = b + np.array([XY_OFFSET_MM[0], XY_OFFSET_MM[1], 0.0])
                     f.write(f"  {p}:\n")
                     f.write(f"    A: {json.dumps([[round(v, 6) for v in r] for r in A.tolist()])}\n")
                     f.write(f"    b: {json.dumps([round(v, 4) for v in b.tolist()])}\n")

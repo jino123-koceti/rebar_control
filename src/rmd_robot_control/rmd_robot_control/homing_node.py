@@ -179,6 +179,17 @@ class HomingNode(Node):
         for name, d in load_seek_dirs().items():
             if name in AXES:
                 AXES[name]['dir'] = d          # axes.yaml 이 코드 기본값을 덮는다
+        # ⚠⚠ [2026-10-12] **설정된 탐색 방향을 따로 보관한다.**
+        #   `AXES` 는 모듈 수준 딕셔너리이고 yaw 방향 유도가 `AXES['yaw']['dir']`
+        #   에 **계산값을 써넣는다**(아래 `_precheck_failed`). 그래서 12시 분기가 같은
+        #   자리를 "axes.yaml seek_dir" 이라고 읽으면 **직전 시도의 계산값을
+        #   설정값으로 착각한다.** 실측 2026-10-12:
+        #     09:54 건 -0.46°(12시) → 방향 -1 → 호밍 성공
+        #           그 뒤 준비자세로 yaw 가 1번 자세(건 -16.8°)로 이동
+        #           거기서 호밍을 걸면 유도 분기가 d=+1 을 AXES 에 기록
+        #     09:59 건 +0.04°(12시) → 오염된 +1 을 읽어 **반대로 돌려 실패**
+        #   그 뒤로는 노드를 재시작할 때까지 계속 반대로 돈다 (UI 탓이 아니다).
+        self.dir_cfg = {n: int(c['dir']) for n, c in AXES.items()}
         # ── 작업영역 카메라 (yaw 별칭을 가릴 때만 쓴다) ──────────────────
         # ⚠ 카메라가 없어도 호밍은 **그대로 동작해야 한다.** 비전은 별칭이
         #   생겼을 때만 부르는 보조 수단이고, 없으면 기존 거부 경로로 간다.
@@ -713,7 +724,8 @@ class HomingNode(Node):
                         '(noon_single)·커플링·카메라를 확인하세요. '
                         '추측해 돌리지 않는다')
             tol = float(self.pose_id.get('tol_gun') or 3.0)
-            fixed = int(AXES['yaw'].get('dir') or -1)
+            # ⚠ **`AXES` 가 아니라 보관한 설정값을 쓴다** (위 `dir_cfg` 주석)
+            fixed = int(self.dir_cfg.get('yaw') or -1)
             if abs(g) <= tol:
                 AXES['yaw']['dir'] = fixed
                 self.get_logger().info(
