@@ -467,6 +467,24 @@ class Navigator(Node):
                 self.get_logger().warning(
                     f"{s.text} — 결속은 됐지만 검출 자세 복귀가 실패했다. "
                     f"끝 자세가 다를 수 있다: {(self.plan or {}).get('detail', '')}")
+                # ⚠⚠ [2026-10-12] **복귀 실패 뒤에 Z 를 확인하고, 내려가 있으면
+                #   다음 단계로 넘어가지 않는다.** 복귀 단계가 곧 **Z 를 올리는**
+                #   단계다 — 실패했다는 것은 Z 가 내려간 채 남았을 수 있다는 뜻이다.
+                #   실측 2026-10-12 15:06: 세게 박아(절대 4.13A) Z 가 -30mm 로
+                #   후퇴하고 그 중단이 yaw 를 자세 사이에 남겼다. 복귀가 거부되자
+                #   여기서 경고만 남기고 **Z -30mm 로 650mm 주행을 시작했다**
+                #   (사람이 e-stop 으로 세웠다).
+                #   ⚠ 중첩 경로(아래)는 이미 Z 를 보고 있었다 — 이 경로만 빠져 있었다.
+                #   기준은 중첩과 같은 `drive_overlap_z_mm` 을 쓴다 ("주행해도 될
+                #   만큼 Z 가 올라왔다" 는 판정이 두 곳에서 갈리면 안 된다).
+                #   Z 를 **모를 때도 멈춘다** — 모르는 채로 주행하는 것이 더 나쁘다.
+                z = (self.plan or {}).get('z_mm')
+                if z is None or z < self.overlap_z:
+                    return self._abort(
+                        f"{s.text} — 복귀 실패로 Z 가 "
+                        + ('미확인' if z is None else f'{z:.1f}mm (기준 '
+                                                     f'{self.overlap_z:.1f}mm)')
+                        + ' 이다. 내려간 채로 주행하지 않는다 — 호밍하고 다시 시작')
             return self._next()
         if ph == 'failed':
             s.state = f"실패: {(self.plan or {}).get('detail', '')}"

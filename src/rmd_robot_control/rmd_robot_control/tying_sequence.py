@@ -194,6 +194,9 @@ class TyingSequence(Node):
         self._z_sent = False         # 이 목표에서 Z 하강을 이미 보냈는가
         self._xy_sent = False        # XY 목표를 한 번은 보냈는가
         self._xy_in_win = False      # 회전 중 XY 를 창 안으로 보냈는가
+        # ⚠⚠ [2026-10-12] yaw 를 못 가려 거부하기 **전에** Z 를 올렸는가.
+        #   Z 상승은 yaw 와 무관하고 안전 방향이다 — 아래 `_do_precheck` 참고.
+        self._z_before_pose = False
         self._xy_t = 0.0
         # 접수한 목표 수. **상위가 "내 목표가 들어갔나" 를 가리는 유일한 근거다.**
         # `step` 만 보면 안 된다 — 목표가 **이미 충족된 자리**에서는
@@ -252,6 +255,7 @@ class TyingSequence(Node):
         self.want_pose = None
         self._retract_tgt = None
         self._fire_phase = 0
+        self._z_before_pose = False   # 새 목표 — 이전 목표의 상태를 끌고 가지 않는다
         self.goals += 1
         self._enter(Step.PRECHECK,
                     f'목표 x={self.goal[0]:.1f} y={self.goal[1]:.1f}mm'
@@ -335,6 +339,23 @@ class TyingSequence(Node):
         if x is None or y is None:
             return self._reject('현재 X·Y mm 를 모른다 — 먼저 호밍하세요 (/homing_cmd)')
         cur = self._pose()
+        # ⚠⚠ [2026-10-12] **Z 상승을 yaw 판정보다 먼저 한다.**
+        #   전에는 자세를 못 가리면 여기서 바로 거부했고, 그래서 뒤에 있는
+        #   `Z_CLEAR` 가 **아예 실행되지 않았다** — Z 가 내려간 채로 거부만 남는다.
+        #   실측 2026-10-12 15:06: 세게 박아(절대 4.13A) Z 가 -30mm 로 후퇴하고
+        #   그 중단이 yaw 를 자세 사이에 남겼다. 그러자 '검출 자세 복귀'(= Z 를
+        #   올리는 단계)가 이 거부에 걸려 실패하고, navigator 는 경고만 남긴 채
+        #   **Z 가 내려간 상태로 650mm 주행을 시작했다.**
+        #   ⚠ Z 를 올리는 것은 **yaw 를 아는지와 무관하고 가장 안전한 방향**이다.
+        #     오히려 자세를 모를 때 더 필요하다. 같은 교훈이 아래 `_needs_z_clear`
+        #     주석에도 이미 있다 ("Z 를 올리는 것은 이 목표가 Z 를 쓰는지와 무관").
+        #   올린 뒤 `PRECHECK` 로 돌아와 자세 판정을 다시 한다 — 그래도 못 가리면
+        #   그때 거부한다. 거부는 같지만 **Z 는 올라가 있다.**
+        if cur is None and self._needs_z_clear():
+            self._z_before_pose = True
+            return self._enter(
+                Step.Z_CLEAR,
+                f"yaw 자세 미확인 — 먼저 Z 를 {self.z_safe:.0f}mm 로 올린다")
         if cur is None:
             return self._reject(
                 f"yaw 자세를 못 가린다 — {(self.stage or {}).get('pose_detail')}. "
@@ -373,10 +394,19 @@ class TyingSequence(Node):
         z = self._z()
         if z is None:
             return False                      # 모르면 판단하지 않는다
-        need = (self.z_safe if self.want_pose != self._pose() else self.z_clear)
+        # ⚠ 자세를 모르면 **회전이 필요한지도 모른다** → 가장 높은 쪽(`z_safe`)으로
+        #   본다. `None != None` 이 False 라 예전 식은 이 경우 `z_clear` 를 골랐다.
+        if self._pose() is None:
+            need = self.z_safe
+        else:
+            need = (self.z_safe if self.want_pose != self._pose() else self.z_clear)
         return z < need - self.z_tol
 
     def _after_z_clear(self, why):
+        # yaw 판정 전에 올린 경우 — 자세 판정을 다시 한다 (위 `_do_precheck` 참고)
+        if self._z_before_pose:
+            self._z_before_pose = False
+            return self._enter(Step.PRECHECK, f'{why} — Z 올림 완료, 자세 판정 다시')
         if self.want_pose == self._pose():
             # 자세가 그대로면 후퇴도 회전도 필요 없다
             return self._enter(Step.MOVE_XY, f'{why} (자세 유지) → 바로 이동')
