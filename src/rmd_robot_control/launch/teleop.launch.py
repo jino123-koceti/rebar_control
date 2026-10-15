@@ -375,6 +375,20 @@ def generate_launch_description():
             'gun_fire_sec': 1.0,
             'gun_return_sec': 1.0,
             'z_safe_mm': 0.0,
+            # ⚠⚠ [2026-10-12] **40 → 20mm.** XY 가 목표에서 이만큼 안으로 들면 Z
+            #   하강을 미리 보낸다(`_do_move_xy`). 판정이 `hypot` 이라 **방향을 안
+            #   본다** — 거의 순수 Y 이동이면 남은 40mm 가 사실상 전부 Y 라서,
+            #   Y 가 40mm 남은 시점에 건이 내려가기 시작해 **깊은 데서 Y 로 쓸린다.**
+            #   실측 2026-10-12: (78.1, 178.5)→(92.0, 264.6) (X 13.9 / Y 86.1mm) 점에서
+            #   `Z_DOWN→FIRE` 가 0.50s 였다 — 다른 점은 1.60/1.70/3.65s 였으니
+            #   XY 도착 시점에 Z 가 이미 거의 다 내려가 있었다는 뜻이다.
+            #   ⚠ 40 은 Z 가 20mm/s 일 때 잡은 값이다. 오늘 Z 를 45mm/s 로 올려
+            #     같은 40mm 구간에서 Z 가 두 배 넘게 내려간다.
+            #   20mm 면 XY 80mm/s 로 0.25s, 그 사이 Z 는 11mm 만 내려간다
+            #   (건 약 -23mm — 철근 접촉 깊이 -62~-69mm 보다 한참 위다).
+            #   ⚠ `self.blend` 는 **기동 때 한 번만 읽는다** — `ros2 param set` 으로는
+            #     안 먹고 서비스 재시작이 필요하다.
+            'xy_blend_mm': 20.0,
             # 모델 잔차가 Z 2.7mm 다. 실측 결속깊이는 -58~-83mm 였으니
             # 그 바깥은 모델이 틀린 것으로 보고 거부한다.
             'z_tie_min_mm': -95.0,
@@ -390,7 +404,20 @@ def generate_launch_description():
     planner = Node(
         package='rmd_robot_control', executable='tying_planner',
         name='tying_planner', output='screen',
-        parameters=[{'plan_only': False}],
+        parameters=[{
+            'plan_only': False,
+            # ⚠ [사용자 지시 2026-10-12] **0.5 → 0.6.** 계획에 쓸 교차점의 최소
+            #   신뢰도다 (`tying_planner` 가 `/rebar/crossings` 를 걸러낸다).
+            #   모델 임계(`crossing_detector` 의 `threshold` 0.3)는 그대로 둔다 —
+            #   낮은 것도 발행은 하게 두고 **쓸지 말지는 여기서** 정하는 구조다.
+            #   왜 올리나: 오검출 점으로 내려가면 철근 위를 눌러 "얕고 센" 충돌이
+            #   난다 (2026-10-12 31건 중 5건이 그 종류였고 한 번은 리모콘
+            #   리시버까지 죽였다). 자세·XY 오차와 달리 이건 점을 **안 고르면**
+            #   사라진다.
+            #   ⚠ 미션 시작 때마다 다시 읽는다 — `ros2 param set` 으로 바로 먹고
+            #     서비스 재시작이 필요 없다 (`_start()` 에서 다시 읽는다).
+            'min_confidence': 0.6,
+        }],
         respawn=True, respawn_delay=2.0,
     )
 

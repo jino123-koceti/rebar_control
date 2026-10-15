@@ -107,6 +107,19 @@ class TyingPlanner(Node):
         # 검출을 받고 바로 계획하지 않는다 — 검출은 여러 프레임을 합치므로
         # 발행까지 시간이 걸린다. 이 시간 안에 안 오면 실패로 본다.
         self.declare_parameter('min_confidence', 0.5)
+        # ⚠⚠ [2026-10-15] **모델이 다룰 수 있는 깊이 범위.** 밖이면 계획에서 뺀다.
+        #   왜: 모델은 깊이를 **안 쓴다** (`USE_DEPTH=False` — A 의 셋째 열이 전부 0).
+        #   교차점이 한 평면에 있다고 보고 cx·cy 만으로 환산하므로, 그 평면에서
+        #   벗어난 검출은 **엉뚱한 스테이지 좌표로 환산된다.**
+        #   실측 2026-10-15: 깊이 744mm 검출([6], 자세2)이 (0.5, 76.9)mm 로 환산돼
+        #   **교차점이 하나도 없는 자리로 장비가 갔다.** 짝의 깊이 범위는
+        #   자세1 363~548 · 자세2 425~585 · 자세3 451~639 · 자세4 374~541mm 라
+        #   744mm 는 어느 자세로도 외삽이다.
+        #   ⚠ 신뢰도 임계가 이것들을 **우연히** 걸러 주고 있었다 (먼 점일수록
+        #     신뢰도가 낮아서). 우연에 기대면 안 되고, 깊이로 직접 걸러야 한다.
+        #     이 필터가 있으면 `min_confidence` 를 낮춰 점 수를 늘려도 안전하다.
+        self.declare_parameter('depth_min_mm', 330.0)
+        self.declare_parameter('depth_max_mm', 660.0)
         # 교차점이 같은 자리에 두 번 잡히면 두 번 결속하게 된다. 스테이지
         # 좌표로 이만큼 안쪽이면 같은 점으로 본다.
         self.declare_parameter('dedup_mm', 25.0)
@@ -142,6 +155,8 @@ class TyingPlanner(Node):
         self.wait_sec = float(self.get_parameter('detect_wait_sec').value)
         self.pt_timeout = float(self.get_parameter('point_timeout_sec').value)
         self.min_conf = float(self.get_parameter('min_confidence').value)
+        self.depth_lo = float(self.get_parameter('depth_min_mm').value)
+        self.depth_hi = float(self.get_parameter('depth_max_mm').value)
         self.dedup = float(self.get_parameter('dedup_mm').value)
 
         self.env = load_envelope()
@@ -241,6 +256,8 @@ class TyingPlanner(Node):
         self.plan_only = bool(g('plan_only').value)
         self.send_z = bool(g('send_z').value)
         self.min_conf = float(g('min_confidence').value)
+        self.depth_lo = float(g('depth_min_mm').value)
+        self.depth_hi = float(g('depth_max_mm').value)
         self.dedup = float(g('dedup_mm').value)
         self.park_pose = int(g('park_pose').value)
         self.detect_x = float(g('detect_x_mm').value)
@@ -456,8 +473,13 @@ class TyingPlanner(Node):
         자세에 서 있는데 4번에 점이 더 많을 때 불필요하게 먼저 돈다.
         """
         reach = []                 # [(검출번호, 카메라좌표, {자세: 스테이지좌표})]
+        skipped_depth = []
         for i, d in enumerate(dets):
             if d.confidence < self.min_conf:
+                continue
+            # 모델이 외삽하게 두지 않는다 (위 `depth_min_mm` 주석 참고)
+            if not (self.depth_lo <= d.depth_mm <= self.depth_hi):
+                skipped_depth.append((i, d.depth_mm))
                 continue
             cam = (d.x, d.y, d.z)
             ok = {}
@@ -469,6 +491,14 @@ class TyingPlanner(Node):
                     ok[pose] = xyz
             if ok:
                 reach.append((i, cam, ok))
+
+        # ⚠ **조용히 버리지 않는다.** 왜 점이 줄었는지 로그에 남아야 사람이 안다
+        #   (이 저장소는 조용한 필터로 여러 번 시간을 잃었다).
+        if skipped_depth:
+            self.get_logger().warning(
+                f"깊이 범위 밖 {len(skipped_depth)}개 제외 "
+                f"(허용 {self.depth_lo:.0f}~{self.depth_hi:.0f}mm): "
+                + ", ".join(f"{i}번 {z:.0f}mm" for i, z in skipped_depth))
 
         left = list(reach)
         pose = (self.stage or {}).get('pose')
