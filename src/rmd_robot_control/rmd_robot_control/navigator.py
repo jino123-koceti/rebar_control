@@ -462,26 +462,27 @@ class Navigator(Node):
             #   시작한다 — 2026-10-04 에 3번 자세로 끝났는데 미션은 완료라고
             #   보고했다. 상태에 남기고 경고한다 (`ready` 가 다음 바퀴에서
             #   바로잡지만, 미션 마지막 단계면 바로잡을 기회가 없다).
-            if (self.plan or {}).get('park_ok') is False:
+            park_failed = (self.plan or {}).get('park_ok') is False
+            if park_failed:
                 s.state = '완료(복귀 실패)'
                 self.get_logger().warning(
                     f"{s.text} — 결속은 됐지만 검출 자세 복귀가 실패했다. "
                     f"끝 자세가 다를 수 있다: {(self.plan or {}).get('detail', '')}")
-                # ⚠⚠ [2026-10-12] **복귀 실패 뒤에 Z 를 확인하고, 내려가 있으면
-                #   다음 단계로 넘어가지 않는다.** 복귀 단계가 곧 **Z 를 올리는**
-                #   단계다 — 실패했다는 것은 Z 가 내려간 채 남았을 수 있다는 뜻이다.
-                #   실측 2026-10-12 15:06: 세게 박아(절대 4.13A) Z 가 -30mm 로
-                #   후퇴하고 그 중단이 yaw 를 자세 사이에 남겼다. 복귀가 거부되자
-                #   여기서 경고만 남기고 **Z -30mm 로 650mm 주행을 시작했다**
-                #   (사람이 e-stop 으로 세웠다).
-                #   ⚠ 중첩 경로(아래)는 이미 Z 를 보고 있었다 — 이 경로만 빠져 있었다.
-                #   기준은 중첩과 같은 `drive_overlap_z_mm` 을 쓴다 ("주행해도 될
-                #   만큼 Z 가 올라왔다" 는 판정이 두 곳에서 갈리면 안 된다).
-                #   Z 를 **모를 때도 멈춘다** — 모르는 채로 주행하는 것이 더 나쁘다.
+            # ⚠⚠ **Z 가 내려가 있으면 다음 단계로 넘어가지 않는다.**
+            #   2026-10-12 15:06: 충돌로 Z 가 -30mm 로 후퇴했는데 복귀가 거부되자
+            #   경고만 남기고 **그대로 650mm 주행을 시작했다**(사람이 e-stop).
+            #   2026-10-15: 검사가 `park_ok is False` 안에만 있었는데, **복귀가
+            #   성공해도 Z 는 내려앉는다** — 브레이크를 풀면 출력축 12.7° 떨어진다.
+            #   그래서 바깥으로 뺐다 (`tools/test/nav_drive_gate_sim.py` 조합 [1]).
+            #   기준은 중첩 경로와 같은 `drive_overlap_z_mm`, **모를 때도 멈춘다.**
+            #   단 **다음이 장비를 움직일 때만** 본다 (`tie` 면 스스로 올린다).
+            moves_base = self._next_kind() in ('drive', 'lateral')
+            if park_failed or moves_base:
                 z = (self.plan or {}).get('z_mm')
                 if z is None or z < self.overlap_z:
+                    why = '복귀 실패로' if park_failed else f'다음이 {self._next_kind()} 인데'
                     return self._abort(
-                        f"{s.text} — 복귀 실패로 Z 가 "
+                        f"{s.text} — {why} Z 가 "
                         + ('미확인' if z is None else f'{z:.1f}mm (기준 '
                                                      f'{self.overlap_z:.1f}mm)')
                         + ' 이다. 내려간 채로 주행하지 않는다 — 호밍하고 다시 시작')

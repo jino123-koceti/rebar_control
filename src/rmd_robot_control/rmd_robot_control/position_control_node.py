@@ -84,6 +84,10 @@ class PositionControlNode(Node):
         # 주행 모터 하드 차단(0x80) 임계 [A]. RMD-X4-36 피크 21.5A(rms) 를 넘기지 말 것.
         # 실측 참고: 전후진 최대 5.51A, 선회 최대 7.63A 이므로 18A 는 이미 2.4배 여유다.
         self.declare_parameter('drive_i_hard_a', 18.0)
+        # ⚠ [2026-10-15] 주행 보호가 걸린 뒤 **자동 해제까지의 냉각 시간**.
+        #   트립은 0x80 으로 출력을 끊으므로 이 동안 전류 0 · 발열 없음.
+        #   짧으면 끼임에서 빨리 회복하고, 길면 고장난 모터를 덜 건드린다.
+        self.declare_parameter('drive_trip_cooldown_sec', 10.0)
         # cmd_vel 이 이 시간 이상 끊기면 주행을 자동 정지한다. 0 이면 비활성.
         self.declare_parameter('cmd_vel_timeout', 0.5)
         # 관절(상부 축) 속도 명령이 끊겼을 때 자동 정지하는 시간.
@@ -125,6 +129,8 @@ class PositionControlNode(Node):
         self.wheel_max_dps = self.get_parameter('wheel_max_dps').value
         self.max_angular_vel = self.get_parameter('max_angular_vel').value
         self.drive_i_hard_a = float(self.get_parameter('drive_i_hard_a').value)
+        self.drive_cooldown = float(
+            self.get_parameter('drive_trip_cooldown_sec').value)
         self.cmd_vel_timeout = float(self.get_parameter('cmd_vel_timeout').value)
         self.joint_speed_timeout = float(self.get_parameter('joint_speed_timeout').value)
         # 관절별 마지막 속도 명령: {motor_id: (speed_dps, 시각)}
@@ -146,7 +152,8 @@ class PositionControlNode(Node):
         }
         self.get_logger().info(
             f"주행 보호: 정격 {I_RATED_A}A / 즉시차단 {self.drive_i_hard_a}A / "
-            f"I²t {I2T_BUDGET:.0f} A²s / 온도 {TEMP_STOP_C}°C")
+            f"I²t {I2T_BUDGET:.0f} A²s / 온도 {TEMP_STOP_C}°C / "
+            f"트립시 0x80 차단, {self.drive_cooldown:.0f}s 뒤 자동 해제")
 
         # 주행 모터 가감속 상한 설정은 기동 시 호출하지 않는다 (2026-09-08):
         #  1) 이 시점엔 can_manager.connect() 전이라 소켓이 없어 8건 전부 실패했다.
@@ -227,6 +234,8 @@ class PositionControlNode(Node):
         self.drive_cmd_active = False # 0 이 아닌 주행 명령이 살아 있는가
         self.drive_trip_reason = ""
         self.drive_normal_since = None
+        self.drive_trip_at = 0.0      # 트립 시각 — 냉각 해제 판정에 쓴다
+        self.drive_cool_now = 0.0     # 이번 트립의 냉각 시간 (즉시차단은 3배)
 
         # 모터 ID → 축 이름. 안전 차단에서 "x+" 같은 방향 표기와 맞추기 위한 것이다.
         # axes.yaml 과 같은 배치 (3차년도 실측).
@@ -1423,9 +1432,12 @@ class PositionControlNode(Node):
     def drive_protect(self, motor_id: int, current: float, speed: float, temperature: int):
         """주행 모터 보호 감시. 응답이 올 때마다 호출된다.
 
-        SEV_HARD(18A 초과) → 두 주행 모터 모두 0x80 SHUTDOWN.
-        그 외(I²t 초과, 스톨, 온도) → 속도 0 + 0x81 정지.
-        어느 쪽이든 래치가 걸려 해제 전까지 cmd_vel 을 무시한다.
+        ⚠ [2026-10-15] **어느 트립이든 두 주행 모터를 0x80 으로 끊는다.**
+        예전에는 SEV_HARD(18A 초과)만 0x80 이고 그 외(I²t·스톨·온도)는
+        `속도 0 + 0x81` 이었는데, 그 둘은 모터를 여자 상태로 남겨 **보호가
+        발열원이 됐다** (아래 `drive_latch_tick` 주석에 실측 경위).
+        차이는 냉각 시간뿐이다 — 즉시차단은 3배로 길게 둔다.
+        래치가 걸린 동안 cmd_vel 을 무시하고, 해제는 시간으로 한다.
         바퀴는 떨어질 것이 없으므로 횡이동과 달리 '후퇴' 동작은 없다.
         """
         pr = self.drive_prot.get(motor_id)
@@ -1438,34 +1450,30 @@ class PositionControlNode(Node):
             self.drive_tripped = True
             self.drive_trip_reason = f"0x{motor_id:03X} {reason}"
             self.drive_normal_since = None
-            if sev == SEV_HARD:
-                self.get_logger().error(f"⛔ 주행 즉시 차단: {self.drive_trip_reason}")
-                self.shutdown_drive_motors()
-            else:
-                self.get_logger().error(f"⛔ 주행 정지: {self.drive_trip_reason}")
-                for mid in self.drive_prot:
-                    self.send_speed_command(mid, 0)
-                    self.can_manager.send_frame(
-                        mid, self.protocol.create_system_command(CommandType.MOTOR_STOP))
+            self.drive_trip_at = now
+            # ⚠⚠ [2026-10-15] **어느 경우든 0x80 으로 완전히 끊는다.**
+            #   전에는 스톨·I²t·온도 트립에서 `속도 0 + 0x81` 로만 멈췄는데, 그 둘은
+            #   모터를 **여자 상태로 남긴다** (`shutdown_drive_motors` 주석 참고 —
+            #   0x81 뒤에도 0.6~1.4A 가 흘렀고 0x80 에서만 0.00A 가 되었다).
+            #   속도모드의 "속도 0" 은 놓는 게 아니라 **0dps 를 능동으로 붙잡는 것**이라,
+            #   걸린 바퀴를 계속 밀면서 열이 쌓인다.
+            #   실측 2026-10-15 (좌측 0x142 고장): 사람이 스틱을 3~4초 밀었는데
+            #   **8.6A 가 20초 내내** 흘렀고 온도가 45 → 67°C 로 올랐다. 해제 조건이
+            #   "전류 정격(6.1A) 이하 3초" 인데 붙잡는 전류가 그보다 높아 **스스로 못
+            #   푸는 교착**이었다 — 선을 뽑아야 끊겼다. **보호가 손상을 키웠다.**
+            # 즉시차단(18A 초과)은 단순 스톨보다 험한 상황이라 더 오래 식힌다.
+            self.drive_cool_now = self.drive_cooldown * (3.0 if sev == SEV_HARD else 1.0)
+            self.get_logger().error(
+                f"⛔ 주행 {'즉시차단' if sev == SEV_HARD else '보호정지'}(0x80): "
+                f"{self.drive_trip_reason} — {self.drive_cool_now:.0f}s 뒤 자동 해제")
+            self.shutdown_drive_motors()
             for q in self.drive_prot.values():
                 self.get_logger().error(f"   {q.summary()}")
             return
 
-        # 래치 해제: 두 축 모두 정격 이하로 3초 유지
-        if self.drive_tripped:
-            hot = any(abs(q.peak_a) > I_RATED_A and q.i2t > I2T_BUDGET * 0.5
-                      for q in self.drive_prot.values())
-            if abs(current) < I_RATED_A and not hot:
-                if self.drive_normal_since is None:
-                    self.drive_normal_since = now
-                elif now - self.drive_normal_since > 3.0:
-                    self.get_logger().info("✅ 주행 보호 해제 (3초간 정격 이하)")
-                    self.drive_tripped = False
-                    self.drive_trip_reason = ""
-                    for q in self.drive_prot.values():
-                        q.reset()
-            else:
-                self.drive_normal_since = None
+        # 해제는 `drive_latch_tick` 이 **냉각 시간**으로 한다 (아래 주석 참고).
+        #   0x80 으로 끊으면 모터가 응답을 안 하므로, 여기서 전류를 보고 푸는
+        #   예전 방식은 애초에 돌지 않는다.
 
     def _on_safety(self, msg):
         self.safety = msg
@@ -1584,19 +1592,35 @@ class PositionControlNode(Node):
             self.send_speed_command(mid, 0)
 
     def drive_latch_tick(self):
-        """보호 래치가 걸린 동안 속도 0 을 보내 해제 판정을 돌린다.
+        """보호 래치를 **냉각 시간이 지나면** 푼다.
 
-        해제 조건은 drive_protect() 안에 있고, drive_protect() 는 0xA2 응답이
-        올 때만 호출된다. 그런데 cmd_vel_callback 은 래치가 걸리면 명령을
-        보내지 않으므로 — 명령이 없으면 응답이 없고, 응답이 없으면 해제
-        판정이 영영 실행되지 않는다. 교착이다.
-        (2026-09-15 실측: "cmd_vel 무시" 1,247회 후에도 미해제, 노드 재시작으로만 복구)
-        속도 0 은 이미 멈춘 모터에 무해하면서 필요한 응답을 만들어낸다.
+        ⚠⚠ [2026-10-15] 전에는 여기서 **속도 0 을 계속 재전송**했다. 해제 판정이
+          0xA2 응답이 올 때만 돌아서, 명령이 없으면 응답이 없고 응답이 없으면
+          영영 안 풀리는 교착을 깨려던 것이었다 (2026-09-15: "cmd_vel 무시"
+          1,247회 후에도 미해제).
+          그런데 **속도 0 은 모터를 붙잡는 명령**이라, 고장나서 안 도는 모터에는
+          이 재전송이 그대로 **가열원**이 됐다 (2026-10-15 좌측 0x142: 8.6A 가
+          20초 내내, 45 → 67°C). 교착을 푸는 대가로 모터를 구운 셈이다.
+
+        이제 트립은 `0x80` 으로 출력을 끊으므로 전류가 0 이 되고 더는 뜨거워지지
+        않는다. 대신 모터가 응답하지 않으니 전류로 해제를 판정할 수 없어
+        **시간으로 푼다.** 풀리면 모터는 꺼진 상태 그대로고, 다음 `cmd_vel` 이
+        오면 다시 켜진다. 그때도 걸려 있으면 1초 안에 다시 트립하므로
+        가동률이 낮게 유지된다 — 일시적 끼임은 스스로 회복되고 진짜 고장은
+        트립을 반복하며 로그로 드러난다.
         """
         if not self.drive_tripped:
             return
-        for mid in self.drive_prot:
-            self.send_speed_command(mid, 0)
+        if time.time() - self.drive_trip_at < self.drive_cool_now:
+            return
+        self.get_logger().info(
+            f"✅ 주행 보호 해제 ({self.drive_cool_now:.0f}s 냉각 완료) — "
+            f"다음 cmd_vel 에 다시 켜진다")
+        self.drive_tripped = False
+        self.drive_trip_reason = ""
+        self.drive_normal_since = None
+        for q in self.drive_prot.values():
+            q.reset()
 
     def shutdown_drive_motors(self):
         """주행 모터 완전 차단. 0x80 만이 실제로 출력을 끊는다.
