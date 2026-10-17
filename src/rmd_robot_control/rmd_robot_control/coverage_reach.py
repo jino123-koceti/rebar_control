@@ -136,7 +136,12 @@ class Reach:
     def from_files(cls, model_path=None, axes_path=None, canon=1):
         """`stage_camera.yaml` + `axes.yaml` 에서 만든다."""
         import yaml
-        root = os.path.expanduser('~/ros2_ws/src/rebar_control')
+        # ⚠ 경로를 집 디렉터리에 박지 않는다. 이 모듈 위치에서 저장소
+        #   뿌리를 찾아, 젯슨이 아닌 곳(워크스테이션)에서도 그대로 돈다.
+        #   `REBAR_ROOT` 로 덮어쓸 수 있다.
+        root = os.environ.get('REBAR_ROOT') or os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         '..', '..', '..'))
         model_path = model_path or f'{root}/data/calibration/stage_camera.yaml'
         axes_path = axes_path or f'{root}/src/rebar_base_control/config/axes.yaml'
         M = yaml.safe_load(open(model_path))

@@ -384,8 +384,31 @@ def scn_field(reach, blocked_rect=None):
         no_tie = [(u, v) for u in us for v in vs
                   if u0 <= u <= u1 and v0 <= v <= v1]
     w = World(us, vs, no_tie=no_tie, drive_sigma=4.0)
-    mid = _mid(reach)
-    return w, None, (us[0] - mid[0], vs[0] - mid[1])
+    return w, None, _start_corner(reach, us[0], vs[0])
+
+
+def scn_bed(reach, w_mm=4200.0, h_mm=3000.0, pitch=200.0):
+    """**테스트베드 실제 치수** — 4200 × 3000mm, 배근 200mm (22열 × 16행 = 352점).
+
+    장애물 없는 깨끗한 판이다. 한 정차에 3열 × 2행 = 6점이 닿으므로
+    열 22 → 8묶음, 행 16 → 8레인 → 정차 64회가 기하학적 최소다.
+    """
+    us = [i * pitch for i in range(int(w_mm / pitch) + 1)]
+    vs = [j * pitch for j in range(int(h_mm / pitch) + 1)]
+    w = World(us, vs, drive_sigma=3.0)
+    return w, None, _start_corner(reach, us[0], vs[0], w)
+
+
+def scn_bed(reach, w_mm=4200.0, h_mm=3000.0, pitch=200.0):
+    """**테스트베드 실제 치수** — 4200 x 3000mm, 배근 200mm (22열 x 16행 = 352점).
+
+    장애물 없는 깨끗한 판이다. 한 정차에 3열 x 2행 = 6점이 닿으므로
+    열 22 → 8묶음, 행 16 → 8레인, 정차 64회가 기하학적 최소다.
+    """
+    us = [i * pitch for i in range(int(round(w_mm / pitch)) + 1)]
+    vs = [j * pitch for j in range(int(round(h_mm / pitch)) + 1)]
+    w = World(us, vs, drive_sigma=3.0)
+    return w, None, _start_corner(reach, us[0], vs[0], w)
 
 
 def scn_wall(reach, where='mid', pitch=200.0, col=300.0):
@@ -408,8 +431,7 @@ def scn_wall(reach, where='mid', pitch=200.0, col=300.0):
     cu = (us[-2] if where == 'end' else us[len(us) // 2])
     cols = [(cu, vs[len(vs) // 2], col, col)]
     w = World(us, vs, columns=cols, drive_sigma=3.0)
-    mid = _mid(reach)
-    return w, None, (us[0] - mid[0], vs[0] - mid[1])
+    return w, None, _start_corner(reach, us[0], vs[0], w)
 
 
 def scn_gap(reach, gap_mm):
@@ -428,13 +450,39 @@ def scn_gap(reach, gap_mm):
     cols = [(uw, (lo0 + lo1) / 2, th, lo1 - lo0),
             (uw, (hi0 + hi1) / 2, th, hi1 - hi0)]
     w = World(us, vs, columns=cols, drive_sigma=3.0)
-    mid = _mid(reach)
-    return w, None, (us[0] - mid[0], vs[0] - mid[1])
+    return w, None, _start_corner(reach, us[0], vs[0], w)
 
 
 def _mid(reach):
     b = reach.bbox()
     return (0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3]))
+
+
+def _start_corner(reach, u0, v0, world=None, inset=20.0, step=50.0):
+    """첫 교차점이 결속영역의 **가까운 모서리**에 오도록 서는 자리.
+
+    ⚠ 가운데에 맞춰 세우면 영역의 절반이 판 바깥으로 나가, 첫 레인이
+      **한 줄만** 묶는다 (사용자 지적 2026-10-17). 모서리에 붙이면 첫
+      정차부터 3열 × 2행 = 6점이 들어온다. 실제 운용도 작업영역 모서리에
+      붙여 세운다.
+
+    ⚠⚠ **설 수 있는 자리인지 확인해야 한다.** 몸체가 1160mm 라 모서리에
+      바짝 붙이면 근처 기둥에 걸친다 — 실제로 로봇이 기둥 위에서 시작하는
+      결과가 나왔다(자체 검사가 잡았다). 걸리면 **뒤로 물러나며** 설 수
+      있는 자리를 찾는다. 들어오는 방향이 그쪽이라 물러나는 것이 자연스럽다.
+    """
+    b = reach.bbox()
+    ru, rv = u0 - b[0] - inset, v0 - b[2] - inset
+    if not world or not getattr(world, 'columns', None):
+        return (ru, rv)
+    from rmd_robot_control.coverage_space import FreeSpace
+    sp = FreeSpace(center=(0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3])))
+    for cu, cv, su, sv in world.columns:
+        sp.add(cu - su / 2, cu + su / 2, cv - sv / 2, cv + sv / 2)
+    for i in range(80):
+        if sp.occupiable(ru - i * step, rv):
+            return (ru - i * step, rv)
+    return (ru, rv)
 
 
 def main():
@@ -455,6 +503,10 @@ def main():
     print(f'   횡이동 양자화 {LAT_MM_PER_TURN:.0f}mm/회전')
 
     todo = []
+    if a.only in ('', 'bed'):
+        todo += [('테스트베드 4200 x 3000mm · 배근 200mm', scn_bed(reach))]
+    if a.only in ('', 'bed'):
+        todo += [('테스트베드 4200 x 3000mm · 배근 200mm', scn_bed(reach))]
     if a.only in ('', 'wall'):
         todo += [('현실 배근 15x11 + 기둥(끝쪽)', scn_wall(reach, 'end')),
                  ('현실 배근 15x11 + 기둥(한가운데)', scn_wall(reach, 'mid'))]

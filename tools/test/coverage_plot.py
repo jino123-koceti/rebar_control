@@ -57,18 +57,38 @@ def _draw(ax, world, trace, reach_bbox, title, note=''):
         return (pose[0] + rmid[0], pose[1] + rmid[1])
 
     if trace['stops']:
-        ru, rv = trace['stops'][0]['pose']
+        # 결속영역은 **묶은 점이 많고, 그 묶음이 영역 한가운데 들어오는**
+        # 정차지에 그린다.
+        # ⚠ 첫 정차지는 판 모서리라 교차점이 덜 들어와 "한 번에 몇 점" 이
+        #   안 보이고, 가장 많이 묶은 곳만 고르면 묶음이 영역 안에서 한쪽으로
+        #   쏠려 보인다 (사용자 지적 2026-10-17). 가운데 정렬까지 보면
+        #   사각·교차점·정차지 원이 저절로 같이 맞는다 — 위치를 꾸밀 필요가 없다.
+        def _pick(i):
+            ru, rv = trace['stops'][i]['pose']
+            ins = [(u, v) for (u, v) in trace['cells']
+                   if ru + b[0] <= u <= ru + b[1] and rv + b[2] <= v <= rv + b[3]]
+            if not ins:
+                return (0, 1e9)
+            cu = sum(u for u, _v in ins) / len(ins)
+            cv = sum(v for _u, v in ins) / len(ins)
+            err = abs(cu - (ru + rmid[0])) + abs(cv - (rv + rmid[1]))
+            return (len(ins), -err)
+        k = max(range(len(trace['stops'])), key=_pick)
+        ru, rv = trace['stops'][k]['pose']
         ax.add_patch(Rectangle((ru + b[0], rv + b[2]), b[1] - b[0], b[3] - b[2],
                                fc=C_REACH, alpha=0.10, ec=C_REACH, ls='--',
-                               lw=1.2, zorder=2))
-        # 사각 **바깥 왼쪽 아래**에 붙인다. 안쪽에 두면 출발점·1번 번호와
-        # 겹친다 (사각의 네 모서리에 전부 뭔가가 온다).
-        ax.text(ru + b[0] - 10, rv + b[2] - 14, '결속 가능 영역 (한 정차지)',
-                color=C_REACH, fontsize=7.5, va='top', ha='left', zorder=6)
+                               lw=1.6, zorder=2))
+        inside = [(u, v) for (u, v) in trace['cells']
+                  if ru + b[0] <= u <= ru + b[1] and rv + b[2] <= v <= rv + b[3]]
+        for u, v in inside:
+            ax.plot(u, v, 'o', ms=23, mfc='none', mec=C_REACH, mew=2.4, zorder=6)
+        ax.text(ru + b[0] - 10, rv + b[2] - 14,
+                f'한 정차지의 결속 가능 영역 — 교차점 {len(inside)}개',
+                color=C_REACH, fontsize=11, va='top', ha='left', zorder=6)
 
-    # 이동 경로 — **계획이 실제로 간 경로를 그린다.** 전에는 ㄱ자를 다시
-    # 만들어 그렸는데, 기둥을 돌아가는 경로는 구간이 셋 이상이라 그러면
-    # **기둥을 관통하는 선**이 나온다 (사용자 지적 2026-10-17).
+    # 이동 경로 — **계획이 실제로 간 경로**를 정차지끼리 잇는다.
+    # ⚠ ㄱ자를 다시 만들어 그리면 기둥을 돌아가는 경로가 **관통하는 선**이
+    #   된다 (사용자 지적). 저장된 경로를 그대로 쓴다.
     P = [cen(s_['pose']) for s_ in trace['stops']]
     for i, s_ in enumerate(trace['stops'][:-1]):
         raw = s_.get('out') or [s_['pose'], trace['stops'][i + 1]['pose']]
@@ -78,38 +98,31 @@ def _draw(ax, world, trace, reach_bbox, title, note=''):
             lat = abs(p1[1] - p0[1]) > 1.0
             ax.annotate('', xy=p1, xytext=p0, zorder=4,
                         arrowprops=dict(arrowstyle='-|>',
-                                        shrinkA=4 if k == 0 else 0,
-                                        shrinkB=4 if k == len(legs) - 1 else 0,
+                                        shrinkA=11 if k == 0 else 0,
+                                        shrinkB=11 if k == len(legs) - 1 else 0,
                                         color=C_LAT if lat else C_DRIVE,
                                         lw=3.4 if lat else 2.0, alpha=0.95))
-        if not legs:
-            continue
-        # 번호는 **가장 긴 구간** 위에. ㄱ자의 두 구간이 겹치지 않게 비켜 둔다
-        p0, p1 = max(legs, key=lambda L: abs(L[1][0] - L[0][0])
-                     + abs(L[1][1] - L[0][1]))
-        lat = abs(p1[1] - p0[1]) > 1.0
-        f = 0.35 if lat else 0.40
-        mx, my = p0[0] + (p1[0] - p0[0]) * f, p0[1] + (p1[1] - p0[1]) * f
-        off = 0.14 * (b[3] - b[2])
-        tx, ty = (mx + off * 2.1, my) if lat else (mx, my + off)
-        ax.text(tx, ty, str(i + 1), ha='center', va='center', fontsize=9.5,
-                color=C_LAT if lat else C_DRIVE, zorder=8,
-                bbox=dict(fc='#FFFFFF', ec='#CFD8DC', lw=0.8, pad=1.6,
-                          boxstyle='round,pad=0.25'))
 
     # 교차점 상태
     for (u, v), st in trace['cells'].items():
         col = {'tied': C_TIED, 'failed': C_FAIL, 'blocked': C_FAIL}.get(st, C_LEFT)
         mk = 'o' if st == 'tied' else ('X' if st in ('failed', 'blocked') else 's')
-        ax.plot(u, v, mk, ms=11 if mk == 'X' else 9, color=col,
+        ax.plot(u, v, mk, ms=15 if mk == 'X' else 12, color=col,
                 mec='white', mew=1.2, zorder=5)
 
-    # 출발 표시 — 순서가 어디서 시작하는지는 있어야 읽힌다
-    if P:
-        ax.plot(P[0][0], P[0][1], 'o', ms=13, color='#FFFFFF',
-                mec='#37474F', mew=1.6, zorder=7)
-        ax.text(P[0][0], P[0][1], 'S', ha='center', va='center', fontsize=8.5,
-                color='#37474F', zorder=8)
+    # 정차지 — 번호가 곧 순서다. 같은 자리를 다시 들르면 한 동그라미에 모은다.
+    # ⚠ 교차점끼리 화살표로 잇는 방식도 써 봤는데, 결속영역 중심이 교차점
+    #   줄과 어긋나면(모서리 시작) 선이 줄 사이로 지나가 더 헷갈린다.
+    order = {}
+    for i, s_ in enumerate(trace['stops']):
+        c_ = cen(s_['pose'])
+        order.setdefault((round(c_[0]), round(c_[1])), []).append(i + 1)
+    for (ru, rv), ns in order.items():
+        lab = ','.join(str(n) for n in ns)
+        w = 20 + 6 * (len(lab) - 1)
+        ax.plot(ru, rv, 'o', ms=w, color='white', mec='#37474F', mew=1.8, zorder=7)
+        ax.text(ru, rv, lab, ha='center', va='center',
+                fontsize=11 if len(lab) < 3 else 9, color='#37474F', zorder=8)
 
     # 축 범위 — 내용에 딱 맞춘다. 요약 상자 자리를 만들려고 축을 늘렸더니
     # 그림이 위로 밀려 보였다 (사용자 지적). 요약은 제목 아래로 뺀다.
@@ -125,11 +138,11 @@ def _draw(ax, world, trace, reach_bbox, title, note=''):
     # ⚠ 요약을 제목 위 여백에 띄우지 않는다. `aspect='equal'` 이면 축 상자가
     #   줄면서 그 글씨가 그림 밖으로 밀려 **제목이 잘린다**(실제로 그랬다).
     #   요약은 `save_*` 가 범례 위 고정 자리에 그린다.
-    ax.set_title(title, fontsize=11.5, pad=9)
-    ax.set_xlabel('U — 주행방향 (mm)', fontsize=9)
-    ax.set_ylabel('V — 횡방향 (mm)', fontsize=9)
+    ax.set_title(title, fontsize=14, pad=11)
+    ax.set_xlabel('U — 주행방향 (mm)', fontsize=11)
+    ax.set_ylabel('V — 횡방향 (mm)', fontsize=11)
     ax.set_aspect('equal')
-    ax.tick_params(labelsize=8)
+    ax.tick_params(labelsize=10)
     ax.grid(alpha=0.15)
 
 
@@ -145,10 +158,10 @@ def _legend(fig, y):
         plt.Line2D([], [], color=C_DRIVE, lw=1.6, label='주행 (싸다)'),
         plt.Line2D([], [], color=C_LAT, lw=3.2, label='횡이동 (비싸다 — 7배)'),
         plt.Line2D([], [], marker='o', ls='', mfc='white', mec='#37474f',
-                   ms=9, label='출발 지점 (S) · 숫자 = 이동 순서'),
+                   ms=11, label='정차지 (번호 = 순서)'),
     ]
-    ncol = 7 if fig.get_figwidth() > 10 else 4
-    fig.legend(handles=h, loc='lower center', ncol=ncol, fontsize=8.5,
+    ncol = 7 if fig.get_figwidth() > 14 else 4
+    fig.legend(handles=h, loc='lower center', ncol=ncol, fontsize=11,
                frameon=False, bbox_to_anchor=(0.5, 0.004))
 
 
@@ -165,8 +178,8 @@ def _finish(fig, axes, notes, path):
       고정 비율로 잡고, **실제로 그려진 축 위치를 읽어** 글씨를 놓는다.
     """
     nl = _note_lines(notes)
-    legend_h = 0.055 if fig.get_figwidth() > 10 else 0.095
-    note_h = (0.050 + 0.024 * nl) * (6.6 / fig.get_figheight())
+    legend_h = 0.050 if fig.get_figwidth() > 14 else 0.075
+    note_h = (0.050 + 0.024 * nl) * (9.2 / fig.get_figheight())
     one = len(axes) == 1
     fig.subplots_adjust(top=0.935, bottom=legend_h + note_h + 0.065,
                         left=0.095 if one else 0.055,
@@ -180,7 +193,7 @@ def _finish(fig, axes, notes, path):
         # 축 아래에 **매단다**(va='top'). 그림 아래에서 재면 x축 라벨과 겹친다 —
         # 축 높이가 비율 때문에 그릴 때 바뀌기 때문이다.
         fig.text(pos.x0 + pos.width / 2, pos.y0 - 0.072, nt, ha='center',
-                 va='top', fontsize=8.5, color='#37474f', linespacing=1.45)
+                 va='top', fontsize=11, color='#37474f', linespacing=1.45)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fig.savefig(path, dpi=160)
     plt.close(fig)
@@ -188,13 +201,13 @@ def _finish(fig, axes, notes, path):
 
 
 def save_one(world, trace, reach_bbox, title, path, note=''):
-    fig, ax = plt.subplots(figsize=(7.8, 6.8))
+    fig, ax = plt.subplots(figsize=(11.0, 9.2))
     _draw(ax, world, trace, reach_bbox, title, note)
     return _finish(fig, [ax], [note], path)
 
 
 def save_compare(world, left, right, reach_bbox, titles, path, notes=('', '')):
-    fig, axs = plt.subplots(1, 2, figsize=(13.6, 6.8))
+    fig, axs = plt.subplots(1, 2, figsize=(19.0, 9.2))
     for ax, tr, t, nt in zip(axs, (left, right), titles, notes):
         _draw(ax, world, tr, reach_bbox, t, nt)
     return _finish(fig, list(axs), list(notes), path)

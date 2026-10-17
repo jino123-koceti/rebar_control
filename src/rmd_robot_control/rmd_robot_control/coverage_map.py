@@ -588,10 +588,19 @@ class CoverageMap:
         return out
 
     def covered(self, ru, rv):
-        """그 포즈에서 결속 가능한 pending 셀들."""
+        """그 포즈에서 결속 가능한 pending 셀들.
+
+        ⚠ 사각 선필터를 먼저 건다. `pose_for` 는 자세 네 개를 다 계산하므로
+          비싼데, 결속영역 외접 사각 밖은 어차피 None 이다. 352점짜리
+          테스트베드에서 이 한 줄이 후보 평가를 수십 배 줄인다.
+        """
+        b = self.reach_bbox
         got = []
         for c in self.pending():
-            p = self.reach.pose_for(c.u - ru, c.v - rv)
+            du, dv = c.u - ru, c.v - rv
+            if not (b[0] <= du <= b[1] and b[2] <= dv <= b[3]):
+                continue
+            p = self.reach.pose_for(du, dv)
             if p is not None:
                 got.append((c, p))
         return got
@@ -599,8 +608,15 @@ class CoverageMap:
     def covered_frontier(self, ru, rv, fr=None):
         """그 포즈에서 **결속영역 안에 들어오는 못 본 자리** 수."""
         fr = self.frontier() if fr is None else fr
-        return sum(1 for _k, (u, v) in fr
-                   if self.reach.pose_for(u - ru, v - rv) is not None)
+        b = self.reach_bbox
+        n = 0
+        for _k, (u, v) in fr:
+            du, dv = u - ru, v - rv
+            if not (b[0] <= du <= b[1] and b[2] <= dv <= b[3]):
+                continue
+            if self.reach.pose_for(du, dv) is not None:
+                n += 1
+        return n
 
     def explore_candidates(self, fr=None):
         """못 본 자리를 **시야에** 넣는 포즈들. 결속영역이 아니라 시야 기준이다.
@@ -668,8 +684,8 @@ class CoverageMap:
         if best:
             # 레인 유지 — 같은 레인에서 웬만큼 벌 수 있으면 비싼 횡이동을 미룬다
             if stay and stay[1]['score'] >= (1.0 - self.lane_stick) * best[1]['score']:
-                return stay[1]
-            return best[1]
+                return self._centre(stay[1])
+            return self._centre(best[1])
 
         for ru, rv, turns, n in self.explore_candidates(fr):
             if abs(ru - self.ru) < 1.0 and turns == 0:
@@ -687,6 +703,41 @@ class CoverageMap:
                             'reveal': n, 'cost_s': cst, 'score': 0.0,
                             'path': path})
         return best[1] if best else None
+
+    def _centre(self, plan):
+        """**덮을 것을 고른 뒤, 그 묶음 가운데로 자세를 옮긴다.**
+
+        점수는 "무엇을 덮나" 만 정한다. 같은 것을 덮는 자세가 여럿이면 묶음이
+        결속영역 한가운데 오는 쪽이 낫다 — 검출·주행 오차에 대한 여유가
+        사방으로 고르게 생기고, 그림도 "한 정차에 3열 × 2행" 으로 읽힌다.
+
+        ⚠ 옮긴 자세가 **같은 셀을 그대로 덮고**, 설 수 있고, 갈 수 있어야만
+          받아들인다. 하나라도 어긋나면 원래 자세를 쓴다.
+        """
+        cells = plan.get('cells') or []
+        if len(cells) < 2:
+            return plan
+        pts = [self.cells[k] for k in cells if k in self.cells]
+        if not pts:
+            return plan
+        cu = sum(c.u for c in pts) / len(pts)
+        cv = sum(c.v for c in pts) / len(pts)
+        ru = cu - self.reach_mid[0]
+        turns = round((cv - self.reach_mid[1] - self.rv) / self.lat_mm)
+        rv = self.rv + turns * self.lat_mm
+        if abs(ru - plan['ru']) < 1.0 and abs(rv - plan['rv']) < 1.0:
+            return plan
+        got = {c.key() for c, _p in self.covered(ru, rv)}
+        if not set(cells).issubset(got):
+            return plan
+        pr = self.path_to(ru, rv)
+        if pr is None:
+            return plan
+        cst, path = pr
+        plan = dict(plan, ru=ru, rv=rv, turns=turns, cost_s=cst, path=path,
+                    drive_mm=ru - self.ru,
+                    cells=[c.key() for c, _p in self.covered(ru, rv)])
+        return plan
 
     def snapshot(self):
         return {
