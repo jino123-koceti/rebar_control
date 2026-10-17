@@ -53,7 +53,17 @@ tools/test/enc_log.json
 
 # 학습 가중치 — GitHub 100MB 한도를 넘는다. 저장소가 아니라 별도 보관.
 model/
+!model/*.md          # 인수인계 문서는 올린다 (가중치만 빼는 것이 목적이다)
 *.pt
 *.pth
 *.onnx
 *.engine
+
+# --- 실험 중 쌓인 이미지 (결론은 문서·메모리에 있다) ---
+#   건 끝 위치 측정(gunpx 177MB)·스윕(gunsurvey 20MB)·현장 스냅샷 31MB.
+#   재현하려면 tools/test/ 의 도구를 다시 돌리면 된다.
+data/vision/gunpx/
+data/vision/gunsurvey/
+data/vision/snapshot_*.png
+data/vision/gun_view_*.png
+data/vision/detect_debug.png
