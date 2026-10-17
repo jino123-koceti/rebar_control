@@ -61,42 +61,39 @@ def _draw(ax, world, trace, reach_bbox, title, note=''):
         ax.add_patch(Rectangle((ru + b[0], rv + b[2]), b[1] - b[0], b[3] - b[2],
                                fc=C_REACH, alpha=0.10, ec=C_REACH, ls='--',
                                lw=1.2, zorder=2))
-        # 사각 **안쪽 위**에 붙인다 — 가운데는 이제 정차지 번호가 쓴다
-        ax.text(ru + b[0] + 14, rv + b[3] - 14, '결속 가능 영역\n(한 정차지)',
-                color=C_REACH, fontsize=7.5, va='top', ha='left',
-                linespacing=1.3, zorder=6)
+        # 사각 **바깥 왼쪽 아래**에 붙인다. 안쪽에 두면 출발점·1번 번호와
+        # 겹친다 (사각의 네 모서리에 전부 뭔가가 온다).
+        ax.text(ru + b[0] - 10, rv + b[2] - 14, '결속 가능 영역 (한 정차지)',
+                color=C_REACH, fontsize=7.5, va='top', ha='left', zorder=6)
 
-    # 이동 경로 — **ㄱ자로 꺾어 그린다.** 로봇은 주행과 횡이동을 동시에 하지
-    # 않는다 (주행은 궤도, 횡이동은 2축 리프팅). 대각선으로 그리면 거짓말이다.
-    # 순서 번호는 **화살표 위**에 올린다.
+    # 이동 경로 — **계획이 실제로 간 경로를 그린다.** 전에는 ㄱ자를 다시
+    # 만들어 그렸는데, 기둥을 돌아가는 경로는 구간이 셋 이상이라 그러면
+    # **기둥을 관통하는 선**이 나온다 (사용자 지적 2026-10-17).
     P = [cen(s_['pose']) for s_ in trace['stops']]
-    for i, (a, c) in enumerate(zip(P, P[1:])):
-        corner = (c[0], a[1])
-        legs = []
-        if abs(c[0] - a[0]) > 1.0:
-            ax.annotate('', xy=corner, xytext=a, zorder=4,
-                        arrowprops=dict(arrowstyle='-|>', shrinkA=4,
-                                        shrinkB=0 if abs(c[1] - a[1]) > 1 else 4,
-                                        color=C_DRIVE, lw=2.0, alpha=0.95))
-            legs.append((a, corner, 'u'))
-        if abs(c[1] - a[1]) > 1.0:
-            ax.annotate('', xy=c, xytext=corner, zorder=4,
-                        arrowprops=dict(arrowstyle='-|>', shrinkA=0, shrinkB=4,
-                                        color=C_LAT, lw=3.4, alpha=0.95))
-            legs.append((corner, c, 'v'))
+    for i, s_ in enumerate(trace['stops'][:-1]):
+        raw = s_.get('out') or [s_['pose'], trace['stops'][i + 1]['pose']]
+        legs = [(cen(a), cen(b)) for a, b in zip(raw, raw[1:])
+                if abs(b[0] - a[0]) > 1.0 or abs(b[1] - a[1]) > 1.0]
+        for k, (p0, p1) in enumerate(legs):
+            lat = abs(p1[1] - p0[1]) > 1.0
+            ax.annotate('', xy=p1, xytext=p0, zorder=4,
+                        arrowprops=dict(arrowstyle='-|>',
+                                        shrinkA=4 if k == 0 else 0,
+                                        shrinkB=4 if k == len(legs) - 1 else 0,
+                                        color=C_LAT if lat else C_DRIVE,
+                                        lw=3.4 if lat else 2.0, alpha=0.95))
         if not legs:
             continue
-        # 긴 쪽 구간의 가운데 위에 번호를 둔다
-        p0, p1, kind = max(legs, key=lambda L: abs(L[1][0] - L[0][0])
-                           + abs(L[1][1] - L[0][1]))
-        # ⚠ 가운데에 일률적으로 두면 **ㄱ자의 두 구간 라벨이 겹친다**.
-        #   주행은 40% 지점 위, 횡이동은 35% 지점 옆 — 떨어뜨려 놓는다.
-        f = 0.40 if kind == 'u' else 0.35
+        # 번호는 **가장 긴 구간** 위에. ㄱ자의 두 구간이 겹치지 않게 비켜 둔다
+        p0, p1 = max(legs, key=lambda L: abs(L[1][0] - L[0][0])
+                     + abs(L[1][1] - L[0][1]))
+        lat = abs(p1[1] - p0[1]) > 1.0
+        f = 0.35 if lat else 0.40
         mx, my = p0[0] + (p1[0] - p0[0]) * f, p0[1] + (p1[1] - p0[1]) * f
         off = 0.14 * (b[3] - b[2])
-        tx, ty = (mx, my + off) if kind == 'u' else (mx + off * 2.1, my)
+        tx, ty = (mx + off * 2.1, my) if lat else (mx, my + off)
         ax.text(tx, ty, str(i + 1), ha='center', va='center', fontsize=9.5,
-                color=C_DRIVE if kind == 'u' else C_LAT, zorder=8,
+                color=C_LAT if lat else C_DRIVE, zorder=8,
                 bbox=dict(fc='#FFFFFF', ec='#CFD8DC', lw=0.8, pad=1.6,
                           boxstyle='round,pad=0.25'))
 
@@ -140,9 +137,10 @@ def _legend(fig, y):
     """범례. 그림 폭에 맞춰 줄 수를 나눈다 (한 줄에 6개면 오른쪽이 잘렸다)."""
     h = [
         plt.Line2D([], [], marker='o', ls='', color=C_TIED, mec='w', label='결속 완료'),
-        plt.Line2D([], [], marker='X', ls='', color=C_FAIL, mec='w', label='장애물 (감지됨)'),
+        plt.Line2D([], [], marker='X', ls='', color=C_FAIL, mec='w',
+                   label='결속 불가 지점 (주행은 가능)'),
         plt.Line2D([], [], marker='s', ls='', color='#8d6e63', mec='#4e342e',
-                   label='기둥 (주행 차단)'),
+                   label='기둥 (주행도 차단)'),
         plt.Line2D([], [], marker='s', ls='', color=C_LEFT, mec='w', label='미결속으로 남음'),
         plt.Line2D([], [], color=C_DRIVE, lw=1.6, label='주행 (싸다)'),
         plt.Line2D([], [], color=C_LAT, lw=3.2, label='횡이동 (비싸다 — 7배)'),

@@ -109,6 +109,37 @@ class FreeSpace:
                     return False
         return True
 
+    def path_to(self, a, b, cost, step=50.0):
+        """a → b 의 **실제 경로**와 비용. (비용초, [포즈…]) 또는 None.
+
+        ㄱ자 한 번으로 되면 그것으로 끝낸다(싸다). 안 되면 A* 로 돌아간다.
+
+        ⚠ **찾은 경로를 반드시 들고 다녀야 한다.** 처음에는 `move_ok` 로
+          가능 여부만 확인하고 실행·그림은 ㄱ자 직선으로 했는데, 그러면
+          로봇이 **기둥을 관통해서 간다** (사용자 지적 2026-10-17). 비용도
+          ㄱ자 기준이라 과소평가된다.
+        """
+        if self.move_ok(a, b, step):
+            corner = (b[0], a[1])
+            path = [a]
+            if abs(b[0] - a[0]) > 1e-6:
+                path.append(corner)
+            if abs(b[1] - a[1]) > 1e-6:
+                path.append(b)
+            if len(path) == 1:
+                path.append(b)
+            turns = int(round(abs(b[1] - a[1]) / 50.0))
+            return cost.move(b[0] - a[0], turns), path
+        if not self.occupiable(*b):
+            return None
+        r = self.route(a, b, drive_mm_s=cost.drive_mm_s,
+                       lat_turn_s=cost.lat_turn_s)
+        if r is None:
+            return None
+        # A* 비용에는 고정비가 빠져 있다 — 정차·주행·횡이동 고정비를 더한다
+        g, path = r
+        return g + cost.stop_fix + cost.drive_fix + cost.lat_fix, _simplify(path)
+
     def route(self, a, b, drive_mm_s=70.0, lat_turn_s=7.2, turn_s=2.0,
               u_step=100.0, v_step=50.0, pad=1600.0, max_nodes=40000):
         """a → b **경로**를 찾는다. 반환 (비용초, [포즈…]) 또는 None.
@@ -189,3 +220,19 @@ class FreeSpace:
 
 def _overlap(a, b):
     return a[0] < b[1] and b[0] < a[1] and a[2] < b[3] and b[2] < a[3]
+
+
+def _simplify(path):
+    """같은 축으로 이어지는 점을 접는다 — 꺾이는 곳만 남긴다."""
+    if len(path) < 3:
+        return list(path)
+    out = [path[0]]
+    for p, q in zip(path[1:-1], path[2:]):
+        a = out[-1]
+        if abs(p[0] - a[0]) < 1e-6 and abs(q[0] - p[0]) < 1e-6:
+            continue                       # 같은 U — 가운데 점은 필요 없다
+        if abs(p[1] - a[1]) < 1e-6 and abs(q[1] - p[1]) < 1e-6:
+            continue
+        out.append(p)
+    out.append(path[-1])
+    return out

@@ -472,19 +472,17 @@ class CoverageMap:
         """그 자리에 설 수 있나 — 자유공간 층에 묻는다."""
         return self.space.occupiable(ru, rv)
 
-    def move_ok(self, ru1, rv1):
-        """지금 자리에서 그 자리로 갈 수 있나 (통로 통과 포함).
+    def path_to(self, ru1, rv1):
+        """지금 자리에서 그 자리까지의 **경로와 비용**. 못 가면 None.
 
-        ㄱ자 한 번으로 되면 그것으로 끝낸다 (싸다). 안 되면 **경로를 찾는다** —
-        기둥 틈으로 돌아 나오는 길은 구간이 셋 이상이라 ㄱ자로는 표현이 안 된다.
+        ⚠ 가능 여부만 받아 오고 실행은 ㄱ자로 하면 **기둥을 관통한다.**
+          경로를 그대로 들고 다녀야 한다 (실행·비용·그림 전부).
         """
-        a, b = (self.ru, self.rv), (ru1, rv1)
-        if self.space.move_ok(a, b):
-            return True
-        if not self.space.occupiable(*b):
-            return False
-        return self.space.route(a, b, drive_mm_s=self.cost.drive_mm_s,
-                                lat_turn_s=self.cost.lat_turn_s) is not None
+        return self.space.path_to((self.ru, self.rv), (ru1, rv1), self.cost)
+
+    def move_ok(self, ru1, rv1):
+        """갈 수 있나 (호환용 — 새 코드는 `path_to` 를 쓴다)."""
+        return self.path_to(ru1, rv1) is not None
 
     def pending(self):
         return [c for c in self.cells.values() if c.state == PENDING]
@@ -651,16 +649,18 @@ class CoverageMap:
                 # 제자리 — 닿는 것은 이미 다 묶었으므로 아무것도 안 바뀐다.
                 # 금지하지 않으면 **같은 자리를 계속 고른다** (시뮬에서 2회 발생).
                 continue
-            if not self.move_ok(ru, rv):
+            pr = self.path_to(ru, rv)
+            if pr is None:
                 continue
-            cst = self.cost.move(ru - self.ru, turns)
+            cst, path = pr
             score = yld / max(cst, 1e-6)
             # 정렬 키: 점수 ↑, 횡이동 적은 쪽, 주행 짧은 쪽
             k = (-score, abs(turns), abs(ru - self.ru))
             item = (k, {'kind': 'tie', 'ru': ru, 'rv': rv, 'turns': turns,
                         'drive_mm': ru - self.ru, 'cells': [c.key() for c, _ in got],
                         'poses': {c.key(): p for c, p in got},
-                        'frontier': nf, 'cost_s': cst, 'score': score})
+                        'frontier': nf, 'cost_s': cst, 'score': score,
+                        'path': path})
             if best is None or k < best[0]:
                 best = item
             if turns == 0 and (stay is None or k < stay[0]):
@@ -674,16 +674,18 @@ class CoverageMap:
         for ru, rv, turns, n in self.explore_candidates(fr):
             if abs(ru - self.ru) < 1.0 and turns == 0:
                 continue
-            if not self.move_ok(ru, rv):
+            pr = self.path_to(ru, rv)
+            if pr is None:
                 continue
-            cst = self.cost.move(ru - self.ru, turns)
+            cst, path = pr
             # 탐색은 **싼 것부터**. 많이 보는 것보다 가까운 것이 낫다 —
             # 어차피 다 보러 가야 하고, 멀리 질러갔다 오면 그만큼 되돌아온다.
             k = (round(cst, 3), -n, abs(turns))
             if best is None or k < best[0]:
                 best = (k, {'kind': 'explore', 'ru': ru, 'rv': rv, 'turns': turns,
                             'drive_mm': ru - self.ru, 'cells': [], 'poses': {},
-                            'reveal': n, 'cost_s': cst, 'score': 0.0})
+                            'reveal': n, 'cost_s': cst, 'score': 0.0,
+                            'path': path})
         return best[1] if best else None
 
     def snapshot(self):

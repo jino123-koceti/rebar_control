@@ -143,10 +143,17 @@ def run(world, reach, label, start, name_of=None, max_stops=200, verbose=False):
             print(f'        → {nxt["kind"]:7s} {tgt:>12s} 주행 {nxt["drive_mm"]:+7.0f}mm'
                   f' 횡 {nxt["turns"]:+3d}회({nxt["turns"]*LAT_MM_PER_TURN:+5.0f}mm)'
                   f' 셀 {len(nxt["cells"])}  {nxt["cost_s"]:5.1f}s')
-        trace['lat'] += abs(nxt['turns'])
-        trace['drive_mm'] += abs(nxt['drive_mm'])
+        # ★ 계획이 준 **경로를 그대로 따라간다.** 직선으로 가면 기둥을 뚫는다.
+        path = nxt.get('path') or [(cm.ru, cm.rv), (nxt['ru'], nxt['rv'])]
         trace['cost_s'] += nxt['cost_s']
-        cm.advance(world.drive(nxt['drive_mm']), nxt['turns'])
+        for p0, p1 in zip(path, path[1:]):
+            du, dv = p1[0] - p0[0], p1[1] - p0[1]
+            t = int(round(dv / LAT_MM_PER_TURN))
+            trace['drive_mm'] += abs(du)
+            trace['lat'] += abs(t)
+            cm.advance(world.drive(du) if du else 0.0, t)
+        cm.ru, cm.rv = nxt['ru'], nxt['rv']    # 누적 오차 보정은 다음 관측이 한다
+        trace['stops'][-1]['out'] = path
     else:
         print('  ⚠ 정차 상한 도달 — 플래너가 수렴하지 않았다')
 
@@ -453,7 +460,7 @@ def main():
                  ('현실 배근 15x11 + 기둥(한가운데)', scn_wall(reach, 'mid'))]
     if a.only in ('', 'field'):
         todo += [('현실 배근 7x5 (피치 200mm)', scn_field(reach)),
-                 ('현실 배근 7x5 + 가운데 막힘',
+                 ('현실 배근 7x5 + 가운데가 결속 불가 (주행은 가능)',
                   scn_field(reach, blocked_rect=(400, 800, 200, 400)))]
     if a.only in ('', 'gap'):
         todo += [('기둥 사이 틈 1300mm — 통과', scn_gap(reach, 1300.0)),
