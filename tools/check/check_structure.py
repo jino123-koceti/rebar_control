@@ -225,6 +225,14 @@ R4_LIMITS = {
     #     `yaw_precheck.py` 로 빼면 200줄 가까이 빠지고, 그 부분은 `axis_config`·
     #     `yaw_pose_vision` 에만 의존해서 상태기계와 깔끔하게 분리된다.
     'homing_node': 1250,       # 1150
+    # coverage_map 700 / coverage_reach 250: 자율 커버리지 지도 (ROS 무관 순수
+    #   모듈, 노드 아님). 한 파일이 855줄까지 갔을 때 **올리지 않고 쪼갰다** —
+    #   `Reach`(좌표변환·도달판정)를 떼니 678 + 188 이 됐고 의존이 한 방향이다.
+    #   늘어난 줄의 대부분은 시뮬이 잡아낸 함정의 설명이다: 피치 미측정 축에서
+    #   지수가 뭉개짐 · 시야 안인데 안 보인 자리를 안 닫으면 탐색이 안 끝남 ·
+    #   제자리 후보 금지 · `move_ok` 의 길이 0 구간과 탈출 경로.
+    'coverage_map': 700, 'coverage_reach': 250,
+
     # ── 2차년도 유산 — 올리지 않는다 (위 설명 참고) ──────────────────────
     'position_control_node': 600, 'joint_controller': 500,
     'homing_controller': 600, 'rebar_controller': 400,
