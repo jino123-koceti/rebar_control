@@ -241,6 +241,16 @@ class TyingSequence(Node):
     def _on_goal(self, msg):
         if self.step not in (Step.IDLE, Step.DONE, Step.FAILED):
             return self._reject(f'이미 진행 중이다 ({self.step.value})')
+        # ⚠ [2026-10-17] **결속마다 다시 읽는다.** 기동 때만 읽어서
+        #   `ros2 param set` 이 조용히 안 먹었다 — 같은 함정을
+        #   `crossing_detector`·`navigator`·`tying_planner` 에서도 겪었다.
+        #   결속 깊이와 허용 범위는 **바닥이 바뀌면 같이 바뀌는 값**이라
+        #   (데크플레이트 -85 → RC -96) 재시작 없이 조절돼야 한다.
+        g = self.get_parameter
+        self.z_tie_default = float(g('z_tie_mm').value)
+        self.z_lo = float(g('z_tie_min_mm').value)
+        self.z_hi = float(g('z_tie_max_mm').value)
+        self.gun_on = bool(g('gun_enabled').value)
         if math.isnan(msg.x) or math.isnan(msg.y):
             return self._reject('결속 지점은 X·Y 가 둘 다 있어야 한다')
         z = float(msg.z) if not math.isnan(msg.z) else self.z_tie_default
