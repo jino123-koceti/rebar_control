@@ -7,6 +7,7 @@
 
 import rclpy
 from rclpy.node import Node
+from .axis_config import load_stage_axes
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray, Float32, Int32, Empty, String, Bool
@@ -240,6 +241,10 @@ class PositionControlNode(Node):
         # 모터 ID → 축 이름. 안전 차단에서 "x+" 같은 방향 표기와 맞추기 위한 것이다.
         # axes.yaml 과 같은 배치 (3차년도 실측).
         self.AXIS_BY_MOTOR = {0x145: 'x', 0x146: 'y', 0x147: 'z', 0x148: 'yaw'}
+        # ⚠ 안전 클램프의 부호 환산용. `axes.yaml` 의 `home_dir` 은 **원점 쪽으로
+        #   가는 모터 명령 부호**다. 없으면 +1 로 본다 (yaw 는 항목이 없다).
+        self.home_dir = {a: int((c or {}).get('home_dir', 1))
+                         for a, c in load_stage_axes(('x', 'y', 'z')).items()}
 
         # 모터 전류 보호 시스템
         #
@@ -1532,18 +1537,23 @@ class PositionControlNode(Node):
           열린다.** 보호가 아니라 가두는 동작이다.
           지금은 `safety_timeout` 이 0(= `use_safety:=false`)이라 이 함수가 호출돼도
           `_safety_active()` 가 False 라 그대로 통과하므로 **현재 운용에서는 안 물린다.**
-          `use_safety:=true` 로 켜기 전에 반드시 고칠 것:
-            d = int((load_stage_axes((axis,)).get(axis) or {}).get('home_dir', 1))
-            want = f"{axis}{'-' if speed_dps * d > 0 else '+'}"
-          `remote_teleop_node._limit_clamp` 는 이미 `home_dir` 을 보고 올바르게
-          환산한다 — 두 노드가 서로 다른 규약을 쓰고 있었다.
+          **아래에서 고쳤다** — `remote_teleop_node._limit_clamp` 와 같은 식을 쓴다.
+          검증은 `use_safety:=true` 로 켜고 리미트에 붙여서 해야 한다 (아직 안 했다).
         """
         if not self._safety_active() or self.safety is None or abs(speed_dps) < 0.01:
             return speed_dps
         axis = self.AXIS_BY_MOTOR.get(motor_id)
         if axis is None:
             return speed_dps
-        want = f"{axis}{'+' if speed_dps > 0 else '-'}"
+        # ⚠⚠ [2026-10-17 수정] **mm 기준으로 환산해서 비교한다.**
+        #   `blocked_axes` 는 mm 기준(`x-` = X 최소단)인데 예전에는 **모터 속도
+        #   부호를 그대로** 썼다. x·y 는 `home_dir +1` 이라 둘이 **반대**여서,
+        #   리미트에 닿으면 **빠져나오는 방향이 막히고 처박는 방향이 열렸다.**
+        #   z 는 `home_dir -1` 이라 우연히 맞았다. `remote_teleop_node._limit_clamp`
+        #   와 **같은 식**을 쓴다 — 두 노드가 다른 규약을 쓰던 것이 문제의 뿌리였다.
+        d = int(self.home_dir.get(axis, 1))
+        mm_dir = '+' if (-1 if speed_dps > 0 else 1) * d > 0 else '-'
+        want = f"{axis}{mm_dir}"
         if want in self.safety.blocked_axes:
             if self._safety_blocked_logged != want:
                 self._safety_blocked_logged = want

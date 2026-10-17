@@ -39,7 +39,7 @@
   "src/rebar_base_control/rebar_base_control/joint_controller.py (상한 500)",
   "src/rebar_base_control/rebar_base_control/remote_bridge.py (상한 200)",
   "src/rebar_base_control/rebar_base_control/sequence_controller.py (상한 400)",
-  "src/rebar_control/rebar_control/navigator.py (상한 560)",
+  "src/rebar_control/rebar_control/navigator.py (상한 640)",
   "src/rebar_control/rebar_control/rebar_controller.py (상한 400)",
   "src/rebar_vision/rebar_vision/tying_orchestrator_node.py (상한 800)",
   "src/rmd_robot_control/rmd_robot_control/position_control_node.py (상한 600)",

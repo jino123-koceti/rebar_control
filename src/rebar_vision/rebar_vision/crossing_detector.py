@@ -81,7 +81,16 @@ class CrossingDetector(Node):
         #   먼 줄에서 진짜 점을 합칠 수 있다.
         #   0 이면 끈다.
         self.declare_parameter('grid_spacing_mm', 200.0)
-        self.declare_parameter('frames', 3)            # 합칠 프레임 수
+        # ⚠⚠ [2026-10-17] 3 → **1**. 이름과 달리 **프레임을 모으는 게 아니라
+        #   같은 RGB 한 장에 추론을 N 번 반복**한다 (아래 detect 참고).
+        #   RF-DETR 은 결정론적이라 결과가 거의 같다 — 흔들림을 못 줄인다.
+        #   실측 2026-10-17 (같은 장면, 각 4회):
+        #     frames=3 → 중앙 0.82초, 출력 10~11, 모델 13~14
+        #     frames=1 → 중앙 0.74초, 출력  9~10, 모델 12~14
+        #   ⚠ 절감은 0.08초(10%)뿐이다. 추론이 전체 시간을 지배하지 않는다
+        #     (영상 변환·깊이 중앙값·발행이 더 크다). '3배 빨라진다' 는 틀렸다.
+        #   흔들림을 실제로 줄이는 것은 `depth_frames` 다 (시간 방향 중앙값).
+        self.declare_parameter('frames', 1)            # 같은 영상 추론 반복 횟수
         self.declare_parameter('rate', 1.0)            # 0 이면 트리거로만 동작
         self.declare_parameter('depth_window', 5)      # 깊이 중앙값 창 (홀수)
         # ⚠⚠ [2026-10-16 사용자 지적] **depth 를 여러 장 모아 화소별 중앙값을 쓴다.**
@@ -266,6 +275,15 @@ class CrossingDetector(Node):
         if not self._ensure_model():
             self._status('모델 적재 실패')
             return
+
+        # ⚠ [2026-10-17] **검출마다 다시 읽는다.** 예전에는 `__init__` 에서만 읽어
+        #   `ros2 param set` 이 조용히 안 먹었다 — `frames` 를 1 로 바꿔 측정했는데
+        #   시간이 그대로여서 알았다. 튜닝하려면 노드를 재시작해야 했다.
+        g = self.get_parameter
+        self.n_frames = max(1, int(g('frames').value))
+        self.win = max(1, int(g('depth_window').value) | 1)
+        self.threshold = float(g('threshold').value)
+        self.grid_mm = float(g('grid_spacing_mm').value)
 
         import cv2
         bgr = self.bridge.imgmsg_to_cv2(self.color, desired_encoding='bgr8')
