@@ -2,21 +2,25 @@
 """호밍 상태기계 무부하 검증 — 하드웨어 없이 돌린다.
 
 가짜 리미트 신호를 발행하고 `/joint_N/speed` 명령을 받아 시퀀스가 맞는지 본다.
-**모터도 EZIO 도 필요 없다.** 아키텍처 문서 §1.5 의 "하드웨어 없이 검증할 수단"에 해당한다.
+**모터도 EZIO 도 필요 없다.**
 
-왜 필요한가: 3차년도에서 호밍을 한 번도 돌려본 적이 없다. 실장비에서 바로 돌리면
-방향 부호가 틀렸을 때 축이 반대 리미트로 달려간다. 상태 전이와 정지 조건을 먼저
-여기서 확인한다.
+⚠⚠ [2026-10-17 전면 수정] **전 축(`all`) 으로 바꿨다.**
+  예전에는 `'x'` 한 축만 보냈는데, 노드가 그걸 거부하도록 바뀌면서
+  (`"호밍은 전 축('all')으로만 한다"`) **어떤 시나리오도 통과할 수 없게** 됐다.
+  도구가 조용히 못 쓰게 된 것을 2026-10-17 에 발견했다.
 
-**주의:** `ezi_io_node` 가 떠 있으면 진짜 리미트와 충돌한다. 반드시 끄고 돌릴 것.
+⚠⚠ **반드시 실장비와 다른 ROS_DOMAIN_ID 로 돌릴 것.**
+  같은 도메인에서 돌리면 진짜 리미트와 충돌하고, 가짜 센서 신호가 실제
+  호밍 노드에 들어간다. 2026-10-17 에 실수로 도메인 33 에서 돌렸다.
 
 사용:
-    # 1) ezi_io_node 를 끈 상태에서
+    export ROS_DOMAIN_ID=77                      # 실장비(33)와 분리
     ros2 run rmd_robot_control homing_node &
-    python3 tools/test/homing_dryrun.py            # 정상 시나리오 (X축)
-    python3 tools/test/homing_dryrun.py --case far     # 반대쪽 리미트에 닿는 경우
-    python3 tools/test/homing_dryrun.py --case stale   # 리미트 신호가 끊긴 경우
-    python3 tools/test/homing_dryrun.py --case athome   # 이미 원점에 있는 경우
+    python3 tools/test/homing_dryrun.py                      # 전 축 정상
+    python3 tools/test/homing_dryrun.py --case athome        # 전 축 센서 위에서 시작
+    python3 tools/test/homing_dryrun.py --case yaw_athome    # yaw 만 센서 위 (B″ 경로)
+    python3 tools/test/homing_dryrun.py --case far           # 반대쪽 리미트
+    python3 tools/test/homing_dryrun.py --case stale         # 센서 두절
 """
 
 import argparse
@@ -29,146 +33,197 @@ from rclpy.node import Node
 from std_msgs.msg import Bool, Float32, String
 
 LIMITS = ('x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max', 'yaw_home')
+# 축 → (명령 토픽 번호, 원점 리미트). axes.yaml 과 같아야 한다.
+AX = {'z': (5, 'z_min'), 'x': (3, 'x_min'), 'yaw': (6, 'yaw_home'), 'y': (4, 'y_min')}
+ORDER = ('z', 'x', 'yaw', 'y')
 
 
 class DryRun(Node):
-    def __init__(self, case, prefix=''):
+    def __init__(self, prefix='', yaw_gun=None):
         super().__init__('homing_dryrun')
-        self.case = case
-        self.prefix = prefix
         self.limit_pubs = {n: self.create_publisher(Bool, f'/limit_sensors/{n}', 10)
                            for n in LIMITS}
         self.cmd_pub = self.create_publisher(String, '/homing_cmd', 10)
+        # yaw 전제 검사는 `/stage/status` 의 `gun_deg`(멀티턴 기준점)를 먼저 본다.
+        # 무부하에서는 엔코더가 없으므로 여기서 흉내 내 준다.
+        self.stage_pub = self.create_publisher(String, '/stage/status', 10)
+        self.yaw_gun = yaw_gun
         self.state = {n: False for n in LIMITS}
-        self.speeds = []        # (시각, dps)
-        self.status = []        # (시각, state, detail)
-        self.create_subscription(Float32, f'{prefix}/joint_3/speed', self._on_speed, 10)
+        self.speed = {}          # 축 → 마지막 dps
+        self.status = []         # (t, state, axis, detail)
+        for a, (j, _) in AX.items():
+            self.create_subscription(Float32, f'{prefix}/joint_{j}/speed',
+                                     self._mk(a), 10)
         self.create_subscription(String, '/homing_status', self._on_status, 10)
         self.t0 = time.time()
         self.publish_limits = True
 
-    def _on_speed(self, msg):
-        self.speeds.append((time.time() - self.t0, msg.data))
+    def _mk(self, axis):
+        def cb(msg):
+            self.speed[axis] = msg.data
+        return cb
 
     def _on_status(self, msg):
         try:
             d = json.loads(msg.data)
         except ValueError:
             return
-        rec = (round(time.time() - self.t0, 2), d.get('state'), d.get('detail'), d.get('refs'))
-        if not self.status or self.status[-1][1:3] != rec[1:3]:
+        rec = (round(time.time() - self.t0, 2), d.get('state'), d.get('axis'),
+               d.get('detail'))
+        if not self.status or self.status[-1][1:4] != rec[1:4]:
             self.status.append(rec)
-            print(f"  [{rec[0]:5.2f}s] 상태={rec[1]:<9} {rec[2]}")
+            print(f"  [{rec[0]:5.2f}s] {str(rec[1]):<9} {str(rec[2]):<4} {rec[3]}")
 
-    def pump_limits(self):
-        if not self.publish_limits:
-            return
-        for n, v in self.state.items():
-            self.limit_pubs[n].publish(Bool(data=v))
+    def pump(self):
+        if self.publish_limits:
+            for n, v in self.state.items():
+                self.limit_pubs[n].publish(Bool(data=v))
+        if self.yaw_gun is not None:
+            self.stage_pub.publish(String(data=json.dumps(
+                {'gun_deg': self.yaw_gun, 'current_mm': {'x': 0.0, 'y': 0.0, 'z': 0.0}})))
 
-    def last_speed(self):
-        return self.speeds[-1][1] if self.speeds else None
+    def phase(self):
+        return self.status[-1][1] if self.status else None
 
-    def stopped(self):
-        """마지막 명령이 0 인가.
+    def axis(self):
+        return self.status[-1][2] if self.status else None
 
-        ⚠ `abs(last_speed() or 1) < 0.01` 로 쓰면 안 된다 — 0.0 은 falsy 라서
-        `or 1` 이 1 로 바꿔버리고, 정지했는데도 '안 멈췄다'로 판정한다(실제로 그랬다).
-        """
-        v = self.last_speed()
-        return v is not None and abs(v) < 0.01
+    def states(self):
+        return [s[1] for s in self.status]
 
 
-def spin(node, sec):
+def spin(n, sec):
     end = time.time() + sec
     while rclpy.ok() and time.time() < end:
-        node.pump_limits()
-        rclpy.spin_once(node, timeout_sec=0.02)
+        n.pump()
+        rclpy.spin_once(n, timeout_sec=0.02)
+
+
+def wait_for(n, pred, sec, what):
+    """조건이 참이 될 때까지 돌린다. 되면 True."""
+    end = time.time() + sec
+    while rclpy.ok() and time.time() < end:
+        n.pump()
+        rclpy.spin_once(n, timeout_sec=0.02)
+        if pred():
+            return True
+        if n.phase() == 'failed':
+            return False
+    print(f"    ⏱ 대기 초과: {what}")
+    return False
+
+
+def run_axis(n, axis, start_at_home, fail):
+    """한 축의 탐색→후퇴→정밀→확정을 몰아준다. 성공 여부."""
+    j, lim = AX[axis]
+    if not wait_for(n, lambda: n.axis() == axis, 25, f"{axis} 차례"):
+        return fail(f"{axis}: 차례가 오지 않았다 (상태 {n.phase()})")
+    if start_at_home:
+        # 차례가 오기 전에 눌러 둬야 하지만, ARM 중에 눌러도 BACK_OFF 로 간다
+        n.state[lim] = True
+    if not wait_for(n, lambda: n.phase() in ('seek', 'back_off'), 12,
+                    f"{axis} seek/back_off"):
+        return fail(f"{axis}: 탐색·후퇴로 가지 않았다")
+
+    if n.phase() == 'seek':
+        if not wait_for(n, lambda: abs(n.speed.get(axis) or 0) > 0.5, 6,
+                        f"{axis} 탐색 속도"):
+            return fail(f"{axis}: 탐색 명령이 안 나왔다")
+        seek = n.speed[axis]
+        print(f"    탐색 {seek:+.1f} dps → {lim} 누름")
+        n.state[lim] = True
+    else:
+        seek = None
+        print(f"    이미 {lim} → 후퇴부터")
+
+    if not wait_for(n, lambda: n.phase() == 'back_off', 8, f"{axis} back_off"):
+        return fail(f"{axis}: 후퇴로 가지 않았다")
+    if not wait_for(n, lambda: abs(n.speed.get(axis) or 0) > 0.5, 4, f"{axis} 후퇴 속도"):
+        return fail(f"{axis}: 후퇴 명령이 안 나왔다")
+    back = n.speed[axis]
+    if seek is not None and seek * back >= 0:
+        return fail(f"{axis}: 후퇴 부호가 탐색과 같다 ({seek:+.1f} / {back:+.1f})")
+    print(f"    후퇴 {back:+.1f} dps → {lim} 해제")
+    n.state[lim] = False
+
+    if not wait_for(n, lambda: n.phase() == 'fine', 8, f"{axis} fine"):
+        return fail(f"{axis}: 정밀 재접근으로 가지 않았다")
+    if not wait_for(n, lambda: abs(n.speed.get(axis) or 0) > 0.1, 4, f"{axis} 정밀 속도"):
+        return fail(f"{axis}: 정밀 명령이 안 나왔다")
+    fine = n.speed[axis]
+    if fine * back >= 0:
+        return fail(f"{axis}: 정밀 방향이 후퇴와 같다 ({back:+.1f} / {fine:+.1f})")
+    if abs(fine) >= abs(back) * 3:
+        print(f"    ⚠ 정밀 {fine:+.1f} dps 가 후퇴 {back:+.1f} 보다 많이 빠르다")
+    print(f"    정밀 {fine:+.1f} dps → {lim} 다시 누름 (원점 확정)")
+    n.state[lim] = True
+    spin(n, 1.2)
+    return True
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--case', default='normal',
-                    choices=['normal', 'far', 'stale', 'athome'])
-    # 실제 모터로 명령이 가지 않게 호밍 노드를 remap 해서 띄우고, 같은 접두어를 준다:
-    #   ros2 run rmd_robot_control homing_node --ros-args \
-    #       -r /joint_3/speed:=/dry/joint_3/speed -r /joint_4/speed:=/dry/joint_4/speed \
-    #       -r /joint_5/speed:=/dry/joint_5/speed -r /joint_6/speed:=/dry/joint_6/speed
+                    choices=['normal', 'far', 'stale', 'athome', 'yaw_athome'])
     ap.add_argument('--prefix', default='', help="예: /dry (모터로 안 보내고 시험만)")
+    ap.add_argument('--yaw-gun', type=float, default=-16.6,
+                    help='가짜 멀티턴 기준점(건 각도°). yaw 전제 검사에 쓰인다')
     a = ap.parse_args()
 
     rclpy.init()
-    n = DryRun(a.case, a.prefix)
-    ok = True
-    print(f"■ 시나리오: {a.case}  (X축)")
+    n = DryRun(a.prefix, yaw_gun=a.yaw_gun)
+    bad = []
 
-    # 리미트 신호를 먼저 흘려 '신선한' 상태를 만든다
-    spin(n, 1.5)
+    def fail(msg):
+        print(f"    ✘ {msg}")
+        bad.append(msg)
+        return False
 
-    if a.case == 'athome':
-        n.state['x_min'] = True
-        spin(n, 0.5)
+    print(f"■ 시나리오: {a.case}  (전 축 {'→'.join(ORDER)}, yaw 기준점 건 {a.yaw_gun:+.1f}°)")
+    spin(n, 1.5)            # 리미트·상태를 '신선하게' 만든다
 
-    print("→ /homing_cmd 'x' 전송")
-    n.cmd_pub.publish(String(data='x'))
+    if a.case in ('athome',):
+        for ax in ORDER:
+            n.state[AX[ax][1]] = True
+    if a.case == 'yaw_athome':
+        n.state['yaw_home'] = True
+    spin(n, 0.5)
+
+    print("→ /homing_cmd 'all' 전송")
+    n.cmd_pub.publish(String(data='all'))
     spin(n, 1.0)
 
     if a.case == 'stale':
         print("→ 리미트 발행을 끊는다 (센서 두절 흉내)")
         n.publish_limits = False
-        spin(n, 2.5)
-        states = [s[1] for s in n.status]
-        ok = 'failed' in states and n.stopped()
-        print(f"판정: {'통과' if ok else '실패'} — 센서 두절 시 정지·실패로 가야 한다")
-
+        spin(n, 3.0)
+        if not ('failed' in n.states()):
+            fail("센서가 두절됐는데 실패로 가지 않았다")
     elif a.case == 'far':
-        print("→ 반대쪽 리미트(x_max)를 눌러본다 (방향 부호가 틀린 상황)")
-        n.state['x_max'] = True
-        spin(n, 1.5)
-        states = [s[1] for s in n.status]
-        ok = 'failed' in states and n.stopped()
-        print(f"판정: {'통과' if ok else '실패'} — 반대 리미트면 즉시 정지·실패로 가야 한다")
-
+        wait_for(n, lambda: n.axis() == 'z' and n.phase() == 'seek', 10, 'z 탐색')
+        print("→ 반대쪽 리미트(z_max)를 누른다 (방향 부호가 틀린 상황)")
+        n.state['z_max'] = True
+        spin(n, 2.0)
+        if not ('failed' in n.states()):
+            fail("반대 리미트를 눌렀는데 실패로 가지 않았다")
     else:
-        # 탐색 방향 확인
-        seek = n.last_speed()
-        print(f"  탐색 속도: {seek} dps")
-        if seek is None or abs(seek) < 1:
-            print("판정: 실패 — 탐색 명령이 안 나왔다"); ok = False
-        else:
-            # 원점 리미트 도달 → 후퇴가 시작되는지 곧바로 확인한다.
-            # (후퇴 제한시간 back_off_sec 이 지나기 전에 센서를 풀어줘야 한다 —
-            #  실제 장비에서도 후퇴하면 바로 센서가 떨어진다)
-            print("→ x_min 눌림")
-            n.state['x_min'] = True
-            spin(n, 0.3)
-            back = n.last_speed()
-            print(f"  후퇴 속도: {back} dps  (탐색과 부호가 반대여야 한다)")
-            if back is None or seek * back >= 0:
-                print("판정: 실패 — 후퇴 방향이 잘못됐다"); ok = False
-            # 후퇴 중 센서 해제 → 후퇴 시간이 끝나면 정밀 재접근으로 간다
-            print("→ x_min 해제 (후퇴 성공)")
-            n.state['x_min'] = False
-            spin(n, 1.2)
-            fine = n.last_speed()
-            print(f"  정밀 재접근 속도: {fine} dps  (탐색과 같은 부호, 더 느려야 한다)")
-            if fine is None or seek * fine <= 0 or abs(fine) >= abs(seek):
-                print("판정: 실패 — 정밀 재접근이 잘못됐다"); ok = False
-            print("→ x_min 다시 눌림 (원점 확정)")
-            n.state['x_min'] = True
-            spin(n, 1.5)
-            states = [s[1] for s in n.status]
-            stop = n.stopped()
-            if not (('done' in states) and stop):
-                print(f"판정: 실패 — 완료로 가고 정지해야 한다 (상태 {states}, 마지막 {n.last_speed()})")
-                ok = False
-            else:
-                print("판정: 통과 — 탐색 → 후퇴 → 정밀 → 완료, 마지막에 정지")
+        at_home = (a.case == 'athome')
+        for ax in ORDER:
+            print(f"  ── {ax} ──")
+            start = at_home or (a.case == 'yaw_athome' and ax == 'yaw')
+            if not run_axis(n, ax, start, fail):
+                break
+        spin(n, 3.0)
+        if 'failed' in n.states():
+            fail(f"실패 상태로 끝났다 — {n.status[-1][3]}")
 
-    print(f"\n■ 결과: {'통과' if ok else '실패'}   (상태 전이 {len(n.status)}회, 명령 {len(n.speeds)}건)")
+    print(f"\n■ 결과: {'통과' if not bad else '실패'}   "
+          f"(상태 전이 {len(n.status)}회)")
+    for m in bad:
+        print(f"   · {m}")
     n.destroy_node()
     rclpy.shutdown()
-    return 0 if ok else 1
+    return 0 if not bad else 1
 
 
 if __name__ == '__main__':

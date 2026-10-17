@@ -556,6 +556,27 @@ class HomingNode(Node):
             return None
         return abs(deg - ref) * float(mmpd)
 
+    def _vision_log_only(self):
+        """비전 판정을 **기록만** 한다 (판정에 쓰지 않는다).
+
+        센서 위에서 시작해 방향 판단이 필요 없는 경로에서도 비전을 찍어 둔다 —
+        카메라가 죽은 것을 나중에 알게 되는 것보다 낫고, 나중에 기준점이 어긋난
+        것을 되짚을 때 근거가 된다 (`_vision_check` 머리말의 같은 이유).
+        """
+        if self._frame is None:
+            self.get_logger().info('비전 기록 생략 — 영상이 없다')
+            return
+        try:
+            from .yaw_pose_vision import gun_blob, pick_sign
+        except ImportError:
+            return
+        blob = gun_blob(self._frame)
+        sign, why = pick_sign(self._frame, near_x_mm=self._x_now())
+        self.get_logger().info(
+            f"비전 기록: {'음수' if sign == -1 else ('양수' if sign == 1 else '보류')}각"
+            + (f" · 면적 {blob[0]:.0f} 주축 {blob[1]:+.1f}°" if blob else ' · 덩어리 못 찾음')
+            + (f" ({why})" if sign is None else ''))
+
     def _vision_check(self, g):
         """**매 호밍마다** yaw 를 비전으로 교차검증한다 → True/False/None.
 
@@ -673,6 +694,30 @@ class HomingNode(Node):
         (`/stage/yaw_declare`) 에서 선다. 둘 다 없으면 **거부하고 방법을 알린다.**
         """
         if self.pose_id and 'yaw' in AXES:
+            # ⚠⚠ [2026-10-17] **센서 위에서 시작하면 방향을 계산하지 않는다.**
+            #   계산하던 `d = 1 if g < edge_gun else -1` 은 `edge_gun`(저장값)에
+            #   의존하는데, 그 값은 커플링이 미끄러지면 무효가 된다. 그리고 그 d 가
+            #   BACK_OFF(`-dir`)까지 좌우해서, **센서 위에 있는데 더 깊이 밀고
+            #   들어가는** 경우가 생긴다 (2026-10-17 아침에 실제로 막혔다).
+            #   센서가 이미 켜져 있으면 방향 판단 자체가 불필요하다 — 빠져나왔다
+            #   다시 들어가면 되고, 어느 쪽으로 빠지든 FINE 이 에지를 다시 적는다.
+            #   **고정 방향을 쓰는 이유**: 감지 구간이 건 -7.12~-3.49° 인데
+            #     아래쪽 여유 12.68° / 위쪽(12시 쪽) 여유 21.69° → 위쪽이 넓다.
+            #     BACK_OFF 는 `-dir` 이므로 위쪽으로 빼려면 dir = -1 이고,
+            #     이는 `axes.yaml` 의 `seek_dir` 과 같다 (−1 = 건 각도 감소).
+            #     FINE 은 `+dir` = 감소 방향 → **항상 `from_high` 에지**로 통일된다.
+            #   ⚠ FINE 은 건너뛰지 않는다. 센서 폭이 건 3.63° 라 지금 자리를
+            #     그대로 원점으로 삼으면 최대 그만큼 틀린다.
+            if self.limit.get(AXES['yaw']['home_limit']):
+                fixed = int(self.dir_cfg.get('yaw') or -1)
+                AXES['yaw']['dir'] = fixed
+                self.get_logger().info(
+                    f"yaw: {AXES['yaw']['home_limit']} 가 이미 켜져 있다 → "
+                    f"방향 판정 생략, 탐색 방향 {fixed:+d} 고정 "
+                    f"(-dir 로 12시 쪽으로 빼고 FINE 으로 재접근). "
+                    f"비전·edge_gun 을 쓰지 않는다")
+                self._vision_log_only()
+                return None
             g, src = self.yaw_gun, '멀티턴 기준점'
             if g is None:
                 n, info = identify_pose(self.pose_id, self.single.get('yaw'))
