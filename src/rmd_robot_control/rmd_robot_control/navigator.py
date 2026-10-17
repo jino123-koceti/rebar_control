@@ -52,6 +52,12 @@ from std_msgs.msg import Bool, Empty, Float32, Int32, String
 from rebar_base_interfaces.msg import SafetyState
 
 
+# 경로 파일 네 번째 값 — **그 웨이포인트에서 결속할지**. 생략하면
+# `tie_at_waypoints` 를 따른다 (= 옛 3열 경로 파일은 동작이 그대로다).
+TIE_WORD = {'1': True,  'y': True,  'yes': True,  'tie': True,  '결속': True,
+            '0': False, 'n': False, 'no': False, 'skip': False, '주행': False}
+
+
 class Step:
     """미션 한 단계. 문자열에서 만든다."""
 
@@ -204,11 +210,18 @@ class Navigator(Node):
             return str(e)
 
     def _from_path(self, path):
-        """`번호, x, y` (mm) 목록을 미션 단계로 바꾼다.
+        """`번호, x, y[, 결속여부]` (mm) 목록을 미션 단계로 바꾼다.
 
-        x = 전진(+), y = 좌측(+). 웨이포인트마다 결속하고, 사이를 전진·횡이동
-        으로 잇는다. 횡이동은 `lateral_mm_per_turn` 단위로만 가므로 나머지가
-        남으면 거부한다 — 몰래 반올림하면 사람이 센 거리와 달라진다.
+        x = 전진(+), y = 좌측(+). 웨이포인트 사이를 전진·횡이동으로 잇는다.
+        횡이동은 `lateral_mm_per_turn` 단위로만 가므로 나머지가 남으면
+        거부한다 — 몰래 반올림하면 사람이 센 거리와 달라진다.
+
+        ⚠ [2026-10-16 사용자 요청] **결속은 웨이포인트마다 켜고 끌 수 있다.**
+          네 번째 값(`TIE_WORD`)이 그 자리에서 결속할지 정하고, 없으면
+          `tie_at_waypoints` 를 따른다. 시연 시나리오가 "시점 결속 → 전진 후
+          결속 → 나머지는 주행만" 이라 전역 켜고끄기로는 표현이 안 됐다.
+        ⚠ 반복(`repeat`)하면 단계 목록을 처음부터 다시 돌므로 **1번
+          웨이포인트의 결속도 다시 수행된다** — 그게 의도다.
         """
         mm_t = float(self.get_parameter('lateral_mm_per_turn').value)
         max_t = int(self.get_parameter('lateral_max_turns').value)
@@ -221,10 +234,16 @@ class Navigator(Node):
             f = [v.strip() for v in line.split(',')]
             if len(f) < 3:
                 raise ValueError(f"{path}:{i} — '번호, x, y' 세 값이 필요하다: {line!r}")
-            pts.append((float(f[1]), float(f[2])))
+            w = f[3].lower() if len(f) > 3 and f[3] else ''
+            if w and w not in TIE_WORD:
+                raise ValueError(
+                    f"{path}:{i} — 결속 여부는 {'/'.join(TIE_WORD)} 중 "
+                    f"하나다: {f[3]!r}")
+            pts.append((float(f[1]), float(f[2]),
+                        TIE_WORD[w] if w else tie))
         if len(pts) < 2:
             raise ValueError(f"{path} — 웨이포인트가 {len(pts)}개뿐이다 (2개 이상)")
-        out = ['tie'] if tie else []
+        out = ['tie'] if pts[0][2] else []
         for k in range(1, len(pts)):
             dx = pts[k][0] - pts[k - 1][0]
             dy = pts[k][1] - pts[k - 1][1]
@@ -249,10 +268,13 @@ class Navigator(Node):
                     turns -= step
             else:
                 continue                      # 제자리 — 단계를 만들지 않는다
-            if tie:
+            if pts[k][2]:
                 out.append('tie')
         self.get_logger().info(
-            f"경로 {path} — 웨이포인트 {len(pts)}개 → {len(out)}단계")
+            f"경로 {path} — 웨이포인트 {len(pts)}개 "
+            f"(결속 {sum(1 for q in pts if q[2])}곳: "
+            f"{', '.join(str(k + 1) for k, q in enumerate(pts) if q[2]) or '없음'})"
+            f" → {len(out)}단계")
         return out
 
     # ---- 입력 --------------------------------------------------------------

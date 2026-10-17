@@ -1520,7 +1520,24 @@ class PositionControlNode(Node):
         return linear_vel, angular_vel
 
     def _safety_clamp_axis(self, motor_id, speed_dps):
-        """리미트에 닿은 축의 그 방향만 막는다 (반대 방향은 빠져나올 수 있게 열어 둔다)."""
+        """리미트에 닿은 축의 그 방향만 막는다 (반대 방향은 빠져나올 수 있게 열어 둔다).
+
+        ⚠⚠ [2026-10-16 발견 · 미수정] **X·Y 는 부호 환산이 빠져 있어 거꾸로 동작한다.**
+          `safety_node` 의 `blocked_axes` 는 **mm 기준**(`x-` = X 최소단)인데, 아래는
+          **모터 속도 부호**를 그대로 `+/-` 로 쓴다. 그런데 `axes.yaml` 에 따르면
+            x: home_dir +1  → **양수 속도가 x_min 방향** (모터 부호와 mm 부호가 반대)
+            y: home_dir +1  → 같음
+            z: home_dir -1  → 우연히 일치해서 Z 만 맞게 동작한다
+          결과: X 가 x_min 리미트에 닿으면 **빠져나오는 방향이 막히고 처박는 방향이
+          열린다.** 보호가 아니라 가두는 동작이다.
+          지금은 `safety_timeout` 이 0(= `use_safety:=false`)이라 이 함수가 호출돼도
+          `_safety_active()` 가 False 라 그대로 통과하므로 **현재 운용에서는 안 물린다.**
+          `use_safety:=true` 로 켜기 전에 반드시 고칠 것:
+            d = int((load_stage_axes((axis,)).get(axis) or {}).get('home_dir', 1))
+            want = f"{axis}{'-' if speed_dps * d > 0 else '+'}"
+          `remote_teleop_node._limit_clamp` 는 이미 `home_dir` 을 보고 올바르게
+          환산한다 — 두 노드가 서로 다른 규약을 쓰고 있었다.
+        """
         if not self._safety_active() or self.safety is None or abs(speed_dps) < 0.01:
             return speed_dps
         axis = self.AXIS_BY_MOTOR.get(motor_id)

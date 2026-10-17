@@ -72,17 +72,43 @@ class CrossingDetector(Node):
         self.declare_parameter('threshold', float(cfg['threshold']))
         self.declare_parameter('fp16', bool(cfg['fp16']))
         self.declare_parameter('merge_px', float(cfg['merge_px']))
+        # ⚠⚠ [사용자 지시 2026-10-15] **배근 간격 기반 중복 제거.**
+        #   `merge_px`(화소)·`dedup_mm`(25mm)로는 **51~59mm 떨어진 중복 오검출**이
+        #   그대로 통과했다 (2026-10-15 실측, 사용자가 오검출로 확인).
+        #   배근 간격이 양방향 200mm 로 일정하므로, **그 절반보다 가까운 두 검출은
+        #   같은 교차점**일 수밖에 없다 — 진짜 교차점 둘을 합칠 위험이 원리적으로 없다.
+        #   화소가 아니라 **mm 로 판정**한다: 화소 기준은 깊이에 따라 거리가 달라져
+        #   먼 줄에서 진짜 점을 합칠 수 있다.
+        #   0 이면 끈다.
+        self.declare_parameter('grid_spacing_mm', 200.0)
         self.declare_parameter('frames', 3)            # 합칠 프레임 수
         self.declare_parameter('rate', 1.0)            # 0 이면 트리거로만 동작
         self.declare_parameter('depth_window', 5)      # 깊이 중앙값 창 (홀수)
+        # ⚠⚠ [2026-10-16 사용자 지적] **depth 를 여러 장 모아 화소별 중앙값을 쓴다.**
+        #   예전에는 `_on_depth` 가 마지막 1장만 들고 있어서, 그 한 장이 튀면
+        #   그대로 깊이 오차가 됐다. 더 나쁜 건 **그 프레임에서 0 이면 그 교차점이
+        #   통째로 버려진다**는 것이다 — depth 유효율이 57% 뿐이라 자주 일어난다.
+        #   여러 장 중 하나만 값이 있으면 살아나므로 유효율도 같이 올라간다.
+        #   ⚠ 지연은 없다 — 콜백에서 미리 쌓아 둔 것을 쓴다. 1 이면 옛 동작과 같다.
+        self.declare_parameter('depth_frames', 5)      # 합칠 depth 장수 (1 = 끔)
+        # 모델 검출(녹색) vs 실제 출력(빨강) 겹쳐 그린 그림. 빈 문자열이면 안 그린다.
+        # ⚠ **절대경로여야 한다** — 상대경로는 노드의 작업 디렉터리(서비스 기준)에
+        #   떨어져서 찾을 수 없다 (2026-10-16 에 실제로 그랬다).
+        self.declare_parameter(
+            'debug_png',
+            '/home/koceti/ros2_ws/src/rebar_control/data/vision/detect_debug.png')
         self.declare_parameter('transform_yaml', '')   # 있으면 stage 좌표로 변환
 
         g = self.get_parameter
         self.weights = str(g('weights').value)
         self.threshold = float(g('threshold').value)
         self.merge_px = float(g('merge_px').value)
+        self.grid_mm = float(g('grid_spacing_mm').value)
         self.n_frames = int(g('frames').value)
         self.win = max(1, int(g('depth_window').value) | 1)
+        self.n_depth = max(1, int(g('depth_frames').value))
+        from collections import deque
+        self.depth_buf = deque(maxlen=self.n_depth)
         self.classes = list(cfg['class_names'])
 
         if not os.path.isabs(self.weights):
@@ -114,6 +140,7 @@ class CrossingDetector(Node):
         self.get_logger().info(
             f"교차점 검출 시작 — 모델 {os.path.basename(self.weights)}, "
             f"임계 {self.threshold}, {self.n_frames}프레임 합침, "
+            f"depth {self.n_depth}장 중앙값, "
             f"좌표계 {'stage' if self.R is not None else 'camera(캘리브레이션 전)'}"
             + ("" if rate > 0 else ", 트리거 전용(/rebar/detect)"))
 
@@ -180,11 +207,39 @@ class CrossingDetector(Node):
 
     def _on_depth(self, msg):
         self.depth = msg
+        # ⚠ 원본 메시지가 아니라 **배열로** 쌓는다 — 뒤에서 한 번에 쌓으려면
+        #   변환을 N 번 해야 하고, 해상도가 섞이면 stack 이 터진다.
+        try:
+            a = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        except Exception:
+            return
+        if self.depth_buf and self.depth_buf[0].shape != a.shape:
+            self.depth_buf.clear()          # 해상도가 바뀌었다 — 섞지 않는다
+        self.depth_buf.append(a.copy())
 
     def _on_info(self, msg):
         self.K = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
 
     # ---- 검출 --------------------------------------------------------------
+    def _depth_stack(self):
+        """최근 depth 들을 **화소별 중앙값**으로 합친 한 장.
+
+        0 은 "못 쟀다" 는 뜻이라 평균에 넣으면 거리를 끌어내린다. 그래서 화소마다
+        **0 이 아닌 값들만** 보고 중앙값을 낸다. 전부 0 인 화소만 0 으로 남는다.
+        그래서 장수를 늘리면 깊이가 안정될 뿐 아니라 **유효 화소가 늘어난다.**
+        """
+        buf = list(self.depth_buf)
+        if not buf:
+            return self.bridge.imgmsg_to_cv2(self.depth,
+                                             desired_encoding='passthrough')
+        if len(buf) == 1:
+            return buf[0]
+        a = np.stack(buf).astype(np.float32)
+        a[a <= 0] = np.nan
+        with np.errstate(all='ignore'):
+            med = np.nanmedian(a, axis=0)
+        return np.nan_to_num(med, nan=0.0).astype(buf[0].dtype)
+
     def _depth_at(self, dimg, u, v, scale=(1.0, 1.0)):
         """작은 창의 중앙값. 한 픽셀만 읽으면 0 이나 튄 값을 잡는다.
 
@@ -215,7 +270,7 @@ class CrossingDetector(Node):
         import cv2
         bgr = self.bridge.imgmsg_to_cv2(self.color, desired_encoding='bgr8')
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        dimg = self.bridge.imgmsg_to_cv2(self.depth, desired_encoding='passthrough')
+        dimg = self._depth_stack()
 
         # 여러 프레임 합치기 — 같은 영상에 대해 반복 추론해 흔들림을 줄인다
         raw = []
@@ -253,6 +308,10 @@ class CrossingDetector(Node):
             z = self._depth_at(dimg, ui, vi, scale)
             if z <= 0:
                 continue                       # 깊이 없는 검출은 3D 로 못 바꾼다
+            # ⚠ [2026-10-15] 깊이를 빼고 화소 비례로 가는 안을 시험했다가 **되돌렸다.**
+            #   이 장비는 카메라가 비스듬해 **스테이지 X 와 깊이의 상관이 -0.89** 다 —
+            #   X 를 맞추는 정보가 사실상 깊이에 들어 있다. 빼면 LOO 가
+            #   12.0 → 20.2mm 로 나빠졌다 (짝 47개, 다섯 모델 비교).
             p = np.array([(u - cx) * z / fx, (v - cy) * z / fy, z], dtype=float)
             if self.R is not None:
                 p = self.R @ p + self.t
@@ -264,6 +323,27 @@ class CrossingDetector(Node):
             d.camera_id = 0
             dets.append(d)
 
+        # 배근 간격의 **절반**보다 가까운 검출끼리는 한 점으로 본다 (위 주석).
+        #   신뢰도가 높은 쪽을 남긴다 — 낮은 쪽이 오검출일 확률이 높다.
+        #   ⚠ **조용히 버리지 않는다.** 왜 점이 줄었는지 로그에 남아야 사람이 안다.
+        if self.grid_mm > 0 and len(dets) > 1:
+            lim = self.grid_mm / 2.0
+            keep, dropped = [], []
+            for d in sorted(dets, key=lambda e: -e.confidence):
+                near = next((k for k in keep
+                             if float(np.hypot(k.x - d.x, k.y - d.y)) < lim), None)
+                if near is None:
+                    keep.append(d)
+                else:
+                    dropped.append((d, near, float(np.hypot(near.x - d.x, near.y - d.y))))
+            if dropped:
+                self.get_logger().warning(
+                    f"간격 중복 {len(dropped)}개 제외 (기준 {lim:.0f}mm = 배근 "
+                    f"{self.grid_mm:.0f}mm 의 절반): "
+                    + ", ".join(f"conf {d.confidence:.2f} ↔ {n.confidence:.2f} "
+                                f"{g:.0f}mm" for d, n, g in dropped))
+            dets = keep
+
         out.detections = dets
         out.valid = bool(dets)
         frame = 'stage' if self.R is not None else 'camera'
@@ -271,6 +351,47 @@ class CrossingDetector(Node):
                              f"frame={frame} / 유효 검출 없음")
         self.pub.publish(out)
         self._status(f"검출 {total}개 중 깊이 확보 {len(dets)}개, 좌표계 {frame}")
+        self._debug_png(bgr, merged, dets, scale, dimg)
+
+    def _debug_png(self, bgr, merged, dets, scale, dimg):
+        """모델이 찾은 것과 실제로 나간 것을 한 장에 겹쳐 그린다.
+
+        ⚠⚠ [2026-10-16] 시연 직전에 **모델은 8~9개를 찾는데 출력이 4~6개**인
+          상황이 나왔다. 어디서 버려지는지 토픽만 봐서는 알 수 없다 —
+          `total_detected` 와 개수 차이로 "몇 개" 만 알 뿐 "어느 것" 을 모른다.
+          그래서 두 집합을 겹쳐 그린다.
+            **녹색** = 모델이 찾은 것 (merged)
+            **빨강** = 실제로 나간 것 (dets)
+          녹색만 있고 빨강이 없는 점이 **버려진 점**이고, 그 자리의 깊이를 같이
+          적어 둬서 "깊이 0 이라 버려졌는지" 가 그림에서 바로 보이게 한다.
+        """
+        # 매번 다시 읽는다 — `ros2 param set` 으로 껐다 켤 수 있게 (재시작 불필요)
+        png = str(self.get_parameter('debug_png').value or '')
+        if not png:
+            return
+        try:
+            import cv2
+            im = bgr.copy()
+            got = {(int(round(d.pixel_u)), int(round(d.pixel_v))) for d in dets}
+            for u, v, name, conf in merged:
+                ui, vi = int(round(u)), int(round(v))
+                z = self._depth_at(dimg, ui, vi, scale)
+                hit = any(abs(ui - a) <= 2 and abs(vi - b) <= 2 for a, b in got)
+                cv2.circle(im, (ui, vi), 22, (0, 255, 0), 2)
+                if hit:
+                    cv2.circle(im, (ui, vi), 11, (0, 0, 255), -1)
+                cv2.putText(im, f"{conf:.2f}", (ui + 26, vi - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.putText(im, ("z%d" % z) if z > 0 else "z0!",
+                            (ui + 26, vi + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 255, 0) if z > 0 else (0, 0, 255), 1)
+            cv2.rectangle(im, (0, 0), (im.shape[1], 30), (0, 0, 0), -1)
+            cv2.putText(im, f"green=model {len(merged)}   red=output {len(dets)}"
+                            f"   dropped {len(merged) - len(dets)}",
+                        (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 1)
+            cv2.imwrite(png, im)
+        except Exception as e:                      # 디버그 그림이 검출을 막으면 안 된다
+            self.get_logger().warning(f"디버그 그림 실패: {e}")
 
     def _not_ready(self):
         if self.color is None:
