@@ -40,6 +40,8 @@ setup(
             'crossing_detector = rebar_vision.crossing_detector:main',
             'zedxone_publisher = rebar_vision.zedxone_publisher:main',
             'usbcam_publisher = rebar_vision.usbcam_publisher:main',
+            # 카메라가 **살아서 멈췄을 때** 되살린다 (respawn 으로는 안 잡힌다)
+            'camera_watchdog = rebar_vision.camera_watchdog:main',
         ],
     },
 )

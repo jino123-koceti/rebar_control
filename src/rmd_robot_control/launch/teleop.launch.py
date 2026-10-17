@@ -457,21 +457,49 @@ def generate_launch_description():
     # ⚠ 해상도·fps 는 USB 2.0 에서 **둘 다 흐르는** 조합이다. 모자라면 fps 가
     #   떨어지는 게 아니라 **스트림이 아예 안 열린다** (UVC 가 대역폭을 미리
     #   예약한다). depth 640x400@10 + color 1280x800@10 → 둘 다 약 9.9fps.
+    # ⚠ 인자는 **여기 한 곳에만** 둔다 — 아래 워치독의 복구 명령을 이 dict 로
+    #   만들기 때문이다. 두 군데에 적으면 되살릴 때 다른 설정으로 뜬다.
+    CAM_ARGS = {
+        'serial_number': 'CPAV563008Y',
+        'depth_registration': 'true',
+        'depth_width': '640', 'depth_height': '400', 'depth_fps': '10',
+        'color_width': '1280', 'color_height': '800', 'color_fps': '10',
+        'enable_ir': 'false',
+        'enable_left_ir': 'false', 'enable_right_ir': 'false',
+        'enable_point_cloud': 'false',
+        'enable_colored_point_cloud': 'false',
+    }
     camera = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             PathJoinSubstitution([FindPackageShare('orbbec_camera'),
                                   'launch', 'gemini2L.launch.py'])
         ]),
-        launch_arguments={
-            'serial_number': 'CPAV563008Y',
-            'depth_registration': 'true',
-            'depth_width': '640', 'depth_height': '400', 'depth_fps': '10',
-            'color_width': '1280', 'color_height': '800', 'color_fps': '10',
-            'enable_ir': 'false',
-            'enable_left_ir': 'false', 'enable_right_ir': 'false',
-            'enable_point_cloud': 'false',
-            'enable_colored_point_cloud': 'false',
-        }.items(),
+        launch_arguments=CAM_ARGS.items(),
+        condition=IfCondition(LaunchConfiguration('use_camera')),
+    )
+
+    # ── 카메라 워치독 ────────────────────────────────────────────────────
+    # ⚠⚠ [2026-10-17] **카메라는 죽지 않고 살아서 멈춘다.** 서비스 재시작 때
+    #   USB 가 재열거되는 와중에 노드가 뜨면 SDK 가 그때의 장치 목록을 들고
+    #   `Device ... not found` 를 5.5초마다 영원히 찍는다. 크래시가 아니라
+    #   **`respawn` 으로 안 잡힌다.** 재시작 3번 중 1번 걸렸다.
+    #   상류 `gemini2L.launch.py` 는 respawn 인자를 받지 않고 단독 노드 경로는
+    #   Foxy 전용이라, 이 워치독이 컨테이너를 죽이고 다시 띄우는 수밖에 없다.
+    #   현장에서 USB 를 뽑을 수는 없으니 자동이어야 한다.
+    cam_watch = Node(
+        package='rebar_vision', executable='camera_watchdog',
+        name='camera_watchdog', output='screen',
+        parameters=[{
+            'topic': '/camera/color/image_raw',
+            'grace_sec': 75.0,      # 카메라 기동에 30초쯤 걸린다
+            'stale_sec': 20.0,      # 정상 10fps — 20초 없으면 멈춘 것
+            'cooldown_sec': 120.0,
+            'max_restarts': 3,      # 넘으면 포기하고 크게 알린다 (물리 문제)
+            'match': '__node:=camera_container',   # ⚠ 좁게 — 다른 컨테이너를 잡지 않게
+            'relaunch': 'ros2 launch orbbec_camera gemini2L.launch.py '
+                        + ' '.join(f'{k}:={v}' for k, v in CAM_ARGS.items()),
+        }],
+        respawn=True, respawn_delay=5.0,
         condition=IfCondition(LaunchConfiguration('use_camera')),
     )
 
@@ -554,6 +582,6 @@ def generate_launch_description():
         LogInfo(msg=['리모콘 조작 구성 기동 — 안전 차단: ', use_safety,
                      ' / 호밍은 자동으로 돌지 않는다 (/homing_cmd 로 시작)']),
         motor, lateral, remote_bridge, remote_teleop, ezi_io, safety, mode_arbiter,
-        homing, stage, tying, planner, camera, pololu,
+        homing, stage, tying, planner, camera, cam_watch, pololu,
         drive, navigator, detector, ui,
     ])

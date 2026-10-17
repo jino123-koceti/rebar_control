@@ -1,0 +1,28 @@
+# Orbbec Gemini 2L (2bc5:0673) — usbfs 노드 권한을 확실히 준다
+#
+# ⚠⚠ [2026-10-17] **간헐적 카메라 실패의 근본 원인이 이것이었다.**
+#   증상: 노드가 `Device with serial number CPAV563008Y not found` 를 5.5초마다
+#         무한 반복. 장치는 lsusb 에 보이고 시리얼도 맞는데 못 연다.
+#   원인: 재열거 때 `/dev/bus/usb/001/0NN` 이 **crw------- root root** 로 만들어진다.
+#         서비스는 `koceti` 로 돌고 Orbbec SDK 는 usbfs(libusb)로 장치를 여므로,
+#         그 노드를 열 권한이 없으면 "장치가 없다" 로 보인다.
+#   실측: 2026-10-17 13:25 재열거분이 0600 root:root 였다. chmod 0666 뒤
+#         컨테이너를 다시 띄우니 바로 붙었다 (컬러 60장/8초).
+#
+# 벤더 규칙(`99-obsensor-libusb.rules`)에 0673 항목이 **이미 있는데도** 안 먹었다.
+# 그 규칙은 `SUBSYSTEMS==`(부모 체인) + `ATTRS{}` 형태인데, usb_device 노드에는
+# **`SUBSYSTEM==`(자신) + `ATTR{}`** 가 더 확실하다. 그래서 같은 장치에 대해
+# 단수형으로 한 줄 더 둔다. 벤더 파일을 고치면 패키지 갱신 때 날아간다.
+#
+# ⚠ 이것으로도 안 먹는 경우가 남으면 그건 udev 워커가 재열거를 못 따라간 것이다.
+#   그때는 `camera_watchdog` 가 컨테이너를 다시 띄워 복구한다 (권한이 정상이면 붙는다).
+#
+# 설치:
+#   sudo cp tools/udev/99-orbbec-gemini2l-perm.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+#   sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=2bc5
+# 확인:
+#   ls -l /dev/bus/usb/001/$(printf %03d $(cat /sys/bus/usb/devices/1-4.3.2/devnum))
+#   → crw-rw-rw- root video  이어야 한다
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="2bc5", ATTR{idProduct}=="0673", MODE="0666", GROUP="video"
