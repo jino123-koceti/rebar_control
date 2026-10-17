@@ -1,0 +1,24 @@
+# 카메라 워치독이 USB 권한을 되살릴 수 있게 하는 **최소 권한** 설정.
+#
+# 왜 필요한가 (2026-10-17):
+#   udev 가 Gemini 2L 의 빠른 연속 재열거를 못 따라가고 이벤트를 흘린다. 그러면
+#   `/dev/bus/usb/001/0NN` 이 devtmpfs 생짜 기본값 `0600 root:root` 로 남는다
+#   (기본 규칙 0664 조차 적용 안 됨). 서비스는 koceti 로 돌고 Orbbec SDK 는
+#   usbfs 로 장치를 열므로, 그 상태면 "Device not found" 가 된다.
+#   벤더 udev 규칙은 멀쩡하다 — `udevadm test` 에서 MODE 0666 · GROUP video 로
+#   정상 매칭된다. **흘린 이벤트를 다시 돌려주기만 하면 된다.**
+#
+# 왜 이 한 줄만 여는가:
+#   `udevadm trigger` 를 **정확히 이 인자로** 쓸 때만 허용한다. 벤더 ID 2bc5
+#   (Orbbec) 에 한정되므로 다른 장치에는 손대지 못한다. 셸이나 범용 권한을
+#   주지 않는다.
+#
+# 설치:
+#   sudo cp tools/sudoers/rebar-udev-retrigger /etc/sudoers.d/
+#   sudo chmod 0440 /etc/sudoers.d/rebar-udev-retrigger
+#   sudo visudo -c          # 문법 검사 (필수)
+# 확인:
+#   sudo -n /usr/bin/udevadm trigger --subsystem-match=usb --attr-match=idVendor=2bc5
+#   → 암호 없이 통과해야 한다
+
+koceti ALL=(root) NOPASSWD: /usr/bin/udevadm trigger --subsystem-match=usb --attr-match=idVendor=2bc5

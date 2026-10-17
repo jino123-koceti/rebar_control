@@ -498,6 +498,11 @@ def generate_launch_description():
             'match': '__node:=camera_container',   # ⚠ 좁게 — 다른 컨테이너를 잡지 않게
             'relaunch': 'ros2 launch orbbec_camera gemini2L.launch.py '
                         + ' '.join(f'{k}:={v}' for k, v in CAM_ARGS.items()),
+            # ⚠ 되살리기 **전에** USB 권한을 고친다 — udev 가 빠른 재열거에서
+            #   이벤트를 흘리면 노드가 0600 root:root 로 남아 SDK 가 못 연다.
+            #   이 한 줄만 sudoers 에 열려 있다 (tools/sudoers/rebar-udev-retrigger).
+            'pre_cmd': 'sudo -n /usr/bin/udevadm trigger '
+                       '--subsystem-match=usb --attr-match=idVendor=2bc5',
         }],
         respawn=True, respawn_delay=5.0,
         condition=IfCondition(LaunchConfiguration('use_camera')),

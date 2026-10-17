@@ -1,28 +1,28 @@
-# Orbbec Gemini 2L (2bc5:0673) — usbfs 노드 권한을 확실히 준다
+# Orbbec Gemini 2L (2bc5:0673) — usbfs 노드 권한 **예비** 규칙
 #
-# ⚠⚠ [2026-10-17] **간헐적 카메라 실패의 근본 원인이 이것이었다.**
-#   증상: 노드가 `Device with serial number CPAV563008Y not found` 를 5.5초마다
-#         무한 반복. 장치는 lsusb 에 보이고 시리얼도 맞는데 못 연다.
-#   원인: 재열거 때 `/dev/bus/usb/001/0NN` 이 **crw------- root root** 로 만들어진다.
-#         서비스는 `koceti` 로 돌고 Orbbec SDK 는 usbfs(libusb)로 장치를 여므로,
-#         그 노드를 열 권한이 없으면 "장치가 없다" 로 보인다.
-#   실측: 2026-10-17 13:25 재열거분이 0600 root:root 였다. chmod 0666 뒤
-#         컨테이너를 다시 띄우니 바로 붙었다 (컬러 60장/8초).
+# ⚠⚠ [2026-10-17 정정] **이 파일은 꼭 필요하지 않다.**
+#   처음에는 "벤더 규칙이 안 먹는다" 고 진단하고 이 파일을 만들었는데, 틀렸다.
+#   `udevadm test` 로 확인하니 벤더 규칙이 **정상 매칭**된다:
+#       99-obsensor-libusb.rules:16  OWNER 0 · GROUP 44(video) · MODE 0666
+#                                    · LINK 'Gemini_2_L'
 #
-# 벤더 규칙(`99-obsensor-libusb.rules`)에 0673 항목이 **이미 있는데도** 안 먹었다.
-# 그 규칙은 `SUBSYSTEMS==`(부모 체인) + `ATTRS{}` 형태인데, usb_device 노드에는
-# **`SUBSYSTEM==`(자신) + `ATTR{}`** 가 더 확실하다. 그래서 같은 장치에 대해
-# 단수형으로 한 줄 더 둔다. 벤더 파일을 고치면 패키지 갱신 때 날아간다.
+#   진짜 원인은 **udev 가 카메라의 빠른 연속 재열거에서 이벤트를 흘리는 것**이다.
+#   이벤트가 처리되지 않으면 노드가 devtmpfs 생짜 기본값 `0600 root:root` 로
+#   남는다 — 기본 규칙(50-udev-default 의 0664)조차 적용이 안 된 상태다.
+#   그래서 **규칙을 아무리 더 써도 소용이 없다.** 흘린 이벤트를 다시 돌려줘야 한다:
+#       sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=2bc5
+#   그 한 줄을 `camera_watchdog` 가 자동으로 돌린다
+#   (`tools/sudoers/rebar-udev-retrigger` 로 그 명령만 sudoers 에 열어 둔다).
 #
-# ⚠ 이것으로도 안 먹는 경우가 남으면 그건 udev 워커가 재열거를 못 따라간 것이다.
-#   그때는 `camera_watchdog` 가 컨테이너를 다시 띄워 복구한다 (권한이 정상이면 붙는다).
+#   실측 2026-10-17: 046·050 번 노드가 0600 이었고, 같은 시각의 다른 USB 노드는
+#   0664(udev 적용됨)였다. 카메라의 재열거 소나기만 흘린 것이다.
 #
-# 설치:
+# **그래도 두는 이유**: 벤더 패키지가 갱신·제거되어 그 규칙이 사라질 때의 예비다.
+#   있어서 해가 없고(같은 값을 준다), 없어도 지금 동작에는 영향이 없다.
+#   /etc/udev/rules.d/ 에서 지우고 싶으면 지워도 된다.
+#
+# 설치(선택):
 #   sudo cp tools/udev/99-orbbec-gemini2l-perm.rules /etc/udev/rules.d/
 #   sudo udevadm control --reload
-#   sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=2bc5
-# 확인:
-#   ls -l /dev/bus/usb/001/$(printf %03d $(cat /sys/bus/usb/devices/1-4.3.2/devnum))
-#   → crw-rw-rw- root video  이어야 한다
 
 SUBSYSTEM=="usb", ATTR{idVendor}=="2bc5", ATTR{idProduct}=="0673", MODE="0666", GROUP="video"

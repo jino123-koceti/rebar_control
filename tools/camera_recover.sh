@@ -53,8 +53,11 @@ if [ -n "$DEVNUM" ]; then
     echo "    권한: ❌ **못 연다 — 이것이 원인이다**"
     echo "    즉효:  sudo chmod 0666 $NODE   그리고 컨테이너를 다시 띄운다"
     echo "           (SDK 는 한 번 실패하면 권한이 고쳐져도 스스로 복구하지 않는다)"
-    echo "    영구:  sudo cp tools/udev/99-orbbec-gemini2l-perm.rules /etc/udev/rules.d/"
-    echo "           sudo udevadm control --reload"
+    echo "    원인:  udev 가 빠른 재열거에서 이벤트를 흘려 노드가 0600 으로 남았다."
+    echo "           (벤더 규칙은 멀쩡하다 — udevadm test 로 확인됨)"
+    echo "    처방:  sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=2bc5"
+    echo "           그다음 컨테이너 재시작. camera_watchdog 가 이 둘을 자동으로 한다"
+    echo "           (tools/sudoers/rebar-udev-retrigger 설치 필요)"
   fi
 fi
 

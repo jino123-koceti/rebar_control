@@ -62,6 +62,18 @@ class CameraWatchdog(Node):
         self.declare_parameter('match', '__node:=camera_container')
         # 되살릴 명령. 런치가 카메라 인자와 **같은 것**을 넣어 준다
         self.declare_parameter('relaunch', '')
+        # ⚠⚠ [2026-10-17] **되살리기 전에 USB 권한부터 고친다.**
+        #   udev 가 카메라의 빠른 연속 재열거를 못 따라가고 이벤트를 흘리면,
+        #   노드가 devtmpfs 생짜 기본값 `0600 root:root` 로 남는다. 기본 규칙
+        #   (0664)조차 적용이 안 된 상태다. 서비스는 koceti 로 돌고 SDK 는
+        #   usbfs 로 장치를 여므로 **"장치가 없다" 로 보인다.**
+        #   벤더 규칙 자체는 멀쩡하다 — `udevadm test` 에서 MODE 0666 ·
+        #   GROUP 44(video) 로 정상 매칭된다. **흘린 이벤트를 다시 돌려주면 된다.**
+        #   권한을 안 고치고 컨테이너만 되살리면 똑같이 실패한다 (실측 1회차).
+        #   root 가 필요하므로 이 명령 하나만 sudoers 에 열어 둔다
+        #   (`tools/sudoers/rebar-udev-retrigger`). 비어 있거나 권한이 없으면
+        #   **조용히 건너뛰고** 되살리기만 한다 — 워치독이 죽으면 안 된다.
+        self.declare_parameter('pre_cmd', '')
         self.declare_parameter('enabled', True)
 
         g = self.get_parameter
@@ -72,6 +84,7 @@ class CameraWatchdog(Node):
         self.max_restarts = int(g('max_restarts').value)
         self.match = str(g('match').value)
         self.relaunch = str(g('relaunch').value)
+        self.pre_cmd = str(g('pre_cmd').value)
         self.enabled = bool(g('enabled').value)
 
         self.last_frame = None          # 마지막 프레임 시각
@@ -137,6 +150,20 @@ class CameraWatchdog(Node):
                 self.get_logger().warning(f"   SIGKILL: PID {pid}")
             except OSError:
                 pass
+        if self.pre_cmd:
+            self.get_logger().info(f"   권한 복구: {self.pre_cmd}")
+            try:
+                r = subprocess.run(shlex.split(self.pre_cmd), timeout=15,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                if r.returncode != 0:
+                    self.get_logger().warning(
+                        f"   권한 복구 실패(rc={r.returncode}) — 그대로 진행한다. "
+                        f"sudoers 설정을 확인하라: "
+                        f"{(r.stdout or b'').decode(errors='ignore')[:120]}")
+                else:
+                    time.sleep(1.0)          # udev 가 적용할 시간
+            except Exception as e:
+                self.get_logger().warning(f"   권한 복구 건너뜀: {e}")
         if not self.relaunch:
             self.get_logger().error(
                 "   `relaunch` 가 비어 있다 — 다시 띄우지 못한다 (런치 설정 확인)")
