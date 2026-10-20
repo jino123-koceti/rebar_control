@@ -206,14 +206,16 @@ def _floor_plane(pts, iters=HOUGH_ITERS, k=HOUGH_K, seed=42):
     return _refit(pts, normal, d)
 
 
-def rank_map(depth_mm, K, roi=ROI_DECK,
+def rank_map(depth_mm, K, roi=None, fit_roi=ROI_DECK,
              depth_min=DEPTH_MIN, depth_max=DEPTH_MAX,
              max_points=MAX_POINTS, seed=42):
     """층 랭크 지도를 만든다.
 
     depth_mm : 2차원 배열 [mm]. 0 이나 NaN 은 '깊이 없음'.
     K        : (fx, fy, cx, cy)
-    roi      : (x, y, w, h). **None(전체)으로 쓰지 말 것** — 위 경고 참고
+    roi      : 층을 **매길** 범위. None 이면 전체.
+    fit_roi  : 평면을 **맞출** 범위 (기본 `ROI_DECK`). 둘을 나누는 이유는
+               아래 ⚠⚠ 참고 — 좁게 맞추고 넓게 매긴다.
 
     반환 (rank, info)
       rank : depth 와 같은 크기 uint8. 0=상부근 1=하부근 … INVALID(255)=모름
@@ -244,13 +246,26 @@ def rank_map(depth_mm, K, roi=ROI_DECK,
     vv = vv + y0
     pts = np.stack([(uu - cx) * zz / fx, (vv - cy) * zz / fy, zz], axis=1)
 
-    # 평면 탐색은 표본만 쓴다 — 다수결이라 솎아내도 같은 평면이 나온다
-    if len(pts) > max_points:
-        sel = np.random.default_rng(seed).choice(len(pts), max_points,
-                                                 replace=False)
-        sample = pts[sel]
+    # ⚠⚠ 평면은 **좁은 데크 영역(fit_roi)에서만** 맞춘다. 층은 **전체**에
+    #   매긴다. 둘을 같은 범위로 묶으면 둘 중 하나가 망가진다:
+    #     · 넓게 맞추면 데크 밖 배경이 평면을 끌어당겨 흔들린다 (폭 83mm)
+    #     · 좁게 매기면 경계 근처 검출의 둘레 원이 잘려 비율이 반 토막 난다
+    #       (2026-10-20: v=156 검출이 0.156 — 진짜인데 허위처럼 보였다)
+    #   평면만 정확하면 랭크는 어디든 매길 수 있으므로 나누는 것이 맞다.
+    fit = np.ones(len(pts), dtype=bool)
+    if fit_roi is not None:
+        fx0, fy0, fw, fh = fit_roi
+        fit = ((uu >= fx0) & (uu < fx0 + fw) & (vv >= fy0) & (vv < fy0 + fh))
+    fpts = pts[fit] if fit.any() else pts
+    if len(fpts) < 3:
+        fpts = pts
+    pts_for_plane, pts = fpts, pts
+    if len(pts_for_plane) > max_points:
+        sel = np.random.default_rng(seed).choice(len(pts_for_plane),
+                                                 max_points, replace=False)
+        sample = pts_for_plane[sel]
     else:
-        sample = pts
+        sample = pts_for_plane
     plane = _floor_plane(sample, seed=seed)
     if plane is None:
         return rank, info
@@ -258,9 +273,16 @@ def rank_map(depth_mm, K, roi=ROI_DECK,
     info['plane'] = (normal, d)
 
     dist = pts @ normal + d
-    labels, centers = _bands(dist)
+    # 띠도 **데크 안에서만** 가른다. 전체로 가르면 좌우 레일이 띠로 살아나
+    # (≈206mm) 상부근(≈161mm)보다 높아서 `pick_rank` 가 레일을 고른다.
+    # 경계가 정해진 뒤에는 **전체 화소**를 그 경계로 매긴다 — 그래야 가장자리
+    # 검출의 둘레 원이 안 잘린다. 레일 화소는 상부근으로 매겨지지만, 레일
+    # 위의 검출은 가동범위 밖이라 뒤에서 걸러진다.
+    labels, centers = _bands(dist[fit] if fit.any() else dist)
     if labels is None:
         return rank, info
+    cen_arr = np.asarray(centers)
+    labels = np.argmin(np.abs(dist[:, None] - cen_arr[None, :]), axis=1)
     # `_bands` 는 이미 거리 오름차순으로 띠를 낸다 — 그게 곧 층 번호다
     # (법선이 카메라 반대쪽이라 가까울수록 작다 → 0 이 가장 높은 층)
     if len(centers) > INVALID:
