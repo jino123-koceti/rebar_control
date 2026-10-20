@@ -26,9 +26,23 @@
   젯슨에서 매 프레임 그러면 비싸다. 평면 탐색은 `max_points` 로 솎아낸 표본만
   쓰고, 층 분류는 전 화소에 하되 벡터화한다. 솎아내도 결과가 같은 이유는
   평면이 **다수결로** 정해지기 때문이다.
-- **층 수를 고를 수 있다** (`layer_k`). 바닥이 안 보이면 3군집이 억지로
-  쪼개진다 — 장면에 맞춰야 한다.
+- **층 수를 미리 정하지 않는다.** 원본은 k-means 로 `LAYER_K` 개를 강제하는데,
+  k-means 는 분산을 줄이므로 **점이 많은 층을 쪼개고 적은 층을 뭉갠다** —
+  바닥이 전체의 60% 가 넘는 이 장면에서 실제로 레일과 상부근이 한 덩이가
+  됐다. 층은 개수가 아니라 **빈 구간**으로 갈린다 (`_bands`).
 - 깊이 단위는 **mm** 로 받는다 (Orbbec 이 16UC1 mm 로 준다).
+
+⚠⚠ **미해결 — 기준 평면이 흔들린다 (2026-10-20).** 같은 자세에서 9장
+  중앙값을 6회 떠 보니 층 높이가 회차마다 25~70mm 씩 **한꺼번에** 밀렸다
+  (레일 253~331 / 상부근 115~173). 한 층이 아니라 전부 같이 밀린다는 것은
+  층을 나누는 문제가 아니라 **평면이 다른 면에 붙는** 문제라는 뜻이다.
+  그래서 `pick_rank` 처럼 **절대 높이로 층을 고르는 방식은 아직 믿을 수 없다** —
+  실제로 상부근(171mm) 대신 그 위 띠(282mm)를 고른 회차가 있다.
+  그림: `docs/design/figures/layer_stability.png`
+  (만든 도구: `tools/test/layer_stability_figure.py`)
+
+  다음에 볼 것 — 평면을 허프 결과에 맡기지 말고 **가장 큰 띠(바닥)를
+  기준점으로** 다시 잡거나, 법선을 카메라 설치각으로 구속하는 것.
 
 ⚠ 이 모듈은 **깊이가 맞다고 가정한다.** 깊이가 비어 있는 화소가 40% 가량
   되는 카메라라, 유효 화소가 적으면 평면 자체가 틀어진다. 그래서 유효 화소
@@ -41,27 +55,78 @@ INVALID = 255          # 랭크 지도에서 '깊이 없음'
 
 # 기본값은 학생 구현과 같게 둔다 — 바꾼 것은 근거를 남긴다.
 HOUGH_ITERS = 10000    # 평면 후보 수
-HOUGH_K = 3            # 평면 후보 군집 수
-LAYER_K = 3            # 층 수 (상부/하부/바닥=3, 상부/바닥=2)
+HOUGH_K = 3            # 평면 후보 군집 수 (평면 탐색에만 쓴다)
 DEPTH_MIN = 10.0       # 층 분리에 넣는 깊이 범위 [mm]
 DEPTH_MAX = 1000.0
 MAX_POINTS = 40000     # 평면 탐색에 쓸 표본 상한 (3차년도 추가)
+# 층을 가르는 최소 틈. 8~30mm 를 두 장면에서 훑어 **12** 로 정했다 —
+# 15 이상이면 상·하부근 사이 20mm 골이 메워져 한 층으로 합쳐진다.
+MIN_GAP_MM = 12.0
 REFINE_TOL = 40.0      # 평면 정밀화에 쓸 내점 거리 [mm] (3차년도 추가)
 REFINE_ITERS = 3       # 정밀화 반복
 
 
-def _kmeans1(data, k, seed=42):
-    """1차원 k-means. 군집 중심과 라벨을 돌려준다.
+def _bands(dist, bin_mm=10.0, min_frac=0.02, min_gap_mm=MIN_GAP_MM):
+    """평면거리를 **골로** 가른다. (라벨, 띠중심) 또는 (None, None).
 
-    OpenCV 를 쓰는 이유는 원본과 같은 구현을 쓰기 위해서다 — 결과가 갈리면
-    원인을 알고리즘이 아니라 구현 차이에서 찾게 된다.
+    ⚠ **k-means 로 나누면 안 된다** (2026-10-20 실측). k-means 는 분산을
+      줄이므로 **점이 많은 층을 쪼개고 적은 층을 뭉갠다.** 이 장면은 바닥이
+      전체의 62%(448k)라, k=4 가 바닥을 둘로 쪼개고(−3 / +56) 레일과 상부근을
+      한 덩이로 묶었다(−293 / −144). 그 결과 `pick_rank` 가 레일을 상부근으로
+      골라 **모든 비율이 0.000** 이 됐다. 1·2차 장면에서 맞았던 것은 층별
+      점 개수 비율이 우연히 맞아떨어진 탓이다.
+
+      층은 **개수가 아니라 빈 구간으로** 갈린다 — 철근과 바닥 사이에는 늘
+      빈 틈이 있다. 히스토그램에서 그 틈을 찾으면 개수 편차에 안 끌린다.
+      덤으로 **층 수를 미리 정할 필요가 없어진다** (`layer_k` 가 사라진다).
+
+    min_frac   : 가장 높은 칸 대비 이 비율 미만이면 '빈 칸'
+    min_gap_mm : 이보다 좁은 틈은 같은 층으로 본다 (봉 지름만 한 틈은 층이 아니다)
     """
-    import cv2
-    d = np.asarray(data, dtype=np.float32).reshape(-1, 1)
-    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
-    _, labels, centers = cv2.kmeans(d, k, None, crit, 10,
-                                    cv2.KMEANS_PP_CENTERS)
-    return centers.reshape(-1), labels.reshape(-1)
+    lo, hi = float(dist.min()), float(dist.max())
+    if hi - lo < bin_mm:
+        return None, None
+    nb = max(4, int(np.ceil((hi - lo) / bin_mm)))
+    hist, edges = np.histogram(dist, bins=nb, range=(lo, hi))
+    full = hist >= max(1.0, min_frac * hist.max())
+    if not full.any():
+        return None, None
+
+    # 찬 칸이 이어진 구간 = 띠. 좁은 틈은 메운다
+    gap_bins = max(1, int(round(min_gap_mm / ((hi - lo) / nb))))
+    runs, s = [], None
+    empty = 0
+    for i, f in enumerate(full):
+        if f:
+            if s is None:
+                s = i
+            empty = 0
+        elif s is not None:
+            empty += 1
+            if empty >= gap_bins:
+                runs.append((s, i - empty + 1))
+                s = None
+    if s is not None:
+        runs.append((s, len(full)))
+    if not runs:
+        return None, None
+
+    bounds = [(edges[a], edges[b]) for a, b in runs]
+    lab = np.full(len(dist), -1, dtype=np.int64)
+    cen = []
+    for r, (a, b) in enumerate(bounds):
+        m = (dist >= a) & (dist <= b)
+        if not m.any():
+            cen.append(0.5 * (a + b))
+            continue
+        lab[m] = r
+        cen.append(float(dist[m].mean()))
+    # 띠에 못 든 점은 가장 가까운 띠로 — 버리면 지도에 구멍이 생긴다
+    out = lab < 0
+    if out.any():
+        c = np.asarray(cen)
+        lab[out] = np.argmin(np.abs(dist[out][:, None] - c[None, :]), axis=1)
+    return lab, cen
 
 
 def _refit(pts, normal, d, tol=REFINE_TOL, iters=REFINE_ITERS):
@@ -137,7 +202,7 @@ def _floor_plane(pts, iters=HOUGH_ITERS, k=HOUGH_K, seed=42):
     return _refit(pts, normal, d)
 
 
-def rank_map(depth_mm, K, roi=None, layer_k=LAYER_K,
+def rank_map(depth_mm, K, roi=None,
              depth_min=DEPTH_MIN, depth_max=DEPTH_MAX,
              max_points=MAX_POINTS, seed=42):
     """층 랭크 지도를 만든다.
@@ -165,7 +230,7 @@ def rank_map(depth_mm, K, roi=None, layer_k=LAYER_K,
     good = np.isfinite(z) & (z >= depth_min) & (z <= depth_max)
     nvalid = int(good.sum())
     info = {'valid': nvalid, 'plane': None, 'centers': []}
-    if nvalid < max(3, layer_k):
+    if nvalid < 3:
         return rank, info
 
     fx, fy, cx, cy = K
@@ -189,13 +254,15 @@ def rank_map(depth_mm, K, roi=None, layer_k=LAYER_K,
     info['plane'] = (normal, d)
 
     dist = pts @ normal + d
-    centers, labels = _kmeans1(dist, layer_k, seed=seed)
-    # 거리 오름차순이 곧 층 번호 — 법선이 카메라 쪽이라 가까울수록 작다
-    order = np.argsort(centers)
-    lab2rank = np.empty(layer_k, dtype=np.uint8)
-    lab2rank[order] = np.arange(layer_k, dtype=np.uint8)
-    rank[vv, uu] = lab2rank[labels]
-    info['centers'] = [float(centers[i]) for i in order]
+    labels, centers = _bands(dist)
+    if labels is None:
+        return rank, info
+    # `_bands` 는 이미 거리 오름차순으로 띠를 낸다 — 그게 곧 층 번호다
+    # (법선이 카메라 반대쪽이라 가까울수록 작다 → 0 이 가장 높은 층)
+    if len(centers) > INVALID:
+        return rank, info
+    rank[vv, uu] = labels.astype(np.uint8)
+    info['centers'] = [float(c) for c in centers]
     return rank, info
 
 

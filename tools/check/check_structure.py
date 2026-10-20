@@ -244,7 +244,7 @@ R4_LIMITS = {
     'coverage_map': 800, 'coverage_reach': 250,
     # 층 분리. 순수 모듈(ROS 없음)이라 단독 검증이 되고, 알고리즘 설명이
     #   주석의 절반이다. 노드 상한의 근거가 적용되지 않는다.
-    'layer_rank': 300,
+    'layer_rank': 340,
 
     # ── 2차년도 유산 — 올리지 않는다 (위 설명 참고) ──────────────────────
     'position_control_node': 600, 'joint_controller': 500,

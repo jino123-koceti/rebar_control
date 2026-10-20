@@ -80,7 +80,11 @@ class CrossingDetector(Node):
         #   화소가 아니라 **mm 로 판정**한다: 화소 기준은 깊이에 따라 거리가 달라져
         #   먼 줄에서 진짜 점을 합칠 수 있다.
         #   0 이면 끈다.
-        self.declare_parameter('grid_spacing_mm', 200.0)
+        # ⚠⚠ [2026-10-20] 200 → **0 (끔)**. 상·하부근 2단 배근에서는 "200mm 간격"
+        #   가정이 깨진다 — 상부근과 하부근이 70~75mm 로 겹쳐 보이는 자리에서
+        #   **결속대상 상부근 교차점 2개**를 신뢰도만 보고 버렸다 (사용자 정답과 대조).
+        #   원래 목적(하부근 교차점 억제)도 제대로 못 했다. 층 구분은 층 판정이 맡는다.
+        self.declare_parameter('grid_spacing_mm', 0.0)
         # ⚠⚠ [2026-10-17] 3 → **1**. 이름과 달리 **프레임을 모으는 게 아니라
         #   같은 RGB 한 장에 추론을 N 번 반복**한다 (아래 detect 참고).
         #   RF-DETR 은 결정론적이라 결과가 거의 같다 — 흔들림을 못 줄인다.
@@ -390,14 +394,23 @@ class CrossingDetector(Node):
         try:
             import cv2
             im = bgr.copy()
-            got = {(int(round(d.pixel_u)), int(round(d.pixel_v))) for d in dets}
+            # 번호 = 발행되는 detections 의 인덱스. 사람과 "몇 번 점" 으로 대화하려고
+            #   그린다 — 검출마다 순서가 바뀌니 번호는 **그 장 안에서만** 유효하다.
+            got = [(int(round(d.pixel_u)), int(round(d.pixel_v))) for d in dets]
             for u, v, name, conf in merged:
                 ui, vi = int(round(u)), int(round(v))
                 z = self._depth_at(dimg, ui, vi, scale)
-                hit = any(abs(ui - a) <= 2 and abs(vi - b) <= 2 for a, b in got)
+                idx = next((i for i, (a, b) in enumerate(got)
+                            if abs(ui - a) <= 2 and abs(vi - b) <= 2), None)
                 cv2.circle(im, (ui, vi), 22, (0, 255, 0), 2)
-                if hit:
+                if idx is not None:
                     cv2.circle(im, (ui, vi), 11, (0, 0, 255), -1)
+                    # 맨 윗줄은 위에 쓰면 상단 띠(30px)에 가려진다 → 아래에 쓴다
+                    org = (ui - 46, vi - 18 if vi > 60 else vi + 44)
+                    cv2.putText(im, str(idx), org, cv2.FONT_HERSHEY_SIMPLEX,
+                                0.9, (0, 0, 0), 5)
+                    cv2.putText(im, str(idx), org, cv2.FONT_HERSHEY_SIMPLEX,
+                                0.9, (255, 255, 255), 2)
                 cv2.putText(im, f"{conf:.2f}", (ui + 26, vi - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 cv2.putText(im, ("z%d" % z) if z > 0 else "z0!",
