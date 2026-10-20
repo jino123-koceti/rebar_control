@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""깊이로 **상부근과 하부근을 가른다.** ROS 를 모르는 순수 모듈.
+
+배근은 층이 있다. 상부근 교차점만 묶어야 하는데 검출기는 층을 모르고 전부
+낸다 — 하부근 교차점에 건을 내리면 헛친다. 이 모듈이 깊이만으로 층을 가른다.
+
+한국공대 학생 구현(`CROSS_DETECT/monitoring.hpp` 의 `extractLayerRankMap`)을
+3차년도 장비에 맞게 옮긴 것이다. 알고리즘은 그대로, **계산량과 입출력만**
+우리 쪽에 맞췄다.
+
+## 어떻게 가르는가 — 두 단계
+
+① **바닥 평면 찾기.** 무작위 3점으로 평면 후보를 많이 뽑아 (θ, φ, d) 공간에서
+   군집을 짓고 **가장 큰 군집**을 바닥으로 본다. 화면에서 가장 넓은 평면이
+   바닥(거푸집·합판)이기 때문이다.
+   왜 최소제곱이 아닌가: 철근이 화소의 상당 부분을 차지해서 전체를 한 평면에
+   맞추면 철근 쪽으로 끌려간다. 군집은 **다수결**이라 철근에 안 끌린다.
+
+② **그 평면까지의 거리로 층 나누기.** 모든 점의 평면 거리를 1차원으로 군집
+   지으면 거리 오름차순이 곧 층이다 — 카메라 쪽이 가까우므로
+   **0 = 상부근, 1 = 하부근, 2 = 바닥**.
+
+## 3차년도에 맞춘 것
+
+- **표본 수를 제한한다.** 원본은 ROI 전 화소(최대 42만)를 k-means 에 넣는다.
+  젯슨에서 매 프레임 그러면 비싸다. 평면 탐색은 `max_points` 로 솎아낸 표본만
+  쓰고, 층 분류는 전 화소에 하되 벡터화한다. 솎아내도 결과가 같은 이유는
+  평면이 **다수결로** 정해지기 때문이다.
+- **층 수를 고를 수 있다** (`layer_k`). 바닥이 안 보이면 3군집이 억지로
+  쪼개진다 — 장면에 맞춰야 한다.
+- 깊이 단위는 **mm** 로 받는다 (Orbbec 이 16UC1 mm 로 준다).
+
+⚠ 이 모듈은 **깊이가 맞다고 가정한다.** 깊이가 비어 있는 화소가 40% 가량
+  되는 카메라라, 유효 화소가 적으면 평면 자체가 틀어진다. 그래서 유효 화소
+  수를 함께 돌려주고 호출부가 적으면 쓰지 않도록 한다.
+"""
+
+import numpy as np
+
+INVALID = 255          # 랭크 지도에서 '깊이 없음'
+
+# 기본값은 학생 구현과 같게 둔다 — 바꾼 것은 근거를 남긴다.
+HOUGH_ITERS = 10000    # 평면 후보 수
+HOUGH_K = 3            # 평면 후보 군집 수
+LAYER_K = 3            # 층 수 (상부/하부/바닥=3, 상부/바닥=2)
+DEPTH_MIN = 10.0       # 층 분리에 넣는 깊이 범위 [mm]
+DEPTH_MAX = 1000.0
+MAX_POINTS = 40000     # 평면 탐색에 쓸 표본 상한 (3차년도 추가)
+REFINE_TOL = 40.0      # 평면 정밀화에 쓸 내점 거리 [mm] (3차년도 추가)
+REFINE_ITERS = 3       # 정밀화 반복
+
+
+def _kmeans1(data, k, seed=42):
+    """1차원 k-means. 군집 중심과 라벨을 돌려준다.
+
+    OpenCV 를 쓰는 이유는 원본과 같은 구현을 쓰기 위해서다 — 결과가 갈리면
+    원인을 알고리즘이 아니라 구현 차이에서 찾게 된다.
+    """
+    import cv2
+    d = np.asarray(data, dtype=np.float32).reshape(-1, 1)
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, labels, centers = cv2.kmeans(d, k, None, crit, 10,
+                                    cv2.KMEANS_PP_CENTERS)
+    return centers.reshape(-1), labels.reshape(-1)
+
+
+def _refit(pts, normal, d, tol=REFINE_TOL, iters=REFINE_ITERS):
+    """군집으로 고른 거친 평면을 **내점 최소제곱**으로 정밀화한다.
+
+    ⚠ 이것이 없으면 쓸 수 없다 (2026-10-20 실측). 허프 군집의 *중심*은
+      (θ, φ, d) 공간에서 평균한 값이라 실제 어느 평면과도 다를 수 있다.
+      그대로 쓰면 바닥 화소의 평면거리가 **100mm 넘게 퍼지고**, 봉을 따라
+      색이 매끄럽게 변하는 기울기로 나타난다 — 실제 층 차이(13~20mm)를
+      완전히 덮는다.
+
+    다수결로 고른 평면의 **내점만** 다시 맞추므로 철근에 끌리지 않는 장점은
+    유지된다. 거친 선택(robust) + 정밀 맞춤(accurate)의 조합이다.
+    """
+    for _ in range(iters):
+        r = pts @ normal + d
+        inl = pts[np.abs(r) < tol]
+        if len(inl) < 16:
+            break
+        c = inl.mean(axis=0)
+        # 최소 분산 방향 = 평면 법선 (SVD 의 마지막 특이벡터)
+        _, _, vt = np.linalg.svd(inl - c, full_matrices=False)
+        n2 = vt[-1]
+        if n2[2] < 0:
+            n2 = -n2
+        normal, d = n2, float(-n2 @ c)
+    return normal, d
+
+
+def _floor_plane(pts, iters=HOUGH_ITERS, k=HOUGH_K, seed=42):
+    """무작위 3점 평면 후보를 군집 지어 **바닥 평면**을 고른다.
+
+    반환 (normal, d) — `normal·p + d` 가 그 점의 평면 거리다. 못 구하면 None.
+    """
+    import cv2
+    n = len(pts)
+    if n < 3:
+        return None
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n, size=(iters, 3))
+    # 같은 점이 겹친 조합은 법선이 0 이 되어 아래에서 걸러진다
+    a, b, c = pts[idx[:, 0]], pts[idx[:, 1]], pts[idx[:, 2]]
+    nrm = np.cross(b - a, c - a)
+    ln = np.linalg.norm(nrm, axis=1)
+    ok = ln > 1e-6
+    if ok.sum() < k:
+        return None
+    nrm = nrm[ok] / ln[ok, None]
+    # 카메라 방향(z 양수)으로 통일 — 안 하면 같은 평면이 두 군집으로 갈린다
+    flip = nrm[:, 2] < 0
+    nrm[flip] = -nrm[flip]
+    theta = np.arctan2(nrm[:, 1], nrm[:, 0])
+    theta[theta < 0] += np.pi
+    phi = np.arccos(np.clip(nrm[:, 2], -1.0, 1.0))
+    dd = -np.sum(nrm * a[ok], axis=1)
+    h = np.stack([theta, phi, dd], axis=1).astype(np.float32)
+
+    # 세 축의 단위가 달라서(라디안 vs mm) 그대로 넣으면 d 가 지배한다.
+    # 0~100 으로 정규화해 세 축을 대등하게 만든다.
+    lo, hi = h.min(axis=0), h.max(axis=0)
+    rng_ = np.where(hi - lo < 1e-6, 1.0, hi - lo)
+    hn = (h - lo) / rng_ * 100.0
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, labels, centers = cv2.kmeans(hn.astype(np.float32), k, None, crit, 10,
+                                    cv2.KMEANS_PP_CENTERS)
+    labels = labels.reshape(-1)
+    best = np.argmax(np.bincount(labels, minlength=k))
+    cen = centers[best] / 100.0 * rng_ + lo
+    th, ph, d = float(cen[0]), float(cen[1]), float(cen[2])
+    normal = np.array([np.cos(th) * np.sin(ph),
+                       np.sin(th) * np.sin(ph),
+                       np.cos(ph)], dtype=float)
+    return _refit(pts, normal, d)
+
+
+def rank_map(depth_mm, K, roi=None, layer_k=LAYER_K,
+             depth_min=DEPTH_MIN, depth_max=DEPTH_MAX,
+             max_points=MAX_POINTS, seed=42):
+    """층 랭크 지도를 만든다.
+
+    depth_mm : 2차원 배열 [mm]. 0 이나 NaN 은 '깊이 없음'.
+    K        : (fx, fy, cx, cy)
+    roi      : (x, y, w, h) 또는 None(전체)
+
+    반환 (rank, info)
+      rank : depth 와 같은 크기 uint8. 0=상부근 1=하부근 … INVALID(255)=모름
+      info : {'valid': 유효화소수, 'plane': (normal, d) 또는 None,
+              'centers': 층별 평면거리 중심 [mm]}
+    """
+    h, w = depth_mm.shape[:2]
+    rank = np.full((h, w), INVALID, dtype=np.uint8)
+    x0, y0, x1, y1 = (0, 0, w, h)
+    if roi is not None:
+        rx, ry, rw, rh = roi
+        x0, y0 = max(0, int(rx)), max(0, int(ry))
+        x1, y1 = min(w, x0 + int(rw)), min(h, y0 + int(rh))
+        if x1 <= x0 or y1 <= y0:
+            return rank, {'valid': 0, 'plane': None, 'centers': []}
+
+    z = depth_mm[y0:y1, x0:x1].astype(np.float32)
+    good = np.isfinite(z) & (z >= depth_min) & (z <= depth_max)
+    nvalid = int(good.sum())
+    info = {'valid': nvalid, 'plane': None, 'centers': []}
+    if nvalid < max(3, layer_k):
+        return rank, info
+
+    fx, fy, cx, cy = K
+    vv, uu = np.nonzero(good)
+    zz = z[vv, uu]
+    uu = uu + x0
+    vv = vv + y0
+    pts = np.stack([(uu - cx) * zz / fx, (vv - cy) * zz / fy, zz], axis=1)
+
+    # 평면 탐색은 표본만 쓴다 — 다수결이라 솎아내도 같은 평면이 나온다
+    if len(pts) > max_points:
+        sel = np.random.default_rng(seed).choice(len(pts), max_points,
+                                                 replace=False)
+        sample = pts[sel]
+    else:
+        sample = pts
+    plane = _floor_plane(sample, seed=seed)
+    if plane is None:
+        return rank, info
+    normal, d = plane
+    info['plane'] = (normal, d)
+
+    dist = pts @ normal + d
+    centers, labels = _kmeans1(dist, layer_k, seed=seed)
+    # 거리 오름차순이 곧 층 번호 — 법선이 카메라 쪽이라 가까울수록 작다
+    order = np.argsort(centers)
+    lab2rank = np.empty(layer_k, dtype=np.uint8)
+    lab2rank[order] = np.arange(layer_k, dtype=np.uint8)
+    rank[vv, uu] = lab2rank[labels]
+    info['centers'] = [float(centers[i]) for i in order]
+    return rank, info
+
+
+def layer_ratio(rank, u, v, radius, target=0):
+    """(u, v) 둘레 원 안에서 목표 층이 차지하는 비율.
+
+    한 화소만 보면 안 되는 이유: 키포인트가 철근 **사이**에 떨어질 수 있고,
+    깊이가 비어 있는 화소도 많다. 둘레를 봐야 "이 점이 그 층에 있다" 가 된다.
+    """
+    h, w = rank.shape[:2]
+    u, v, r = int(round(u)), int(round(v)), int(radius)
+    y0, y1 = max(0, v - r), min(h, v + r + 1)
+    x0, x1 = max(0, u - r), min(w, u + r + 1)
+    if y1 <= y0 or x1 <= x0:
+        return 0.0
+    yy, xx = np.ogrid[y0 - v:y1 - v, x0 - u:x1 - u]
+    disk = (yy * yy + xx * xx) <= r * r
+    # 분모는 **원 전체 넓이**다 (화면 밖·깊이 없음도 분모에 든다). 그래야
+    # "가장자리라 정보가 적다" 가 낮은 비율로 드러난다 — 원본과 같은 규약.
+    total = float(np.pi * r * r)
+    hit = float(np.count_nonzero(rank[y0:y1, x0:x1][disk] == target))
+    return hit / total if total > 0 else 0.0
+
+
+def pick_rank(info, lo_mm, hi_mm, prefer='high'):
+    """높이 구간으로 목표 랭크를 **고른다.** 없으면 None.
+
+    ⚠ **랭크 번호를 박아 쓰면 안 된다.** 원본(`TARGET_LAYER_RANK = 0`)은 0 을
+      상부근으로 못박는데, 우리 장비는 **프레임 레일이 철근보다 카메라에
+      가까워서 rank 0 이 레일**이다 (2026-10-20 실측: 레일 −349mm, 상부근
+      −186mm, 하부근 −82mm, 바닥 +3mm). 그대로 쓰면 레일을 결속 대상으로
+      고른다.
+
+    lo_mm, hi_mm : 바닥 평면 **위쪽** 높이 구간 [mm]. 양수로 준다.
+                   (평면거리는 카메라 쪽이 음수이므로 부호를 뒤집어 비교한다)
+    prefer       : 구간 안에 여럿이면 'high'(가장 높은) 또는 'low'
+
+    랭크가 층 수에 따라 바뀌므로, 호출부는 늘 이 함수로 고른다.
+    """
+    cen = info.get('centers') or []
+    hits = [(i, -c) for i, c in enumerate(cen) if lo_mm <= -c <= hi_mm]
+    if not hits:
+        return None
+    hits.sort(key=lambda x: x[1], reverse=(prefer == 'high'))
+    return hits[0][0]
