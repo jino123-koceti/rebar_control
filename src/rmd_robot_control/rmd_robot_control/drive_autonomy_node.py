@@ -37,6 +37,7 @@
 """
 
 import json
+import math
 import time
 
 import rclpy
@@ -48,7 +49,7 @@ from std_msgs.msg import Empty, String
 
 from rebar_base_interfaces.msg import RebarGrid
 
-from rmd_robot_control.coverage_map import CoverageMap
+from rmd_robot_control.coverage_map import CoverageMap, FAILED as CELL_FAILED, TIED
 from rmd_robot_control.coverage_reach import Reach
 
 # 상태. 문자열로 두는 이유는 로그와 `/autonomy/status` 에 그대로 실리기 때문이다.
@@ -70,7 +71,10 @@ class DriveAutonomyNode(Node):
         # 뒤집혀도 장비가 멀리 가버리지 못하게 막는 마지막 울타리다.
         self.declare_parameter('max_leg_mm', 600.0)
         # 정차지마다 결속까지 할지. 이 증분의 기본은 주행 고리만이다.
-        self.declare_parameter('tie_at_stop', False)
+        self.declare_parameter('tie_at_stop', True)
+        # 결속 결과를 셀에 되돌릴 때의 짝짓기 허용 오차. 철근 피치가 200mm
+        # 안팎이므로 반 피치보다 한참 작아야 옆 셀과 헷갈리지 않는다.
+        self.declare_parameter('match_tol_mm', 60.0)
         # 검출 필터는 `tying_planner` 와 **같은 값**을 쓴다. 다르면 두 층이
         # 서로 다른 점 집합을 보고, 지도에 있는 셀을 결속부가 못 가는 일이 난다.
         self.declare_parameter('min_confidence', 0.5)
@@ -88,6 +92,7 @@ class DriveAutonomyNode(Node):
         self.max_stops = int(g('max_stops').value)
         self.max_leg_mm = float(g('max_leg_mm').value)
         self.tie_at_stop = bool(g('tie_at_stop').value)
+        self.match_tol = float(g('match_tol_mm').value)
         self.min_conf = float(g('min_confidence').value)
         self.depth_lo = float(g('depth_min_mm').value)
         self.depth_hi = float(g('depth_max_mm').value)
@@ -102,6 +107,7 @@ class DriveAutonomyNode(Node):
         self.stops = 0
         self.phase = 'idle'
         self.detail = ''
+        self.points = []     # /plan/status 의 점별 결속 결과
 
         self.grid = None            # 새 검출이 오면 채워진다
         self.detect_sent = False
@@ -115,6 +121,7 @@ class DriveAutonomyNode(Node):
         self.pub_status = self.create_publisher(String, '/autonomy/status', 10)
 
         self.create_subscription(RebarGrid, '/rebar/crossings', self.on_grid, 10)
+        self.create_subscription(String, '/plan/status', self.on_plan, 10)
         self.create_subscription(String, '/mission/status', self.on_mission, 10)
         self.create_subscription(String, '/autonomy/cmd', self.on_cmd, 10)
 
@@ -134,6 +141,12 @@ class DriveAutonomyNode(Node):
         # 착각해 움직이지도 않고 다음 정차지를 계획한다.
         if self.detect_sent:
             self.grid = msg
+
+    def on_plan(self, msg):
+        try:
+            self.points = json.loads(msg.data).get('points') or []
+        except ValueError:
+            pass
 
     def on_mission(self, msg):
         try:
@@ -351,13 +364,63 @@ class DriveAutonomyNode(Node):
             self.go(FAILED)
 
     def arrive(self):
-        """도착 — 지도에 반영하고 다시 본다."""
+        """도착 — 결속 결과를 셀에 되돌리고 다시 본다."""
         p = self.plan
         self.map.advance(drive_mm=p['drive_mm'], lateral_turns=p['turns'])
         self.stops += 1
+        if self.tie_at_stop and p['kind'] == 'tie':
+            self.apply_tie(p)
         self.get_logger().info(
             f'도착 (u={self.map.ru:.0f} v={self.map.rv:.0f}) — 다시 검출한다')
         self.go(OBSERVE)
+
+    def apply_tie(self, plan):
+        """결속 결과를 **셀별로** 되돌린다.
+
+        이게 없으면 셀이 pending 에서 빠지지 않아 고리가 끝나지 않는다.
+
+        점은 `stage_mm` 과 `pose` 로 온다. 계획했던 셀을 **그 점이 쓴 자세로**
+        스테이지 좌표에 올려 가장 가까운 것과 짝짓는다. 자세를 계획 쪽 값으로
+        쓰면 안 된다 — `tying_planner` 는 자세 전환을 줄이려 다른 자세를 고른다.
+
+        드라이런은 결속이 성공한 것으로 **가정한다.** 그래야 고리가 끝까지
+        돌아 전체 정차 순서를 볼 수 있다 — 가정했다는 것을 로그에 남긴다.
+        """
+        keys = [tuple(k) for k in plan['cells']]
+        if not keys:
+            return
+        if self.dry_run:
+            for k in keys:
+                self.map.mark(k, TIED, '드라이런 — 결속 성공 가정')
+            self.get_logger().info(f'  (드라이런) {len(keys)}개 셀을 결속으로 가정')
+            return
+
+        hit = 0
+        for pt in self.points:
+            pose, sm = pt.get('pose'), pt.get('stage_mm')
+            if pose is None or not sm:
+                continue
+            best, bd = None, 1e9
+            for k in keys:
+                u, v = self.map.uv_of(*k)
+                sx, sy = self.reach.stage_of_canon(pose, u, v)
+                d = math.hypot(sx - sm[0], sy - sm[1])
+                if d < bd:
+                    best, bd = k, d
+            if best is None or bd > self.match_tol:
+                continue
+            ok = pt.get('state') == '완료'
+            self.map.mark(best, TIED if ok else CELL_FAILED,
+                          pt.get('state', ''))
+            hit += 1
+        # 짝이 안 지어진 셀은 **건드리지 않는다.** 묶였다고 단정하면 영영
+        # 다시 안 가고, 실패로 단정하면 쓸데없이 재시도한다. pending 으로
+        # 두면 다음에 들를 때 자연히 다시 계획된다.
+        self.get_logger().info(
+            f'  결속 결과 반영 — 계획 {len(keys)}개 중 {hit}개 짝지음')
+        if hit < len(keys):
+            self.get_logger().warning(
+                f'  짝 못 지은 {len(keys) - hit}개는 pending 으로 둔다')
 
     # ── 상태 발행 ───────────────────────────────────────────────────────
 
