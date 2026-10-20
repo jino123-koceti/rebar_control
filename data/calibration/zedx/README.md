@@ -1,0 +1,82 @@
+# 전방 ZED X (S/N 43764735) 보정 교정
+
+## 무엇이 문제였나
+
+전방 ZED X 가 `open()` 에서 `POTENTIAL CALIBRATION ISSUE` 를 냈다.
+좌우 보정영상의 에피폴라 정합을 재서 원인을 가렸다 — **캘리 파일도 SDK 도
+아니고, 좌우 리그가 하우징 안에서 물리적으로 틀어져 있다.**
+
+| S/N | 세로 어긋남(중앙값) | 평행이동 | y 기울기(전고) | 잔차 |
+|---|---|---|---|---|
+| 43615762 (후방·정상) | +0.00 px | −0.24 px | −0.50 px | 0.90 px |
+| 43764735 (전방·문제) | **−17.92 px** | −18.89 px | +7.78 px | 1.47 px |
+
+좌우 렌즈가 한 하우징에 밀봉돼 있으므로 **로봇 쪽 마운트를 조여서는 못
+고친다.** 내부가 틀어진 것이다.
+
+배제한 것들:
+- 캘리 파일 — 지우고 SDK 가 서버에서 다시 받아도 md5 동일, 여전히 실패
+- SDK 버그 — ZED X 좌우 뒤바뀜 버그는 5.2.1 에서 수정됨, 우리는 5.4.1
+- `ZED_Calibration` 도구 — ZED X 에서 "Opening camera" 에서 멈춘다
+  ([zed-sdk#601](https://github.com/stereolabs/zed-sdk/issues/601), 미해결)
+- `optional_settings_path` — ZED X 에서 **무시된다**. RX 에 11 rad(물리적으로
+  불가능한 값)를 넣어도 런타임 값이 공장값에서 꼼짝하지 않았다
+
+## 어떻게 고쳤나
+
+오차가 매끄러운 강체 회전이었다(잔차 1.47px, 정상 카메라 0.90px 과 비슷).
+그래서 **내부 파라미터는 공장값을 그대로 두고 좌우 상대 회전만** 다시 풀었다
+(`solve_extrinsic.py`). 특징점 7,283 개에서 세로 어긋남을 최소화한다.
+
+**yaw(Y축)는 일부러 건드리지 않았다.** yaw 는 가로 시차 = 거리값을 좌우하는데
+세로 어긋남으로는 관측되지 않는다. 관측 안 되는 것을 움직이면 거리만 망가진다.
+
+| | 세로 어긋남 | depth 채움률 | 비고 |
+|---|---|---|---|
+| 공장값 | −18.9 px · 100% 가 1px 초과 | 52.6% | 가까운 물체가 통째로 비었다 |
+| 보정 후 | **−0.03 px** · 29% | **79.7%** | 후방 카메라와 같은 수준 |
+
+필요했던 보정: **pitch −1.250°**, roll +0.053°.
+눈으로 볼 비교: `depth_factory.jpg` / `depth_fixed.jpg`.
+
+## 쓰는 법
+
+**카메라를 열 때마다 이 파일을 넘겨야 한다.** 안 넘기면 조용히 깨진 공장값으로
+되돌아간다. 시스템 보정 파일(`/usr/local/zed/settings/`)은 건드리지 않았다.
+
+pyzed:
+
+```python
+ip.optional_opencv_calibration_file = (
+    '/home/koceti/ros2_ws/src/rebar_control/'
+    'data/calibration/zedx/zed_calibration_43764735.yml')
+```
+
+ROS 2 래퍼 — `general.optional_opencv_calibration_file`.
+`src/rebar_vision/config/zed_front_calib.yaml` 를 params-file 로 함께 넘긴다.
+
+**후방(43615762)에는 쓰지 말 것.** 그쪽 공장값은 정상이다.
+
+## 아직 확인 안 된 것
+
+**거리의 절대 눈금.** yaw 와 기선을 공장값 그대로 뒀으니 눈금은 보존됐을
+것이고, 정류 후 초점거리도 723.9 → 740.0 px (2.2%) 로 거의 안 변했다.
+하지만 리그가 yaw 로도 돌아갔다면 거리에 치우침이 남고, 우리 방법으로는
+그걸 볼 수 없다.
+
+판정하려면 둘 중 하나:
+1. 평평한 면을 줄자로 잰 거리에 두고 depth 와 대조
+2. 같은 대상을 후방 카메라(정상)와 함께 재서 비교
+
+## 파일
+
+| | |
+|---|---|
+| `zed_calibration_43764735.yml` | 보정값 (OpenCV 형식, SDK 가 읽는 것) |
+| `solve_extrinsic.py` | 회전을 다시 푸는 스크립트 (재측정용) |
+| `SN43764735.conf.factory` | 공장 보정값 백업 (md5 743411b4…) |
+| `SN43615762.conf.factory` | 후방 공장 보정값 백업 (md5 f8d74dbc…) |
+| `depth_factory.jpg` / `depth_fixed.jpg` | 적용 전후 비교 |
+
+공장값으로 되돌리려면 ZED Explorer 의 FACTORY RESET 을 쓰거나, 위 `.factory`
+파일을 `/usr/local/zed/settings/` 에 되돌려 놓으면 된다.
