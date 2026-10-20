@@ -51,6 +51,8 @@ from rclpy.parameter import Parameter
 from std_msgs.msg import Bool, Empty, Float32, Int32, String
 from rebar_base_interfaces.msg import SafetyState
 
+from rmd_robot_control.lateral_axes import MM_PER_TURN
+
 
 # 경로 파일 네 번째 값 — **그 웨이포인트에서 결속할지**. 생략하면
 # `tie_at_waypoints` 를 따른다 (= 옛 3열 경로 파일은 동작이 그대로다).
@@ -108,7 +110,13 @@ class Navigator(Node):
         #   멈추기 전까지 같은 사고를 반복한다.
         self.declare_parameter('repeat', False)
         self.declare_parameter('tie_at_waypoints', True)
-        self.declare_parameter('lateral_mm_per_turn', 100.0)
+        # [정정 2026-10-20] 100.0 → `lateral_axes.MM_PER_TURN`(50.0).
+        #   2026-10-06 에 '3차년도는 1회전 100mm' 로 적고 여기를 100 으로
+        #   맞췄는데, 2026-10-17 재실측에서 **50mm** 로 정정됐다. 그 정정이
+        #   lateral_axes 에만 반영되고 여기는 남아 있었다 — 자율 주행이
+        #   횡이동을 쓰는 순간 거리가 절반이 된다. 값을 베끼지 말고
+        #   단일 소스를 읽는다.
+        self.declare_parameter('lateral_mm_per_turn', MM_PER_TURN)
         self.declare_parameter('lateral_max_turns', 4)
         self.declare_parameter('drive_timeout_sec', 180.0)
         self.declare_parameter('tie_timeout_sec', 900.0)

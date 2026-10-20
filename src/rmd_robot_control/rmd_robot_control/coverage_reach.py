@@ -10,6 +10,34 @@
 """
 import os
 
+# 저장소 뿌리를 가리는 표식. 이 파일이 있는 디렉터리가 뿌리다.
+_MARKER = os.path.join('data', 'calibration', 'stage_camera.yaml')
+
+
+def _find_root(start):
+    """`start` 에서 위로 올라가며 저장소 뿌리를 찾는다.
+
+    두 군데서 쓰인다 — 소스 트리(`src/rebar_control/src/<pkg>/<pkg>/`)와
+    colcon 사본(`build/<pkg>/<pkg>/`). 전자는 조상 중에 뿌리가 있고,
+    후자는 없다. 후자를 위해 각 조상의 `src/rebar_control/` 도 같이 본다.
+
+    못 찾으면 **추측하지 않고** 가장 가까운 후보를 그대로 돌려준다 —
+    호출부가 `FileNotFoundError` 로 실패하는 편이, 엉뚱한 캘리 파일을
+    조용히 읽는 것보다 낫다.
+    """
+    d = start
+    for _ in range(8):
+        if os.path.exists(os.path.join(d, _MARKER)):
+            return d
+        alt = os.path.join(d, 'src', 'rebar_control')
+        if os.path.exists(os.path.join(alt, _MARKER)):
+            return alt
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return os.path.normpath(os.path.join(start, '..', '..', '..'))
+
 # ──────────────────────────────────────────────────────────────────────
 # 도달 판정
 # ──────────────────────────────────────────────────────────────────────
@@ -137,11 +165,15 @@ class Reach:
         """`stage_camera.yaml` + `axes.yaml` 에서 만든다."""
         import yaml
         # ⚠ 경로를 집 디렉터리에 박지 않는다. 이 모듈 위치에서 저장소
-        #   뿌리를 찾아, 젯슨이 아닌 곳(워크스테이션)에서도 그대로 돈다.
+        #   뿌리를 **거슬러 올라가며 찾는다** — 젯슨이 아닌 곳(워크스테이션)
+        #   에서도, ROS 로 설치된 사본(`build/…`)에서도 그대로 돈다.
         #   `REBAR_ROOT` 로 덮어쓸 수 있다.
-        root = os.environ.get('REBAR_ROOT') or os.path.normpath(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         '..', '..', '..'))
+        #
+        #   세 단계 위로 고정하면 소스에서만 맞는다. colcon 이 만든 사본은
+        #   `build/<pkg>/<pkg>/` 아래라 세 단계 위가 워크스페이스 뿌리가
+        #   되어 파일을 못 찾는다 (2026-10-20 실제로 노드가 죽었다).
+        root = os.environ.get('REBAR_ROOT') or _find_root(
+            os.path.dirname(os.path.abspath(__file__)))
         model_path = model_path or f'{root}/data/calibration/stage_camera.yaml'
         axes_path = axes_path or f'{root}/src/rebar_base_control/config/axes.yaml'
         M = yaml.safe_load(open(model_path))
