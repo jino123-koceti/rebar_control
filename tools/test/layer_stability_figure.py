@@ -40,7 +40,7 @@ plt.rcParams['axes.unicode_minus'] = False
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 '..', '..', 'src', 'rebar_vision'))
-from rebar_vision.layer_rank import (_bands, _floor_plane,   # noqa: E402
+from rebar_vision.layer_rank import (_bands, _floor_plane, ROI_DECK,  # noqa: E402
                                      DEPTH_MIN, DEPTH_MAX, MAX_POINTS)
 
 
@@ -53,9 +53,14 @@ def kmeans_1d(dist, k=4):
     return np.sort(cen.reshape(-1))
 
 
-def plane_dist(depth, K):
+def plane_dist(depth, K, roi=None):
     fx, fy, cx, cy = K
     good = np.isfinite(depth) & (depth >= DEPTH_MIN) & (depth <= DEPTH_MAX)
+    if roi is not None:
+        x, y, w, h = roi
+        m = np.zeros_like(good)
+        m[y:y + h, x:x + w] = True
+        good &= m
     vv, uu = np.nonzero(good)
     zz = depth[vv, uu]
     pts = np.stack([(uu - cx) * zz / fx, (vv - cy) * zz / fy, zz], axis=1)
@@ -74,63 +79,77 @@ def main():
     K = tuple(np.load(args[ki + 1]))
     out = args[args.index('-o') + 1] if '-o' in args else 'layer_stability.png'
 
-    dists, kms, bds = [], [], []
-    for f in files:
-        d = plane_dist(np.load(f).astype(np.float32), K)
-        dists.append(d)
-        kms.append([-c for c in kmeans_1d(d, 4)])
-        bds.append(sorted([-c for c in (_bands(d)[1] or [])], reverse=True))
+    def layers(roi):
+        ds, hs = [], []
+        for f in files:
+            d = plane_dist(np.load(f).astype(np.float32), K, roi)
+            ds.append(d)
+            hs.append(sorted([-c for c in (_bands(d)[1] or [])], reverse=True))
+        return ds, hs
 
-    fig, axes = plt.subplots(2, 1, figsize=(11.5, 9.4),
-                             gridspec_kw=dict(height_ratios=[1.15, 1.0]))
+    d_full, h_full = layers(None)
+    d_roi, h_roi = layers(ROI_DECK)
 
-    # ① 평면거리 분포를 회차별로 겹쳐 — 평면이 움직이면 통째로 밀린다
-    ax = axes[0]
+    fig, axes = plt.subplots(3, 1, figsize=(11.5, 12.4),
+                             gridspec_kw=dict(height_ratios=[1, 1, 1.05]))
     cmap = plt.get_cmap('viridis')
-    for i, d in enumerate(dists):
-        ax.hist(d, bins=np.arange(-420, 160, 10), histtype='step', lw=1.7,
-                color=cmap(i / max(1, len(dists) - 1)), label=f'{i + 1}회')
-    ax.set_title('① 같은 자세에서 6회 — 평면거리 분포가 통째로 밀린다',
-                 fontsize=13, pad=8)
-    ax.set_xlabel('바닥 평면까지의 거리 (mm · 음수가 위쪽)', fontsize=10)
-    ax.set_ylabel('화소 수', fontsize=10)
-    ax.legend(fontsize=9, ncol=6, loc='upper left')
-    ax.text(0.985, 0.93,
-            '대부분 회차는 겹치는데 일부(2회)만 통째로 밀렸다.\n'
-            '한 층이 아니라 모든 봉우리가 같이 밀린다 = 층을 나누는\n'
-            '문제가 아니라 층을 재는 자(기준 평면)가 다른 면에 붙은 것',
-            transform=ax.transAxes, va='top', ha='right', fontsize=9.5,
-            bbox=dict(boxstyle='round,pad=0.45', fc='#FFEBEE', ec='#E53935'))
 
-    # ② 두 방법이 낸 층 높이
-    ax = axes[1]
-    for i, (km, bd) in enumerate(zip(kms, bds)):
-        ax.scatter([i + 1 - 0.13] * len(km), km, s=64, marker='o',
+    def hists(ax, ds, title, note, fc, ec):
+        for i, d in enumerate(ds):
+            ax.hist(d, bins=np.arange(-420, 160, 10), histtype='step', lw=1.7,
+                    color=cmap(i / max(1, len(ds) - 1)), label=f'{i + 1}회')
+        ax.set_title(title, fontsize=13, pad=8)
+        ax.set_xlabel('바닥 평면까지의 거리 (mm · 음수가 위쪽)', fontsize=10)
+        ax.set_ylabel('화소 수', fontsize=10)
+        ax.set_xlim(-420, 120)
+        ax.legend(fontsize=9, ncol=6, loc='upper left')
+        ax.text(0.985, 0.93, note, transform=ax.transAxes, va='top', ha='right',
+                fontsize=9.5,
+                bbox=dict(boxstyle='round,pad=0.45', fc=fc, ec=ec))
+
+    hists(axes[0], d_full, '① 전체 영상 — 회차마다 봉우리가 통째로 밀린다',
+          '데크 밖 배경(먼 벽)과 결속건이 평면 탐색에 섞여\n'
+          '평면을 끌어당긴다. 모든 봉우리가 같이 밀리는 것이\n'
+          '"층이 아니라 자가 흔들린다" 는 신호다.',
+          '#FFEBEE', '#E53935')
+    hists(axes[1], d_roi, '② 데크만 남기고(ROI) — 여섯 회차가 거의 포개진다',
+          'ROI = (280, 160, 720, 630). 좌우 프레임 레일까지 뺀다 —\n'
+          '레일이 상부근과 비슷한 높이(≈198mm)라 안 빼면 섞인다.',
+          '#E8F5E9', '#43A047')
+
+    ax = axes[2]
+    for i, (a, b) in enumerate(zip(h_full, h_roi)):
+        ax.scatter([i + 1 - 0.14] * len(a), a, s=66, marker='o',
                    color='#E53935', zorder=3,
-                   label='k-means (원본)' if i == 0 else None)
-        ax.scatter([i + 1 + 0.13] * len(bd), bd, s=64, marker='s',
+                   label='전체 영상' if i == 0 else None)
+        ax.scatter([i + 1 + 0.14] * len(b), b, s=66, marker='s',
                    color='#1E88E5', zorder=3,
-                   label='골 기반 (바꾼 것)' if i == 0 else None)
+                   label='ROI 적용' if i == 0 else None)
     ax.axhspan(120, 300, color='#FFC107', alpha=0.16, zorder=0)
-    ax.text(len(dists) + 0.42, 210, 'pick_rank 가\n상부근을 찾는\n창 120~300mm',
+    ax.text(len(files) + 0.42, 210, 'pick_rank 가\n상부근을 찾는\n창 120~300mm',
             fontsize=9, va='center', ha='center', color='#F57F17')
-    ax.set_title('② 층 높이 — 두 방법 모두 회차마다 달라진다',
+    fu = [max([v for v in a if 120 <= v <= 300], default=float('nan')) for a in h_full]
+    ru = [max([v for v in b if 120 <= v <= 300], default=float('nan')) for b in h_roi]
+    okf = [v for v in fu if v == v]
+    okr = [v for v in ru if v == v]
+    ax.set_title(f'③ 층 높이 — 상부근으로 고른 값의 폭: '
+                 f'전체 {max(okf)-min(okf):.0f}mm → ROI {max(okr)-min(okr):.0f}mm',
                  fontsize=13, pad=8)
     ax.set_xlabel('촬영 회차 (각 9장 중앙값)', fontsize=10)
     ax.set_ylabel('바닥 위 높이 (mm)', fontsize=10)
-    ax.set_xticks(range(1, len(dists) + 1))
-    ax.set_xlim(0.5, len(dists) + 0.95)
+    ax.set_xticks(range(1, len(files) + 1))
+    ax.set_xlim(0.5, len(files) + 0.95)
     ax.grid(axis='y', alpha=0.3)
     ax.legend(fontsize=10, loc='lower right')
 
-    fig.suptitle('층 분리 — k-means 를 버린 이유와, 아직 남은 문제',
-                 fontsize=15, y=0.985)
-    fig.tight_layout(rect=(0, 0, 1, 0.962))
+    fig.suptitle('층 분리 — 흔들림의 원인은 군집 방법이 아니라 ROI 였다',
+                 fontsize=15, y=0.99)
+    fig.tight_layout(rect=(0, 0, 1, 0.972))
     fig.savefig(out, dpi=130)
     print(f'저장: {out}')
-    for i, (km, bd) in enumerate(zip(kms, bds)):
-        print(f'  {i + 1}회  k-means ' + ' · '.join(f'{v:5.0f}' for v in km)
-              + '   |  골 ' + ' · '.join(f'{v:5.0f}' for v in bd))
+    for i, (a, b) in enumerate(zip(h_full, h_roi)):
+        print(f'  {i + 1}회  전체 ' + ' · '.join(f'{v:5.0f}' for v in a)
+              + '   |  ROI ' + ' · '.join(f'{v:5.0f}' for v in b))
 
 
 main()
