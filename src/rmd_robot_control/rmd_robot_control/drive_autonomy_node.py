@@ -108,6 +108,7 @@ class DriveAutonomyNode(Node):
         self.phase = 'idle'
         self.detail = ''
         self.points = []     # /plan/status 의 점별 결속 결과
+        self.path_cleared = False
 
         self.grid = None            # 새 검출이 오면 채워진다
         self.detect_sent = False
@@ -323,11 +324,20 @@ class DriveAutonomyNode(Node):
                     throttle_duration_sec=5.0)
                 return
             req = SetParameters.Request()
-            req.parameters = [Parameter(
-                name='mission',
-                value=ParameterValue(
-                    type=ParameterType.PARAMETER_STRING_ARRAY,
-                    string_array_value=self.mission))]
+            # ⚠ `path_file` 도 **같이 비워야 한다.** navigator 는 그 값이
+            #   있으면 경로 파일에서 단계를 만들고 `mission` 을 무시한다
+            #   (navigator.py: `texts = _from_path(path) if path else mission`).
+            #   2026-10-20 실측: 미션은 `['drive 141']` 로 들어갔는데 실행된
+            #   것은 데모 경로의 5단계였고 `tie` 부터 시작해 실패했다.
+            req.parameters = [
+                Parameter(name='mission',
+                          value=ParameterValue(
+                              type=ParameterType.PARAMETER_STRING_ARRAY,
+                              string_array_value=self.mission)),
+                Parameter(name='path_file',
+                          value=ParameterValue(
+                              type=ParameterType.PARAMETER_STRING,
+                              string_value=''))]
             self.param_future = self.params.call_async(req)
             self.deadline = time.time() + 10.0
             return
@@ -346,6 +356,11 @@ class DriveAutonomyNode(Node):
             self.go(FAILED)
             return
 
+        if not self.path_cleared:
+            self.path_cleared = True
+            self.get_logger().warning(
+                'navigator 의 path_file 을 비웠다 — 미션 파라미터가 우선하도록.'
+                ' 데모 경로를 다시 쓰려면 그 값을 되돌려야 한다')
         self.phase = 'idle'
         self.pub_start.publish(Empty())
         self.deadline = time.time() + self.mission_timeout
