@@ -2479,7 +2479,7 @@ class PositionControlNode(Node):
             self.get_logger().warning(f"정지 감쇠 처리 오류 (0x{motor_id:03X}): {e}")
     
     def left_motor_response_callback(self, can_id: int, data: bytes):
-        """왼쪽 모터 (0x141) 응답 콜백"""
+        """좌측 주행모터 응답 콜백 — 실제 ID 는 `left_motor_id` (2026-09-08 재정의로 0x142)."""
         if len(data) >= 8:
             try:
                 cmd = data[0]
@@ -2487,7 +2487,7 @@ class PositionControlNode(Node):
                 # 멀티턴 각도 읽기 응답 (0x92) - S20 모드 위치 제어용
                 if cmd == 0x92:
                     # motor_response_callback과 동일한 로직 사용
-                    self.debug_logger.info(f"🔍 [0x141] 0x92 응답 수신, motor_response_callback 호출")
+                    self.debug_logger.info(f"🔍 [0x{self.left_motor_id:03X}] 0x92 응답 수신, motor_response_callback 호출")
                     self.motor_response_callback(self.left_motor_id, data)
                     return
                 
@@ -2505,8 +2505,8 @@ class PositionControlNode(Node):
                         0x20: "과부하"
                     }
                     error_msg = error_msgs.get(error_code, f"알 수 없는 에러 (0x{error_code:02X})")
-                    self.get_logger().error(f"🔴 0x141 에러: {error_msg} (코드: 0x{error_code:02X})")
-                    self.debug_logger.error(f"🔴 0x141 에러: {error_msg}, RAW={data.hex().upper()}")
+                    self.get_logger().error(f"🔴 0x{self.left_motor_id:03X} 에러: {error_msg} (코드: 0x{error_code:02X})")
+                    self.debug_logger.error(f"🔴 0x{self.left_motor_id:03X} 에러: {error_msg}, RAW={data.hex().upper()}")
                     return
                 
                 # 속도 명령 응답 감지 (0xA2)
@@ -2522,7 +2522,7 @@ class PositionControlNode(Node):
                     safety_level = 'n/a'
 
                     # 상세 로그 (debug 레벨로 변경하여 스팸 방지)
-                    self.debug_logger.debug(f"✓ 0x141 속도 응답: speed={speed:.1f}dps, torque={torque:.2f}A, level={safety_level}, RAW={data.hex().upper()}")
+                    self.debug_logger.debug(f"✓ 0x{self.left_motor_id:03X} 속도 응답: speed={speed:.1f}dps, torque={torque:.2f}A, level={safety_level}, RAW={data.hex().upper()}")
                 
                 temperature = int.from_bytes([data[1]], byteorder='little', signed=True)
                 torque_raw = int.from_bytes(data[2:4], byteorder='little', signed=True)
@@ -2543,16 +2543,16 @@ class PositionControlNode(Node):
                 except Exception as pub_error:
                     # Publisher context가 invalid한 경우 (노드 종료 중) 무시
                     if "context is invalid" in str(pub_error) or "publisher" in str(pub_error).lower():
-                        self.debug_logger.debug(f"0x141 RPM 발행 실패 (노드 종료 중): {pub_error}")
+                        self.debug_logger.debug(f"0x{self.left_motor_id:03X} RPM 발행 실패 (노드 종료 중): {pub_error}")
                     else:
-                        self.get_logger().warning(f"0x141 RPM 발행 오류: {pub_error}")
+                        self.get_logger().warning(f"0x{self.left_motor_id:03X} RPM 발행 오류: {pub_error}")
                 
             except Exception as e:
-                self.get_logger().error(f"0x141 응답 파싱 오류: {e}")
-                self.debug_logger.error(f"0x141 응답 파싱 오류: {e}")
+                self.get_logger().error(f"0x{self.left_motor_id:03X} 응답 파싱 오류: {e}")
+                self.debug_logger.error(f"0x{self.left_motor_id:03X} 응답 파싱 오류: {e}")
     
     def right_motor_response_callback(self, can_id: int, data: bytes):
-        """오른쪽 모터 (0x142) 응답 콜백"""
+        """우측 주행모터 응답 콜백 — 실제 ID 는 `right_motor_id` (2026-09-08 재정의로 0x141)."""
         if len(data) >= 8:
             try:
                 cmd = data[0]
@@ -2560,7 +2560,7 @@ class PositionControlNode(Node):
                 # 멀티턴 각도 읽기 응답 (0x92) - S20 모드 위치 제어용
                 if cmd == 0x92:
                     # motor_response_callback과 동일한 로직 사용
-                    self.debug_logger.info(f"🔍 [0x142] 0x92 응답 수신, motor_response_callback 호출")
+                    self.debug_logger.info(f"🔍 [0x{self.right_motor_id:03X}] 0x92 응답 수신, motor_response_callback 호출")
                     self.motor_response_callback(self.right_motor_id, data)
                     return
                 
@@ -2578,11 +2578,11 @@ class PositionControlNode(Node):
                         0x20: "과부하"
                     }
                     error_msg = error_msgs.get(error_code, f"알 수 없는 에러 (0x{error_code:02X})")
-                    self.get_logger().error(f"🔴 0x142 에러: {error_msg} (코드: 0x{error_code:02X})")
-                    self.debug_logger.error(f"🔴 0x142 에러: {error_msg}, RAW={data.hex().upper()}")
+                    self.get_logger().error(f"🔴 0x{self.right_motor_id:03X} 에러: {error_msg} (코드: 0x{error_code:02X})")
+                    self.debug_logger.error(f"🔴 0x{self.right_motor_id:03X} 에러: {error_msg}, RAW={data.hex().upper()}")
                     return
                 
-                # 속도 명령 응답 감지 (0xA2) - 0x142 특별 추적
+                # 속도 명령 응답 감지 (0xA2) — 우측 주행모터 추적
                 if cmd == 0xA2:
                     temperature = int.from_bytes([data[1]], byteorder='little', signed=True)
                     torque_raw = int.from_bytes(data[2:4], byteorder='little', signed=True)
@@ -2592,19 +2592,18 @@ class PositionControlNode(Node):
                     
                     # 비정상 값 감지 시 에러 읽기
                     if abs(torque) > 10.0 or temperature > 80:
-                        self.get_logger().error(f"WARNING: 0x142 비정상: torque={torque:.2f}A, temp={temperature}°C")
+                        self.get_logger().error(f"WARNING: 0x{self.right_motor_id:03X} 비정상: torque={torque:.2f}A, temp={temperature}°C")
                         self.read_motor_error(self.right_motor_id)
                     
                     self.drive_protect(self.right_motor_id, torque, speed, temperature)
                     safety_level = 'n/a'
 
-                    self.get_logger().warning(f"★ 0x142 속도 응답: speed={speed:.1f}dps, torque={torque:.2f}A")
-                    self.debug_logger.warning(f"★ 0x142 속도 응답: speed={speed:.1f}dps, torque={torque:.2f}A, level={safety_level}, RAW={data.hex().upper()}")
+                    self.debug_logger.debug(f"★ 0x{self.right_motor_id:03X} 속도 응답: speed={speed:.1f}dps, torque={torque:.2f}A, level={safety_level}, RAW={data.hex().upper()}")
                     
                     # 속도가 0이 아니면 경고
                     if abs(speed) > 1.0:
-                        self.get_logger().warning(f"⚠⚠⚠ 0x142 정지 실패! 여전히 회전 중: {speed:.1f}dps")
-                        self.debug_logger.warning(f"⚠⚠⚠ 0x142 정지 실패! 여전히 회전 중: {speed:.1f}dps")
+                        self.get_logger().warning(f"⚠⚠⚠ 0x{self.right_motor_id:03X} 정지 실패! 여전히 회전 중: {speed:.1f}dps")
+                        self.debug_logger.warning(f"⚠⚠⚠ 0x{self.right_motor_id:03X} 정지 실패! 여전히 회전 중: {speed:.1f}dps")
                 
                 temperature = int.from_bytes([data[1]], byteorder='little', signed=True)
                 torque_raw = int.from_bytes(data[2:4], byteorder='little', signed=True)
@@ -2625,13 +2624,13 @@ class PositionControlNode(Node):
                 except Exception as pub_error:
                     # Publisher context가 invalid한 경우 (노드 종료 중) 무시
                     if "context is invalid" in str(pub_error) or "publisher" in str(pub_error).lower():
-                        self.debug_logger.debug(f"0x142 RPM 발행 실패 (노드 종료 중): {pub_error}")
+                        self.debug_logger.debug(f"0x{self.right_motor_id:03X} RPM 발행 실패 (노드 종료 중): {pub_error}")
                     else:
-                        self.get_logger().warning(f"0x142 RPM 발행 오류: {pub_error}")
+                        self.get_logger().warning(f"0x{self.right_motor_id:03X} RPM 발행 오류: {pub_error}")
                 
             except Exception as e:
-                self.get_logger().error(f"0x142 응답 파싱 오류: {e}")
-                self.debug_logger.error(f"0x142 응답 파싱 오류: {e}")
+                self.get_logger().error(f"0x{self.right_motor_id:03X} 응답 파싱 오류: {e}")
+                self.debug_logger.error(f"0x{self.right_motor_id:03X} 응답 파싱 오류: {e}")
     
     def destroy_node(self):
         """노드 종료 시 정리"""
