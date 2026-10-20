@@ -85,6 +85,17 @@ class CrossingDetector(Node):
         #   **결속대상 상부근 교차점 2개**를 신뢰도만 보고 버렸다 (사용자 정답과 대조).
         #   원래 목적(하부근 교차점 억제)도 제대로 못 했다. 층 구분은 층 판정이 맡는다.
         self.declare_parameter('grid_spacing_mm', 0.0)
+        # ⚠ **상부근만 남긴다** (2026-10-20 추가). 깊이로 층을 갈라 상부근
+        #   띠에 걸친 검출만 내보낸다. 간격 필터(위)가 하려다 못 한 일을
+        #   여기서 제대로 한다 — 층은 신뢰도가 아니라 **높이**로 갈린다.
+        #   값은 "검출 둘레 원(반지름 `layer_radius_px`) 안에서 상부근 띠가
+        #   차지하는 넓이 비율" 의 하한. 0 이면 끈다.
+        #   실측 정답 대조 (2026-10-20, 현재 설정):
+        #     진짜 상부근 교차점 0.416~0.482 / 허위·하부근 0.177~0.252
+        #     → 빈 구간 한가운데인 **0.35**. 여유가 양쪽으로 0.07 이상이다.
+        #   근거 그림: docs/design/figures/layer_roi_split.png 등
+        self.declare_parameter('layer_ratio_min', 0.35)
+        self.declare_parameter('layer_radius_px', 50)
         # ⚠⚠ [2026-10-17] 3 → **1**. 이름과 달리 **프레임을 모으는 게 아니라
         #   같은 RGB 한 장에 추론을 N 번 반복**한다 (아래 detect 참고).
         #   RF-DETR 은 결정론적이라 결과가 거의 같다 — 흔들림을 못 줄인다.
@@ -288,6 +299,8 @@ class CrossingDetector(Node):
         self.win = max(1, int(g('depth_window').value) | 1)
         self.threshold = float(g('threshold').value)
         self.grid_mm = float(g('grid_spacing_mm').value)
+        self.layer_min = float(g('layer_ratio_min').value)
+        self.layer_r = int(g('layer_radius_px').value)
 
         import cv2
         bgr = self.bridge.imgmsg_to_cv2(self.color, desired_encoding='bgr8')
@@ -345,6 +358,10 @@ class CrossingDetector(Node):
             d.camera_id = 0
             dets.append(d)
 
+        n_depth_ok = len(dets)
+        dets = self._layer_filter(dets, dimg, scale)
+        n_layer_ok = len(dets)
+
         # 배근 간격의 **절반**보다 가까운 검출끼리는 한 점으로 본다 (위 주석).
         #   신뢰도가 높은 쪽을 남긴다 — 낮은 쪽이 오검출일 확률이 높다.
         #   ⚠ **조용히 버리지 않는다.** 왜 점이 줄었는지 로그에 남아야 사람이 안다.
@@ -372,8 +389,51 @@ class CrossingDetector(Node):
         out.error_message = (f"frame={frame}" if dets else
                              f"frame={frame} / 유효 검출 없음")
         self.pub.publish(out)
-        self._status(f"검출 {total}개 중 깊이 확보 {len(dets)}개, 좌표계 {frame}")
+        # 어디서 줄었는지 한 줄로 보인다 — 뭉뚱그리면 원인을 못 찾는다
+        self._status(
+            f"검출 {total}개 → 깊이 {n_depth_ok}개 → 상부근 {n_layer_ok}개"
+            f" → 출력 {len(dets)}개, 좌표계 {frame}")
         self._debug_png(bgr, merged, dets, scale, dimg)
+
+    def _layer_filter(self, dets, dimg, scale):
+        """상부근 띠에 걸친 검출만 남긴다. `layer_ratio_min` 이 0 이면 끈다.
+
+        왜 필요한가: 검출 모델은 층을 모른다. 하부근끼리의 교차점이나,
+        상부근이 하부근 위를 지나가는 **허위 교차점**도 똑같이 찾아낸다.
+        거기에 건을 내리면 헛친다. 층은 깊이로만 갈린다.
+
+        ⚠ **조용히 버리지 않는다** — 몇 개를 어떤 비율로 버렸는지 남긴다.
+        """
+        if self.layer_min <= 0 or not dets or self.K is None:
+            return dets
+        try:
+            from rebar_vision.layer_rank import rank_map, layer_ratio, pick_rank
+        except ImportError as e:
+            self.get_logger().warning(f"층 분리 모듈을 못 읽었다 — 층 필터 건너뜀: {e}")
+            return dets
+
+        # 깊이 영상 기준 내부 파라미터. 컬러와 해상도가 다르면 비례로 환산한다
+        fx, fy, cx, cy = self.K
+        sx, sy = scale
+        Kd = (fx / sx, fy / sy, cx / sx, cy / sy)
+        rank, info = rank_map(np.asarray(dimg, dtype=np.float32), Kd)
+        up = pick_rank(info, 120, 300, 'high')
+        if up is None:
+            self.get_logger().warning(
+                "상부근 띠를 못 골랐다 — 층 필터 건너뜀 "
+                f"(띠 높이 {[round(-c) for c in info['centers']]})")
+            return dets
+
+        keep, drop = [], []
+        for d in dets:
+            r = layer_ratio(rank, d.pixel_u / sx, d.pixel_v / sy, self.layer_r, up)
+            (keep if r >= self.layer_min else drop).append((d, r))
+        if drop:
+            self.get_logger().warning(
+                f"상부근 아님 {len(drop)}개 제외 (비율 < {self.layer_min:.2f}, "
+                f"상부근 높이 {-info['centers'][up]:.0f}mm): "
+                + ", ".join(f"({d.pixel_u},{d.pixel_v}) {r:.3f}" for d, r in drop))
+        return [d for d, _ in keep]
 
     def _debug_png(self, bgr, merged, dets, scale, dimg):
         """모델이 찾은 것과 실제로 나간 것을 한 장에 겹쳐 그린다.
