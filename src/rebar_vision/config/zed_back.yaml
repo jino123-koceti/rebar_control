@@ -1,0 +1,44 @@
+# 후방 ZED X (S/N 43615762) — 주행 중 장애물 판단용
+#
+# 전방(`zed_front.yaml`)과 설정이 같되, **보정 파일 지정이 없다.**
+# 이 카메라는 공장 보정값이 정상이다 (좌우 세로 어긋남 0.00px 실측).
+# 전방용 보정 파일을 여기에 쓰면 안 된다 — 다른 개체의 값이다.
+---
+/**:
+    ros__parameters:
+        general:
+            camera_model: 'zedx'
+            grab_resolution: 'HD1080'
+            grab_frame_rate: 15
+            pub_resolution: 'NATIVE'
+            pub_frame_rate: 10.0
+
+        depth:
+            # 전방과 같은 모드를 써야 한다. 모드가 다르면 TensorRT 엔진이
+            # 하나 더 필요해져 첫 기동에서 6분을 더 쓴다.
+            depth_mode: 'NEURAL'
+            # 0 이어야 한다. 1 이상이면 래퍼가 **위치추적을 강제로 켠다**
+            # ("forced to ENABLE because required by depth_stabilization").
+            # 주행 오도메트리는 엔코더로 받으므로 VSLAM 은 GPU 낭비다.
+            depth_stabilization: 0
+            min_depth: 0.3
+            max_depth: 10.0
+            point_cloud_freq: 0.0
+
+        pos_tracking:
+            pos_tracking_enabled: false
+
+        mapping:
+            mapping_enabled: false
+
+        object_detection:
+            od_enabled: false
+
+        body_tracking:
+            bt_enabled: false
+
+        stream_server:
+            stream_enabled: false
+
+        debug:
+            sdk_verbose: 0

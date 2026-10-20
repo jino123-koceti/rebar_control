@@ -6,9 +6,9 @@
 
 토픽:
   구독:
-    - /zed_front/zed_node/left/image_rect_color (RGB)
+    - /zed_front/zed_node/rgb/color/rect/image (RGB)
     - /zed_front/zed_node/depth/depth_registered (Depth)
-    - /zed_back/zed_node/left/image_rect_color (RGB)
+    - /zed_back/zed_node/rgb/color/rect/image (RGB)
     - /zed_back/zed_node/depth/depth_registered (Depth)
   발행:
     - /obstacle_pause (Bool) - True: 장애물 감지, False: 해제
@@ -83,33 +83,34 @@ class ObstacleDetectorNode(Node):
         self.front_rgb_stamp = 0.0
         self.back_rgb_stamp = 0.0
 
-        # 구독: 전방 카메라 (zed_front = 전진 시 전방)
-        self.front_rgb_sub = self.create_subscription(
-            Image,
-            '/zed_front/zed_node/left/image_rect_color',
-            self._front_rgb_callback,
-            10
-        )
-        self.front_depth_sub = self.create_subscription(
-            Image,
-            '/zed_front/zed_node/depth/depth_registered',
-            self._front_depth_callback,
-            10
-        )
+        # 구독 토픽은 파라미터로 둔다. 래퍼 판올림 때 이름이 바뀌어도
+        # 코드를 안 고치고 넘어가기 위해서다 — 실제로 한 번 바뀌었다:
+        # 2026-10-20 기준 zed-ros2-wrapper 는 컬러를 `left/image_rect_color`
+        # 가 아니라 `rgb/color/rect/image` 로 낸다. 옛 이름으로 두면 구독만
+        # 조용히 안 붙고 **에러도 안 난다.**
+        self.declare_parameter('front_rgb_topic',
+                               '/zed_front/zed_node/rgb/color/rect/image')
+        self.declare_parameter('front_depth_topic',
+                               '/zed_front/zed_node/depth/depth_registered')
+        self.declare_parameter('back_rgb_topic',
+                               '/zed_back/zed_node/rgb/color/rect/image')
+        self.declare_parameter('back_depth_topic',
+                               '/zed_back/zed_node/depth/depth_registered')
 
-        # 구독: 후방 카메라 (zed_back = 후진 시 전방)
+        def _topic(name):
+            return str(self.get_parameter(name).value)
+
+        # 전방 카메라 (zed_front = 전진 시 전방)
+        self.front_rgb_sub = self.create_subscription(
+            Image, _topic('front_rgb_topic'), self._front_rgb_callback, 10)
+        self.front_depth_sub = self.create_subscription(
+            Image, _topic('front_depth_topic'), self._front_depth_callback, 10)
+
+        # 후방 카메라 (zed_back = 후진 시 전방)
         self.back_rgb_sub = self.create_subscription(
-            Image,
-            '/zed_back/zed_node/left/image_rect_color',
-            self._back_rgb_callback,
-            10
-        )
+            Image, _topic('back_rgb_topic'), self._back_rgb_callback, 10)
         self.back_depth_sub = self.create_subscription(
-            Image,
-            '/zed_back/zed_node/depth/depth_registered',
-            self._back_depth_callback,
-            10
-        )
+            Image, _topic('back_depth_topic'), self._back_depth_callback, 10)
 
         # 발행
         self.pause_pub = self.create_publisher(Bool, '/obstacle_pause', 10)

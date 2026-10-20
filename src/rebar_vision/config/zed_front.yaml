@@ -1,0 +1,64 @@
+# 전방 ZED X (S/N 43764735) — 주행 중 장애물 판단용
+#
+# ⚠ `optional_opencv_calibration_file` 이 **반드시** 있어야 한다.
+#   이 카메라는 좌우 리그가 하우징 안에서 pitch 1.25° 틀어져 있어, 공장
+#   보정값으로는 **가까운 물체가 통째로 빈다**(채움률 52.6% vs 79.7%).
+#   장애물까지의 거리를 재야 하는 카메라가 정작 가까운 것을 못 보게 된다.
+#   빠뜨려도 경고가 없다 — 조용히 깨진 공장값으로 돌아간다.
+#   근거·측정값: data/calibration/zedx/README.md
+#
+#   경로를 절대경로로 두는 이유: ROS 파라미터는 치환을 못 하고, 이 값은
+#   런치 인자가 아니라 파일로만 넘어간다(`ros_params_override_path`).
+---
+/**:
+    ros__parameters:
+        general:
+            camera_model: 'zedx'
+            optional_opencv_calibration_file: '/home/koceti/ros2_ws/src/rebar_control/data/calibration/zedx/zed_calibration_43764735.yml'
+
+            # 보정 파일의 Size 가 1920x1080 이라 맞춰 둔다. SDK 가 해상도를
+            # 변환해 주긴 하지만, 맞춰 두면 변환 단계가 하나 줄어든다.
+            grab_resolution: 'HD1080'
+
+            # 주행 판단에 30fps 는 필요 없다. 15 로 내려 GPU 를 아낀다
+            # (전후방 2대가 동시에 NEURAL depth 를 돌린다).
+            grab_frame_rate: 15
+            pub_resolution: 'NATIVE'
+            pub_frame_rate: 10.0
+
+        depth:
+            # NEURAL 을 쓰는 이유는 품질만이 아니다 — 이 장비에 **엔진이 이미
+            # 캐시돼 있다**. 다른 모드를 처음 쓰면 TensorRT 변환에 6분이 걸리고,
+            # 그게 자동 기동 중에 터지면 재시작 루프가 된다.
+            depth_mode: 'NEURAL'
+            # 0 이어야 한다. 1 이상이면 래퍼가 **위치추적을 강제로 켠다**
+            # ("forced to ENABLE because required by depth_stabilization").
+            # 주행 오도메트리는 엔코더로 받으므로 VSLAM 은 GPU 낭비다.
+            depth_stabilization: 0
+
+            # 결속용 카메라와 달리 주행은 멀리 봐야 한다.
+            min_depth: 0.3
+            max_depth: 10.0
+
+            # 포인트클라우드는 아직 쓰는 데가 없다. 틈새 통과 판단에 필요해지면
+            # 그때 켠다 (대역폭·GPU 가 싸지 않다).
+            point_cloud_freq: 0.0
+
+        # 주행 오도메트리는 바퀴 엔코더로 이미 받는다. VSLAM 은 GPU 만 먹는다.
+        pos_tracking:
+            pos_tracking_enabled: false
+
+        mapping:
+            mapping_enabled: false
+
+        object_detection:
+            od_enabled: false
+
+        body_tracking:
+            bt_enabled: false
+
+        stream_server:
+            stream_enabled: false
+
+        debug:
+            sdk_verbose: 0

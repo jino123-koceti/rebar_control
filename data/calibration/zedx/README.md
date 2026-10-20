@@ -53,7 +53,12 @@ ip.optional_opencv_calibration_file = (
 ```
 
 ROS 2 래퍼 — `general.optional_opencv_calibration_file`.
-`src/rebar_vision/config/zed_front_calib.yaml` 를 params-file 로 함께 넘긴다.
+`src/rebar_vision/config/zed_front.yaml` 에 들어 있고, 전후방 런치가 그걸 쓴다:
+
+```bash
+ros2 launch rebar_vision zed_dual.launch.py
+```
+
 
 **후방(43615762)에는 쓰지 말 것.** 그쪽 공장값은 정상이다.
 
