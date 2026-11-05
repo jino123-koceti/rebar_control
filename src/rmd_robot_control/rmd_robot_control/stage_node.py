@@ -267,7 +267,10 @@ class StageNode(Node):
         #   못 내려가고 맴돈다. 속도도 낮춘다 — 오버슈트는 속도에 비례하고
         #   (400dps 2.2° / 200dps 0.22°) 보정 이동량은 모터축 몇 도뿐이다.
         #   실측 근거와 수치는 `teleop.launch.py` 의 `yaw_gun_tol_deg` 주석에.
-        self.declare_parameter('yaw_fine_tol_deg', 0.6)     # 회차 도달 판정 (모터축)
+        # 회차 도달 판정 (모터축). ⚠ **L1 의 `position_tolerance`(1.0°)보다
+        #   촘촘하면 안 된다** — L1 이 먼저 '도달' 로 손을 떼므로 L4 가 영원히
+        #   만족 못 하고 재전송하며 왕복한다 (2026-11-05 실측 2.5초/회차).
+        self.declare_parameter('yaw_fine_tol_deg', 1.0)
         self.declare_parameter('yaw_fine_speed_dps', 60.0)  # 회차 회전 속도
 
         g = self.get_parameter
