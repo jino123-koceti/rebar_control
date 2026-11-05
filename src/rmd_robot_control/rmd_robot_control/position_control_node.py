@@ -2283,9 +2283,16 @@ class PositionControlNode(Node):
     def cmd_vel_callback(self, msg: Twist):
         """CMD_VEL 콜백 (0x141, 0x142 모터 속도 제어)"""
         if self.drive_tripped:
+            # ⚠ 문구가 "전류 정격 이하 3초" 였는데 **사실과 달랐다.** 트립하면
+            #   0x80 으로 출력을 끊어 모터가 응답을 안 하므로 전류 기반 해제는
+            #   애초에 돌지 않는다 — 실제로는 **고정 냉각 타이머**가 푼다
+            #   (`drive_latch_tick`). 틀린 안내는 "전류를 낮추려고 기다리는"
+            #   엉뚱한 대처를 부른다. 남은 시간을 그대로 보여 준다.
+            left = self.drive_cool_now - (time.time() - self.drive_trip_at)
             self.get_logger().warning(
                 f"주행 보호 작동 중 — cmd_vel 무시 ({self.drive_trip_reason}). "
-                f"전류가 정격 이하로 3초 유지되면 자동 해제됩니다.")
+                f"{max(0.0, left):.0f}초 뒤 자동 해제 (출력은 0x80 으로 끊겨 있다)",
+                throttle_duration_sec=1.0)
             return
         self.last_cmd_vel_time = time.time()
         self.drive_cmd_active = bool(msg.linear.x or msg.angular.z)
