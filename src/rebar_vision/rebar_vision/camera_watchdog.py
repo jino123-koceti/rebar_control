@@ -24,9 +24,13 @@ USB 가 재열거되는데, 새 노드가 **그 재열거 중에 뜨면** SDK �
 상류 `gemini2L.launch.py` 는 `respawn` 을 받지 않고 단독 노드 경로는 Foxy 전용이라
 (Humble 은 항상 컴포저블 컨테이너), 이 노드가 직접 해 주는 수밖에 없다.
 
-⚠ **죽일 대상을 이름으로 넓게 잡지 않는다.** `component_container` 만 보고 죽이면
-  다른 컨테이너까지 잡는다. `__node:=camera_container` 가 들어간 cmdline 만 고른다.
-  (2026-10-17 에 `pkill -f` 로 엉뚱한 노드를 잡은 일이 있다.)
+⚠⚠ **죽일 대상을 넓게 잡지 않는다 — 두 번 당했다.**
+  2026-10-17: `component_container` 로 잡아 다른 컨테이너까지 죽였다.
+  2026-11-05: 그래서 `__node:=camera_container` 로 좁혔는데, 나중에 들어온
+    **측면 305 두 대가 같은 컨테이너 이름**을 써서 또 같이 죽었다. 2L 을
+    되살릴 때마다 측면이 죽고 USB 가 재열거됐고, 그게 반복되다 좌측 305 가
+    통째로 사라져 **전원 재투입으로야 살아났다.**
+  → 지금은 **네임스페이스까지 포함해 토큰 단위로** 비교한다.
 
 ⚠ **유예·냉각·횟수 제한이 있다.** 카메라는 기동에 30초쯤 걸리고, 되살리기가
   실패를 반복하면 그건 소프트웨어로 풀 문제가 아니다 (케이블·전원). 몇 번 해 보고
@@ -59,7 +63,9 @@ class CameraWatchdog(Node):
         # 이 횟수를 넘기면 포기하고 알리기만 한다 (물리적 문제로 본다)
         self.declare_parameter('max_restarts', 3)
         # 컨테이너를 고를 cmdline 조각. **좁게** 잡는다
-        self.declare_parameter('match', '__node:=camera_container')
+        # ⚠ **토큰 전부가 cmdline 에 있어야** 대상이다 (부분문자열 아님).
+        #   네임스페이스를 반드시 포함할 것 — 측면 305 도 컨테이너 이름이 같다.
+        self.declare_parameter('match', '__node:=camera_container __ns:=/camera')
         # 되살릴 명령. 런치가 카메라 인자와 **같은 것**을 넣어 준다
         self.declare_parameter('relaunch', '')
         # ⚠⚠ [2026-10-17] **되살리기 전에 USB 권한부터 고친다.**
@@ -122,7 +128,21 @@ class CameraWatchdog(Node):
                     cmd = f.read().replace(b'\0', b' ').decode(errors='ignore')
             except OSError:
                 continue
-            if self.match in cmd and 'camera_watchdog' not in cmd:
+            # ⚠⚠ [2026-11-05] **토큰 단위로 본다. 부분문자열이면 안 된다.**
+            #   `__node:=camera_container` 로 부분 비교했더니 **측면 305 두 대를
+            #   같이 죽였다.** 셋 다 컨테이너 이름이 같고 네임스페이스만 다르다:
+            #       __node:=camera_container -r __ns:=/camera        ← 2L (대상)
+            #       __node:=camera_container -r __ns:=/camera_left   ← 측면
+            #       __node:=camera_container -r __ns:=/camera_right  ← 측면
+            #   게다가 `/camera` 는 `/camera_left` 의 **접두어**라 네임스페이스를
+            #   더해도 부분 비교로는 못 가른다. 토큰으로 비교해야 한다.
+            #   실제 피해: 2L 을 되살릴 때마다 측면이 죽고 USB 가 재열거되는데,
+            #   그게 반복되면 PHY 가 래치돼 카메라가 통째로 사라진다
+            #   ([[rebar-usb-error71-needs-power-cycle]]). 2026-11-05 에 좌측
+            #   305 를 그렇게 잃고 전원 재투입으로야 살렸다.
+            toks = cmd.split()
+            if (all(m in toks for m in self.match.split())
+                    and 'camera_watchdog' not in cmd):
                 out.append((int(pid), cmd.strip()))
         return out
 

@@ -247,13 +247,19 @@ class DeckEdgeNode(Node):
 
     # ---- 판정 --------------------------------------------------------------
     def tick(self):
-        # ⚠ 교대로 본다. 진행 방향만 보면 반대쪽이 묵어 탈출까지 막힌다.
-        #   측면은 주행 중에 쓰이지 않으므로 **4틱에 한 번**만 본다 —
-        #   횡이동은 전진이 막혔을 때만 하고, 그때는 서 있다.
+        # ⚠ **네 방향을 균등하게 돌린다** (전 → 후 → 좌 → 우).
+        #   진행 방향만 보면 반대쪽 판정이 묵어 **탈출 방향까지 막힌다**
+        #   (2차년도와 같은 결론). 측면도 마찬가지다 — 전진이 막힌 순간
+        #   좌우 판정이 4초 묵어 있으면 그만큼 서서 기다려야 한다.
+        #   2차년도는 측면이 GMSL(ZED X One)이라 한 번에 한 대만 열 수 있어
+        #   요청/응답으로 순차 판정했는데, 지금은 USB 305 라 **둘 다 상시
+        #   스트리밍**이다. 추론만 돌아가며 하면 된다 (세그 1회 ~90ms).
         self.turn += 1
-        if self.lat and self.turn % 4 == 3:
-            return self._tick_side()
-        side = self.sides['forward' if self.turn % 2 == 0 else 'backward']
+        order = ['forward', 'backward'] + (['left', 'right'] if self.lat else [])
+        key = order[self.turn % len(order)]
+        if key in self.lat:
+            return self._tick_side(key)
+        side = self.sides[key]
         if not side.ready():
             return
         img, depth, K = side.rgb, side.depth, side.K
@@ -298,9 +304,8 @@ class DeckEdgeNode(Node):
             'frac': frac,
         }
 
-    def _tick_side(self):
+    def _tick_side(self, key):
         """측면 한 대. 깊이도 평면도 안 쓰고 rebar_frac 만 본다."""
-        key = 'left' if (self.turn // 4) % 2 == 0 else 'right'
         s = self.lat.get(key)
         if s is None or s.rgb is None:
             return
@@ -366,6 +371,11 @@ class DeckEdgeNode(Node):
             ensure_ascii=False)))
         self.status_pub.publish(String(data=json.dumps(
             {'t': round(time.time(), 1), 'block': block, 'slow': slow,
+             # ⚠ `side` 는 **여기에도** 실어야 한다. 자율 고리는 status 를
+             #   구독하는데 block 쪽에만 넣었더니 항상 빈 값을 받아 좌우를
+             #   '모름 → 닫힘' 으로 떨어뜨렸다 (2026-11-05: 좌측이 열려
+             #   있는데도 "전진·좌우 모두 막혔다" 로 종료).
+             'side': {k: v['open'] for k, v in side_state.items()},
              'detail': detail}, ensure_ascii=False)))
 
 
