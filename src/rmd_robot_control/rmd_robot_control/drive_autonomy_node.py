@@ -153,6 +153,7 @@ class DriveAutonomyNode(Node):
         self.t_wait = 0.0             # deck_edge 판정을 기다리기 시작한 시각
         self.deck_wait_s = 15.0
         self.de = {}                  # /deck_edge/status 의 detail
+        self.de_side = {}             # 측면 가능 여부 {'left': bool, 'right': bool}
         self.stop_mm = 300.0          # deck_edge 노드와 같은 문턱
         self.mission = []
         self.moved = (0.0, 0)
@@ -219,9 +220,11 @@ class DriveAutonomyNode(Node):
     def on_deck(self, msg):
         """deck_edge 판정. 늦거나 끊기면 **보수적으로** 막힌 것으로 본다."""
         try:
-            self.de = (json.loads(msg.data) or {}).get('detail') or {}
+            d = json.loads(msg.data) or {}
         except ValueError:
-            pass
+            return
+        self.de = d.get('detail') or {}
+        self.de_side = d.get('side') or {}
 
     def _sense(self):
         """진행 방향의 (갈 수 있는 거리, 막힌 방향들, 쓸 수 있나).
@@ -373,6 +376,11 @@ class DriveAutonomyNode(Node):
         self.get_logger().info(f'  미션 {self.mission}')
         self.go(SEND)
 
+    def _side_open(self):
+        """횡 방향별 가능 여부. **+ = 좌측** (lateral_axes 규약)."""
+        s = (self.de_side or {})
+        return {1: bool(s.get('left')), -1: bool(s.get('right'))}
+
     def _reactive_plan(self):
         """센서만 보고 다음 행동을 정한다. **지도를 읽지 않는다.**
 
@@ -403,15 +411,20 @@ class DriveAutonomyNode(Node):
             return None
         self.t_wait = 0.0
         self.react.set_pitch(self.map.pitch_u)
-        # ⚠ 횡 **방향**은 측면 305 가 알아야 한다 (미구현). 지금은 양쪽 열린
-        #   것으로 두고 로그에 남긴다 — 추측으로 비키면 데크 밖으로 간다.
-        d = self.react.decide(go_mm, blocked, {1: True, -1: True},
+        # ⚠ 부호 규약: **+ 가 좌측 횡이동** (0x143=+1 / 0x144=-1, 2026-09-08
+        #   실물 검증). 여기서 뒤집히면 **반대쪽으로 비켜 데크 밖으로 간다.**
+        # ⚠ 측면 판정이 없으면 **닫힌 것으로 본다.** 전진과 반대 규칙이다 —
+        #   전진은 모른다고 막으면 그 자리에 갇히지만, 횡은 모른 채 비키면
+        #   떨어진다. 모르면 고리가 완료로 끝나는 편이 안전하다.
+        d = self.react.decide(go_mm, blocked, self._side_open(),
                               max_lanes=self.max_lanes)
         if d['kind'] == rx.DONE:
             self.get_logger().info(f"반응형 종료 — {d['why']}")
             return None
         if d['kind'] == rx.LATERAL:
-            self.get_logger().warning('  ⚠ 횡 방향 판정 미구현 — 측면 카메라 없이 간다')
+            self.get_logger().info(
+                f"  횡 {'좌' if d['turns'] > 0 else '우'}측 "
+                f"{abs(d['turns'])}회전 — 측면 판정 {self.de_side}")
             return {'kind': 'move', 'drive_mm': 0.0, 'turns': int(d['turns']),
                     'path': [], 'cells': [], 'poses': {}, 'cost_s': 0.0,
                     'why': d['why']}

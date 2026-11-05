@@ -131,6 +131,13 @@ class DeckEdgeNode(Node):
         self.declare_parameter('device', 'cuda')
         self.declare_parameter('front_ns', '/zed_front/zed_node')
         self.declare_parameter('back_ns', '/zed_back/zed_node')
+        # 측면 305 — **횡이동 방향 판정**. 좌우 어느 쪽에 데크가 이어지는지는
+        #   전후방 카메라가 절대 못 본다. 추측으로 비키면 떨어진다.
+        #   ⚠ 좌우 시리얼은 영상으로 확인한 값이다 (orbbec_side.launch.py).
+        self.declare_parameter('left_ns', '/camera_left')
+        self.declare_parameter('right_ns', '/camera_right')
+        self.declare_parameter('side_rgb_sub', 'color/image_raw')
+        self.declare_parameter('use_sides', True)
         self.declare_parameter('rgb_sub', 'rgb/color/rect/image')
         self.declare_parameter('depth_sub', 'depth/depth_registered')
         self.declare_parameter('info_sub', 'depth/camera_info')
@@ -180,6 +187,19 @@ class DeckEdgeNode(Node):
         for key, ns in (('forward', str(g('front_ns').value)),
                         ('backward', str(g('back_ns').value))):
             self._wire(self.sides[key], ns, g)
+        # 측면은 **깊이를 안 쓴다.** 횡이동 판정에 필요한 것은 "그쪽에 밟을
+        #   배근이 이어지는가" 뿐이고, 그건 rebar_frac 하나로 나온다.
+        #   거리(corridor)는 주행 방향에만 의미가 있다.
+        self.lat = {}
+        if bool(g('use_sides').value):
+            s = str(g('side_rgb_sub').value)
+            for key, ns in (('left', str(g('left_ns').value)),
+                            ('right', str(g('right_ns').value))):
+                self.lat[key] = Side(key, n_med)
+                self.create_subscription(
+                    Image, f'{ns}/{s}',
+                    lambda m, k=self.lat[key]: self._on_rgb(k, m),
+                    qos_profile_sensor_data, callback_group=self.cg_sub)
 
         self.block_pub = self.create_publisher(String, '/deck_edge_block', 10)
         self.status_pub = self.create_publisher(String, '/deck_edge/status', 10)
@@ -228,8 +248,12 @@ class DeckEdgeNode(Node):
     # ---- 판정 --------------------------------------------------------------
     def tick(self):
         # ⚠ 교대로 본다. 진행 방향만 보면 반대쪽이 묵어 탈출까지 막힌다.
-        side = self.sides['forward' if self.turn % 2 == 0 else 'backward']
+        #   측면은 주행 중에 쓰이지 않으므로 **4틱에 한 번**만 본다 —
+        #   횡이동은 전진이 막혔을 때만 하고, 그때는 서 있다.
         self.turn += 1
+        if self.lat and self.turn % 4 == 3:
+            return self._tick_side()
+        side = self.sides['forward' if self.turn % 2 == 0 else 'backward']
         if not side.ready():
             return
         img, depth, K = side.rgb, side.depth, side.K
@@ -274,6 +298,19 @@ class DeckEdgeNode(Node):
             'frac': frac,
         }
 
+    def _tick_side(self):
+        """측면 한 대. 깊이도 평면도 안 쓰고 rebar_frac 만 본다."""
+        key = 'left' if (self.turn // 4) % 2 == 0 else 'right'
+        s = self.lat.get(key)
+        if s is None or s.rgb is None:
+            return
+        m = self.seg.predict(s.rgb)
+        j = de.judge(m, s.fsm)
+        s.stamp = time.time()
+        s.last = {'verdict': j['verdict'], 'rebar_frac': round(j['rebar_frac'], 3),
+                  'on_rebar': bool(j['on_rebar']), 'reason': j['reason'],
+                  'obs': round(j['obs_nearmid'], 3)}
+
     def _decide(self, side):
         """그 방향을 막아야 하나 / 늦춰야 하나. (block, slow, 이유)"""
         d = side.last
@@ -308,8 +345,24 @@ class DeckEdgeNode(Node):
             if s:
                 slow.append(key)
             detail[key] = dict(side.last, age_s=round(time.time() - side.stamp, 1))
+        side_state = {}
+        for key, s in self.lat.items():
+            age = round(time.time() - s.stamp, 1) if s.stamp else None
+            d = dict(s.last, age_s=age)
+            # **모르면 닫힌 것으로 본다.** 횡이동은 데크 밖으로 나가는 방향일 수
+            #   있어서, 모르는 채로 비키면 떨어진다. 전진과 반대 규칙이다
+            #   (전진은 모른다고 막으면 그 자리에 갇힌다).
+            d['open'] = bool(s.last.get('verdict') == 'GO' and age is not None
+                             and age < 20.0)
+            side_state[key] = d
+            detail[key] = d
+            # ⚠ `block` 에는 넣지 않는다 — 그 목록은 safety_node 가 주행
+            #   방향(forward/backward)으로만 해석한다. 측면은 `side` 로 낸다.
+            if not d['open']:
+                reasons.append(f"횡{key}: {s.last.get('verdict') or '판정없음'}")
         self.block_pub.publish(String(data=json.dumps(
-            {'block': block, 'slow': slow, 'reason': ' · '.join(reasons)},
+            {'block': block, 'slow': slow, 'side': {k: v['open'] for k, v in side_state.items()},
+             'reason': ' · '.join(reasons)},
             ensure_ascii=False)))
         self.status_pub.publish(String(data=json.dumps(
             {'t': round(time.time(), 1), 'block': block, 'slow': slow,
