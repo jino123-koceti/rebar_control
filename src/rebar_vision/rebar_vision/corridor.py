@@ -159,11 +159,13 @@ def judge(block_mask, drive_mask, depth_mm, plane, K,
     drive_mask : 밟을 수 있는 것 (rebar_h·rebar_v)
 
     반환 dict:
-        go_mm        직진 가능 거리 (장비 앞단 기준). 음수면 이미 물려 있다
-        limit        'obstacle' | 'deck' | 'none'
+        go_mm        **장애물까지** 갈 수 있는 거리 (장비 앞단 기준).
+                     장애물이 없으면 None — '무한' 이 아니라 '이 판정으로는
+                     제한 없음' 이다. 데크끝은 rebar_frac 이 따로 본다.
+        limit        'obstacle' | 'clear'
         obs_mm       통로 안 차단물까지 (없으면 None)
         obs_lat_mm   그 차단물이 중심선에서 얼마나 들어왔나 (+가 오른쪽)
-        deck_mm      통로 안에서 배근이 이어진 끝
+        deck_mm      통로 안 배근 끝 — **참고용. 제한으로 쓰지 말 것** (아래 ⚠⚠)
     """
     half = body_w_mm / 2.0 + margin_mm
     lo, hi = center_mm - half, center_mm + half
@@ -192,21 +194,18 @@ def judge(block_mask, drive_mask, depth_mm, plane, K,
                & (np.abs(Hr) < 120.0))
         if rin.sum() > 500:
             deck = float(np.percentile(Fr[rin], 99))
-    # ⚠ 배근을 못 찾은 것(deck == 0)은 **거리 0 이 아니라 '모름'** 이다.
-    #   0 으로 두면 min() 이 0 을 골라 "갈 수 없다" 가 되고, 장애물이 없는데도
-    #   그 방향을 막는다 (2026-11-05 첫 가동에서 전후 둘 다 막혔다).
-    deck_known = deck > 0.0
-    out['deck_mm'] = (deck - front_offset_mm) if deck_known else None
+    # ⚠⚠ **`deck_mm` 을 거리 제한으로 쓰지 않는다. 참고용으로만 싣는다.**
+    #   "통로 안 철근 화소의 99백분위" 는 원거리 철근 검출이 프레임마다 달라
+    #   못 믿는다 — 900mm 주행 실험(2026-11-05)에서 1309~1823 을 오가고 절반은
+    #   아예 결측이었다. 같은 주행에서 `deck_edge.judge` 의 `rebar_frac` 은
+    #   0.582 → 0.497 로 **한 번도 역전 없이** 떨어졌다.
+    #   → **데크끝은 rebar_frac 이, 장애물은 여기가 맡는다.** 각자 설계된 대로다.
+    #   (장애물 거리는 줄자 대비 1.6~2.4%, 5프레임 산포 6~13mm 로 믿을 만하다.)
+    out['deck_mm'] = (deck - front_offset_mm) if deck > 0.0 else None
 
-    lim = min(obs, deck) if deck_known else obs
-    if np.isfinite(obs) and (not deck_known or obs < deck):
-        out['limit'] = 'obstacle'
-    elif deck_known:
-        out['limit'] = 'deck'
-    else:
-        out['limit'] = 'unknown'      # 장애물도 배근도 안 보인다 — 판단 보류
-    out['go_mm'] = (None if not np.isfinite(lim)
-                    else lim - margin_mm - front_offset_mm)
+    out['limit'] = 'obstacle' if np.isfinite(obs) else 'clear'
+    out['go_mm'] = (None if not np.isfinite(obs)
+                    else obs - margin_mm - front_offset_mm)
     return out
 
 

@@ -49,6 +49,8 @@ import time
 import numpy as np
 import cv2
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import String
@@ -113,7 +115,9 @@ class Side:
             self.hist.pop(0)
         got = [x for x in self.hist if x[0] is not None]
         if len(got) < max(1, len(self.hist) // 2 + 1):
-            return None, 'unknown'  # 과반이 '없음' 이면 없는 것으로 본다
+            # 과반이 '거리 없음' = 통로 안에 장애물이 없다는 뜻이다.
+            # 'unknown' 으로 적으면 "판정 실패" 로 읽혀 로그가 오해를 부른다.
+            return None, 'clear'
         got.sort(key=lambda x: x[0])
         return got[len(got) // 2]
 
@@ -130,7 +134,12 @@ class DeckEdgeNode(Node):
         self.declare_parameter('rgb_sub', 'rgb/color/rect/image')
         self.declare_parameter('depth_sub', 'depth/depth_registered')
         self.declare_parameter('info_sub', 'depth/camera_info')
-        self.declare_parameter('rate_hz', 2.0)          # 양방향 합. 한쪽은 절반
+        self.declare_parameter('rate_hz', 2.0)          # 추론 주기 (양방향 합)
+        # ⚠ 발행은 추론과 **분리**한다. safety_node 의 input_timeout 이 0.5s 인데
+        #   추론 1틱이 평면 재적합 때 0.6s 를 넘는다. 같은 타이머로 묶으면 안전
+        #   입력이 묵어 **전 방향이 정지**한다 (2026-11-05 첫 통합에서 발생).
+        #   안전 신호는 판정 속도와 무관한 하트비트여야 한다.
+        self.declare_parameter('publish_hz', 10.0)
         self.declare_parameter('median_frames', 5)
         self.declare_parameter('plane_period_s', 2.0)   # 평면 재적합 주기
         self.declare_parameter('plane_classes', DEFAULT_PLANE_CLASSES)
@@ -164,6 +173,7 @@ class DeckEdgeNode(Node):
         self.use_frac = bool(g('use_rebar_frac').value)
         self.plane_period = float(g('plane_period_s').value)
 
+        self.cg_sub = MutuallyExclusiveCallbackGroup()
         n_med = int(g('median_frames').value)
         self.sides = {'forward': Side('forward', n_med),
                       'backward': Side('backward', n_med)}
@@ -174,21 +184,32 @@ class DeckEdgeNode(Node):
         self.block_pub = self.create_publisher(String, '/deck_edge_block', 10)
         self.status_pub = self.create_publisher(String, '/deck_edge/status', 10)
         self.turn = 0
+        # ⚠ 추론과 발행을 **다른 콜백 그룹**에 둔다. 한 그룹(=단일 스레드)이면
+        #   0.6초짜리 추론 틱이 발행 타이머를 막아 간격이 1초까지 벌어지고,
+        #   safety_node 의 0.5초 한도를 넘겨 전 방향이 정지한다 (실측 2.4Hz).
+        self.cg_infer = MutuallyExclusiveCallbackGroup()
+        self.cg_pub = MutuallyExclusiveCallbackGroup()
         hz = max(0.2, float(g('rate_hz').value))
-        self.create_timer(1.0 / hz, self.tick)
+        self.create_timer(1.0 / hz, self.tick, callback_group=self.cg_infer)
+        phz = max(2.0, float(g('publish_hz').value))
+        self.create_timer(1.0 / phz, self._publish, callback_group=self.cg_pub)
         self.get_logger().info(
             f'데크끝 판정 시작 — 전후 교대 {hz:.1f}Hz · 중앙값 {n_med}장 · '
             f'중심선 {self.center:+.0f}mm · 폭 {self.body_w:.0f}+여유 {self.margin:.0f} · '
-            f'정지 {self.stop_mm:.0f}mm / 감속 {self.slow_mm:.0f}mm')
+            f'정지 {self.stop_mm:.0f}mm / 감속 {self.slow_mm:.0f}mm · '
+            f'발행 {phz:.0f}Hz')
 
     def _wire(self, side, ns, g):
         s = str(g('rgb_sub').value)
         self.create_subscription(Image, f'{ns}/{s}',
-                                 lambda m, k=side: self._on_rgb(k, m), qos_profile_sensor_data)
+                                 lambda m, k=side: self._on_rgb(k, m), qos_profile_sensor_data,
+                                 callback_group=self.cg_sub)
         self.create_subscription(Image, f'{ns}/{str(g("depth_sub").value)}',
-                                 lambda m, k=side: self._on_depth(k, m), qos_profile_sensor_data)
+                                 lambda m, k=side: self._on_depth(k, m), qos_profile_sensor_data,
+                                 callback_group=self.cg_sub)
         self.create_subscription(CameraInfo, f'{ns}/{str(g("info_sub").value)}',
-                                 lambda m, k=side: self._on_info(k, m), qos_profile_sensor_data)
+                                 lambda m, k=side: self._on_info(k, m), qos_profile_sensor_data,
+                                 callback_group=self.cg_sub)
 
     # ---- 입력 --------------------------------------------------------------
     def _on_rgb(self, side, msg):
@@ -222,7 +243,7 @@ class DeckEdgeNode(Node):
                 side.plane, side.plane_t = p, now
         if side.plane is None:
             side.last = {'error': '평면 적합 실패 (바닥 화소 부족)'}
-            return
+            return          # 발행은 별도 타이머가 한다 — 여기서 멈추면 안 된다
 
         r = co.judge(np.isin(mask, self.block_cls), np.isin(mask, self.drive_cls),
                      depth, side.plane, K, center_mm=self.center,
@@ -252,26 +273,29 @@ class DeckEdgeNode(Node):
                 side.plane.blind_mm(K[3], K[1], img.shape[0])),
             'frac': frac,
         }
-        self._publish()
 
     def _decide(self, side):
         """그 방향을 막아야 하나 / 늦춰야 하나. (block, slow, 이유)"""
         d = side.last
         if not d or 'go_mm' not in d:
             return False, False, ''
+        # **두 신호가 맡는 일이 다르다** (2026-11-05 900mm 주행으로 확인):
+        #   장애물  → corridor 의 go_mm. 줄자 대비 1.6~2.4%, 산포 6~13mm
+        #   데크끝  → rebar_frac 의 GO/SLOW/STOP. 단조감소하고 현장 튜닝됨
+        # corridor 의 deck_mm 은 요동쳐서 못 쓴다 — 섞으면 멀쩡한 판정까지 망친다.
         go = d['go_mm']
-        # ⚠ limit 'unknown'(장애물도 배근도 안 보임)은 **막지 않는다.** 모른다고
-        #   막으면 그 자리에 갇힌다 — rebar_frac 쪽 STOP 이 따로 잡아 준다.
-        if d.get('limit') == 'unknown':
-            go = None
         if go is not None and go <= self.stop_mm:
-            return True, False, f"{d['limit']} {go:.0f}mm"
-        # 2차년도 rebar_frac 은 **보조**로 쓴다 — 발밑 배근이 끊기면 거리와 무관히 선다
+            return True, False, f"장애물 {go:.0f}mm"
         f = d.get('frac')
         if f and f['verdict'] == 'STOP':
             return True, False, f"배근 {f['reason'] or f['rebar_frac']}"
-        slow = (go is not None and go <= self.slow_mm) or (f and f['verdict'] == 'SLOW')
-        return False, bool(slow), ('감속' if slow else '')
+        slow = (go is not None and go <= self.slow_mm) or bool(f and f['verdict'] == 'SLOW')
+        why = []
+        if go is not None and go <= self.slow_mm:
+            why.append(f'장애물 {go:.0f}mm')
+        if f and f['verdict'] == 'SLOW':
+            why.append(f"배근 {f['rebar_frac']:.3f}")
+        return False, slow, ' · '.join(why)
 
     def _publish(self):
         block, slow, reasons = [], [], []
@@ -297,7 +321,9 @@ def main(args=None):
     node = None
     try:
         node = DeckEdgeNode()
-        rclpy.spin(node)
+        ex = MultiThreadedExecutor(num_threads=3)
+        ex.add_node(node)
+        ex.spin()
     except KeyboardInterrupt:
         pass
     finally:
