@@ -85,7 +85,12 @@ class DriveAutonomyNode(Node):
         self.declare_parameter('max_leg_mm', 600.0)
         # 횡이동에도 같은 울타리. 없으면 전진만 막고 횡은 무제한이라
         # 일관성이 없다 — 부호가 뒤집히면 옆으로 멀리 간다.
-        self.declare_parameter('max_leg_turns', 6)      # 6회전 = 300mm
+        # ⚠ **레인 한 칸이 들어가야 한다.** 결속영역 V 폭 380mm 에 겹침 15% 면
+        #   ceil(380×0.85/50) = **7회전** 이다. 6 으로 뒀다가 2026-11-05 에
+        #   정상 계획(+7)을 거부했다 — `max_leg_mm` 250 이 259mm 를 막던 것과
+        #   같은 실수다. **근거 없는 숫자는 오탐으로 돌아온다.**
+        #   10회전(500mm)이면 겹침 없는 레인(8회전)까지 덮고 폭주는 잡는다.
+        self.declare_parameter('max_leg_turns', 10)    # 10회전 = 500mm
         # 정차지마다 결속까지 할지. 이 증분의 기본은 주행 고리만이다.
         self.declare_parameter('tie_at_stop', True)
         # 순회 방식. 'reactive' = 센서만 보고 돈다(기본), 'map' = 옛 탐욕 플래너.
