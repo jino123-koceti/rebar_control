@@ -507,7 +507,16 @@ class PositionControlNode(Node):
         # 4축 × 10Hz = 40프레임/초, 1Mbps 버스에서 무시할 수 있는 부하다.
         self.encoder_single_timer = self.create_timer(0.1, self._read_encoder_single)
         # 2Hz. 호밍의 ARM 단계가 이 값을 보고 넘어간다 — 느리면 호밍이 그만큼 기다린다.
-        self.brake_state_timer = self.create_timer(0.5, self._read_brake_state)
+        # ⚠⚠ [2026-11-05] **전이 직후에만 빠르게 본다.**
+        #   0.5초 고정 폴링이었는데, 브레이크 해제 **확인**이 그 주기에 묶여
+        #   실측 1.49초(≈3주기)가 걸렸다. 그 동안 stage_node 는 회전을 못
+        #   시작한다 — yaw 재보정 1회차 5.2초 중 1.5초가 여기였다.
+        #   물리적 해제가 느린 게 아니라 **확인이 늦게 오는 것**이었다.
+        #   그래서 평소에는 2Hz 그대로 두고, 브레이크 명령 뒤 짧은 창 동안만
+        #   10Hz 로 본다 — 정상 CAN 트래픽은 안 늘고 전이만 빨라진다.
+        self._brake_fast_until = 0.0
+        self._brake_last_poll = 0.0
+        self.brake_state_timer = self.create_timer(0.1, self._read_brake_state)
         
         # 서비스 생성
         self.brake_release_service = self.create_service(
@@ -827,6 +836,11 @@ class PositionControlNode(Node):
 
         응답 처리는 `0x9A` 분기에서 한다. 주행 축은 제외한다 — 브레이크가 없다.
         """
+        now = time.time()
+        fast = now < self._brake_fast_until
+        if not fast and now - self._brake_last_poll < 0.5:
+            return                       # 평소에는 2Hz
+        self._brake_last_poll = now
         frame = bytearray(8)
         frame[0] = 0x9A
         for mid in self.brake_pubs:
@@ -844,6 +858,8 @@ class PositionControlNode(Node):
         parts = msg.data.strip().lower().split()
         if not parts:
             return
+        # 전이가 일어날 참이다 — 확인이 빨리 오도록 잠깐 촘촘히 본다
+        self._brake_fast_until = time.time() + 2.5
         action = parts[0]
         if action not in ('release', 'lock', 'shutdown', 'recover'):
             self.get_logger().error(
