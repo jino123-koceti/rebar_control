@@ -254,3 +254,30 @@ python train_cnn.py --algorithm ppo --test --load_model output/8th/models/cnn_pp
 
 - 학습 로그: `output/train_8th.log`
 - 학습 곡선 등 플롯: `output/8th/plots/`
+
+## rebar_seg_260914.pt — 주행영역 세그멘테이션 (2026-11-05 반입)
+
+    출처    ros2_ws_2nd/src/rebar_vision/model/rebar_seg_260914.pt  (2차년도)
+    구조    DeepLabV3+ / MobileNetV2 (segmentation-models-pytorch)
+    클래스  9 — background, floor, human, level_rod, obstacle, plate, rebar_h, rebar_v, wall
+    크기    17.8MB   추론 25ms/장 (512x512, Orin GPU)
+
+`model/` 은 .gitignore 라 **이 파일은 커밋되지 않는다.** 2차년도 워크스페이스에서
+복사할 것. 체크포인트는 Lightning 형식(`model.` 접두어)이고 `rebar_seg.py` 가
+벗겨 낸다.
+
+⚠ **클래스 인덱스를 하드코딩하지 말 것.** 7클래스 모델에서 9클래스로 가며
+  rebar_h 가 4→6, rebar_v 가 5→7 로 밀렸다. 하드코딩된 `REBAR=[4,5]` 를 그대로
+  두면 "주행가능 = obstacle + plate" 가 되어 **데크 밖으로 나간다.**
+  `rebar_seg` 가 체크포인트에서 클래스 수를 읽어 맵을 고르고,
+  `deck_edge.set_class_map()` / `rebar_grid.set_class_map()` 이 **이름으로**
+  인덱스를 재계산한다. 로드 직후 둘 다 부를 것.
+
+의존성: `pip install --no-deps timm segmentation-models-pytorch`
+  ⚠ `--no-deps` 필수 — 그냥 설치하면 torch/torchvision 을 JetPack 것 위에
+    덮어써 CUDA 가 죽고, numpy 1.26.4 핀도 위험하다.
+
+실측 검증 (2026-11-05, 3차년도 장비):
+  전방 ZED X  GO    rebar_frac 0.563  heading -0.70°
+  후방 ZED X  SLOW  rebar_frac 0.501  heading -0.07°
+  305 좌/우   철근·방수포·실험실바닥·장애물을 정확히 분리
