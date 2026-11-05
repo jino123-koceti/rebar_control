@@ -67,9 +67,22 @@ class DriveAutonomyNode(Node):
         self.declare_parameter('detect_timeout_s', 20.0)
         self.declare_parameter('mission_timeout_s', 300.0)
         self.declare_parameter('max_stops', 30)
-        # 한 구간에 허용할 최대 전진. 플래너가 이상한 값을 내거나 부호가
-        # 뒤집혀도 장비가 멀리 가버리지 못하게 막는 마지막 울타리다.
+        # ── 폭주 울타리 ──────────────────────────────────────────────
+        # ⚠ 이것은 **안전층이 아니다.** 진짜 안전(데크 끝·장애물 정지)이 아직
+        #   자율 고리에 안 붙어 있어서 그 동안 세워 둔 임시 방벽이다.
+        #   `/deck_edge_block` 은 아직 발행자가 없다 (safety_node 는 구독만).
+        #   그것들이 붙으면 이 값은 거의 의미가 없어진다 — "데크 끝이 보이면
+        #   멈춘다" 가 거리 상한보다 훨씬 옳은 기준이다.
+        #
+        # 값의 근거: 플래너가 한 번에 움직이는 거리는 **결속영역 길이
+        #   (U 방향 520mm)** 언저리가 자연 상한이다. 그보다 훨씬 먼 계획은
+        #   진짜 이상한 것이다. 600 이면 **정상 계획은 안 걸리고 폭주는 잡는다.**
+        #   ⚠ 250 으로 뒀다가 259mm 짜리 정상 계획을 9mm 차이로 거부했다
+        #     (2026-11-05). 근거 없는 숫자는 오탐으로 돌아온다.
         self.declare_parameter('max_leg_mm', 600.0)
+        # 횡이동에도 같은 울타리. 없으면 전진만 막고 횡은 무제한이라
+        # 일관성이 없다 — 부호가 뒤집히면 옆으로 멀리 간다.
+        self.declare_parameter('max_leg_turns', 6)      # 6회전 = 300mm
         # 정차지마다 결속까지 할지. 이 증분의 기본은 주행 고리만이다.
         self.declare_parameter('tie_at_stop', True)
         # 결속 결과를 셀에 되돌릴 때의 짝짓기 허용 오차. 철근 피치가 200mm
@@ -91,6 +104,7 @@ class DriveAutonomyNode(Node):
         self.mission_timeout = float(g('mission_timeout_s').value)
         self.max_stops = int(g('max_stops').value)
         self.max_leg_mm = float(g('max_leg_mm').value)
+        self.max_leg_turns = int(g('max_leg_turns').value)
         self.tie_at_stop = bool(g('tie_at_stop').value)
         self.match_tol = float(g('match_tol_mm').value)
         self.min_conf = float(g('min_confidence').value)
@@ -103,6 +117,7 @@ class DriveAutonomyNode(Node):
         self.state = IDLE
         self.plan = None
         self.mission = []
+        self.moved = (0.0, 0)
         self.deadline = 0.0
         self.stops = 0
         self.phase = 'idle'
@@ -132,7 +147,8 @@ class DriveAutonomyNode(Node):
         mode = '드라이런 (미션을 보내지 않는다)' if self.dry_run else '★ 실제 주행'
         self.get_logger().info(f'자율 주행 고리 — {mode}')
         self.get_logger().info(
-            f'   한 구간 상한 {self.max_leg_mm:.0f}mm · 정차 상한 {self.max_stops}회'
+            f'   구간 상한 전진 {self.max_leg_mm:.0f}mm / 횡 {self.max_leg_turns}회전'
+            f' · 정차 상한 {self.max_stops}회'
             f" · 정차 결속 {'켬' if self.tie_at_stop else '끔'}")
 
     # ── 들어오는 것 ─────────────────────────────────────────────────────
@@ -290,20 +306,33 @@ class DriveAutonomyNode(Node):
                 if abs(du) > 1e-6:
                     legs.append(('u', du))
 
-        out = []
+        out, done_u, done_v = [], 0.0, 0
         for axis, qty in legs:
             if not qty:
                 continue
             if axis == 'v':
+                if abs(qty) > self.max_leg_turns:
+                    raise RuntimeError(
+                        f'한 구간 횡이동 {qty:+d}회전은 상한 '
+                        f'{self.max_leg_turns}회전을 넘는다')
                 out.append(f'lateral {int(qty):+d}')
+                done_v += int(qty)
             else:
                 if abs(qty) > self.max_leg_mm:
                     raise RuntimeError(
                         f'한 구간 {qty:+.0f}mm 는 상한 '
                         f'{self.max_leg_mm:.0f}mm 를 넘는다')
                 out.append(f'drive {qty:.0f}')
+                done_u += float(f'{qty:.0f}')      # 미션에 적힌 값 그대로
         if self.tie_at_stop and plan['kind'] == 'tie':
             out.append('tie')
+        # ⚠ 지도는 **계획이 아니라 실제로 미션에 넣은 양**으로 갱신해야 한다.
+        #   `plan['turns']`/`plan['drive_mm']` 는 후보를 고를 때의 총량이고,
+        #   미션은 A* 경로 구간에서 만들어져 **서로 다를 수 있다.**
+        #   2026-11-05 실측: 계획 '횡 +1회전' 인데 미션엔 lateral 이 없었다.
+        #   그대로 두면 지도가 로봇 위치를 50mm 틀리게 알고, 그 어긋남이
+        #   결속 결과 짝짓기(허용 60mm)를 반 토막 냈다 (2개 중 1개).
+        self.moved = (done_u, done_v)
         return out
 
     def do_send(self):
@@ -381,7 +410,12 @@ class DriveAutonomyNode(Node):
     def arrive(self):
         """도착 — 결속 결과를 셀에 되돌리고 다시 본다."""
         p = self.plan
-        self.map.advance(drive_mm=p['drive_mm'], lateral_turns=p['turns'])
+        du, dv = self.moved
+        if abs(du - p['drive_mm']) > 1.0 or dv != p['turns']:
+            self.get_logger().warning(
+                f"  계획과 미션이 다르다 — 계획 {p['drive_mm']:+.0f}mm/{p['turns']:+d}회전"
+                f" vs 미션 {du:+.0f}mm/{dv:+d}회전. **미션 쪽으로** 지도를 갱신한다")
+        self.map.advance(drive_mm=du, lateral_turns=dv)
         self.stops += 1
         if self.tie_at_stop and p['kind'] == 'tie':
             self.apply_tie(p)
@@ -411,14 +445,23 @@ class DriveAutonomyNode(Node):
             return
 
         hit = 0
+        if not self.points:
+            self.get_logger().warning(
+                '  /plan/status 에 점별 결과가 없다 — 결속 결과를 반영 못 한다')
         for pt in self.points:
             pose, sm = pt.get('pose'), pt.get('stage_mm')
             if pose is None or not sm:
                 continue
             best, bd = None, 1e9
             for k in keys:
+                # ⚠ `uv_of` 는 **지도 전역 좌표**인데 `stage_of_canon` 은
+                #   **로봇 기준** 정준 좌표를 받는다 (`observe` 와 같은 규약).
+                #   그대로 넣으면 현재 포즈만큼 통째로 어긋나 하나도 안 맞는다
+                #   — 2026-11-05 첫 실주행에서 "계획 4개 중 0개 짝지음" 이 났다.
+                #   결속은 `advance()` 뒤 자리에서 했으므로 지금 포즈를 뺀다.
                 u, v = self.map.uv_of(*k)
-                sx, sy = self.reach.stage_of_canon(pose, u, v)
+                sx, sy = self.reach.stage_of_canon(
+                    pose, u - self.map.ru, v - self.map.rv)
                 d = math.hypot(sx - sm[0], sy - sm[1])
                 if d < bd:
                     best, bd = k, d
@@ -432,7 +475,8 @@ class DriveAutonomyNode(Node):
         # 다시 안 가고, 실패로 단정하면 쓸데없이 재시도한다. pending 으로
         # 두면 다음에 들를 때 자연히 다시 계획된다.
         self.get_logger().info(
-            f'  결속 결과 반영 — 계획 {len(keys)}개 중 {hit}개 짝지음')
+            f'  결속 결과 반영 — 보고된 점 {len(self.points)}개 · '
+            f'계획 {len(keys)}개 중 {hit}개 짝지음')
         if hit < len(keys):
             self.get_logger().warning(
                 f'  짝 못 지은 {len(keys) - hit}개는 pending 으로 둔다')
