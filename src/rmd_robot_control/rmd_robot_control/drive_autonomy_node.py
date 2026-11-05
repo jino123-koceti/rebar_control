@@ -100,6 +100,16 @@ class DriveAutonomyNode(Node):
         self.declare_parameter('planner', 'reactive')
         # 레인 상한 (시험용). 0 이면 무제한.
         self.declare_parameter('max_lanes', 0)
+        # 시작 진행 방향. +1 전진 / -1 후진. 지그재그는 횡이동마다 뒤집는다.
+        #   전진 쪽이 막혀 있을 때 후진부터 돌리고 싶은 경우가 있다 (시험·탈출).
+        self.declare_parameter('start_dir', 1)
+        # ⚠⚠ **이번 주행에 허용된 총 이동량 [mm].** 0 이면 무제한.
+        #   `max_stops` 로 묶는 것은 **허가를 표현하지 못한다** — 스텝이 460mm 면
+        #   6회 상한이 2.7m 가 된다. 2026-11-05 에 "100cm 까지" 허가를 받고
+        #   정차 횟수만 묶었다가 **1346mm 를 갔다.** 사람이 준 한계는 사람이
+        #   말한 단위(거리)로 받아야 한다.
+        #   전진·후진·횡을 **절대값으로 합산**한다 — 왕복으로 빠져나가지 못하게.
+        self.declare_parameter('max_travel_mm', 0.0)
         # 결속 결과를 셀에 되돌릴 때의 짝짓기 허용 오차. 철근 피치가 200mm
         # 안팎이므로 반 피치보다 한참 작아야 옆 셀과 헷갈리지 않는다.
         self.declare_parameter('match_tol_mm', 60.0)
@@ -152,7 +162,10 @@ class DriveAutonomyNode(Node):
         self.max_lanes = int(self.get_parameter('max_lanes').value) or None
         b = self.map.reach_bbox
         self.react = rx.Reactive(b[1] - b[0], b[3] - b[2],
-                                 lat_mm_per_turn=self.map.lat_mm)
+                                 lat_mm_per_turn=self.map.lat_mm,
+                                 u_dir=int(self.get_parameter('start_dir').value))
+        self.max_travel = float(self.get_parameter('max_travel_mm').value)
+        self.travelled = 0.0          # 절대값 합산 (전진+후진+횡)
         self.tied_here = False        # 이 자리에서 이미 묶었나
         self.t_arrived = 0.0          # 지금 자리에 도착한 시각 (판정 신선도 기준)
         self.t_wait = 0.0             # deck_edge 판정을 기다리기 시작한 시각
@@ -401,6 +414,10 @@ class DriveAutonomyNode(Node):
                     'poses': {c.key(): _p for c, _p in got},
                     'cost_s': 0.0, 'why': f'제자리 {len(got)}점'}
 
+        if self.max_travel > 0 and self.travelled >= self.max_travel:
+            self.get_logger().warning(
+                f'허용 이동량 {self.max_travel:.0f}mm 소진 ({self.travelled:.0f}mm) — 멈춘다')
+            return None
         go_mm, blocked, fresh = self._sense()
         if not fresh:
             # **모르는 채로 전진하지 않는다** — 그 상태로 가면 데크 밖으로
@@ -433,7 +450,16 @@ class DriveAutonomyNode(Node):
             return {'kind': 'move', 'drive_mm': 0.0, 'turns': int(d['turns']),
                     'path': [], 'cells': [], 'poses': {}, 'cost_s': 0.0,
                     'why': d['why']}
-        return {'kind': 'move', 'drive_mm': float(d['mm']), 'turns': 0,
+        mm = float(d['mm'])
+        if self.max_travel > 0:
+            left = self.max_travel - self.travelled
+            if abs(mm) > left:
+                # 남은 허가만큼만 간다. 거부하지 않고 **줄인다** — 거부하면
+                # 고리가 끝나버려 "조금 더 갈 수 있었는데" 를 잃는다.
+                mm = left if mm > 0 else -left
+                self.get_logger().warning(
+                    f'  허가 잔여 {left:.0f}mm 로 스텝을 줄인다 ({d["mm"]:+.0f} → {mm:+.0f})')
+        return {'kind': 'move', 'drive_mm': mm, 'turns': 0,
                 'path': [], 'cells': [], 'poses': {}, 'cost_s': 0.0,
                 'why': d['why']}
 
@@ -590,6 +616,7 @@ class DriveAutonomyNode(Node):
             #   쓰면 미션이 달라졌을 때(예: 횡이 통째로 빠졌을 때) 상태가
             #   어긋난 채로 계속 돈다.
             self.react.moved(rx.LATERAL if dv else rx.DRIVE, dv or du, ok=True)
+            self.travelled += abs(du) + abs(dv) * self.map.lat_mm
             self.tied_here = False
             self.t_arrived = time.time()
         self.get_logger().info(
