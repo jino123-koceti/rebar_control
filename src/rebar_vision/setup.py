@@ -42,6 +42,8 @@ setup(
             'usbcam_publisher = rebar_vision.usbcam_publisher:main',
             # 카메라가 **살아서 멈췄을 때** 되살린다 (respawn 으로는 안 잡힌다)
             'camera_watchdog = rebar_vision.camera_watchdog:main',
+            # L2 — 전후방 세그로 주행 가능 판정. /deck_edge_block 의 **유일한 발행자**
+            'deck_edge = rebar_vision.deck_edge_node:main',
         ],
     },
 )
