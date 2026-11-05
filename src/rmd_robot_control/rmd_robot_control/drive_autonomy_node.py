@@ -53,6 +53,7 @@ from rebar_base_interfaces.msg import RebarGrid
 from rmd_robot_control.coverage_map import CoverageMap, FAILED as CELL_FAILED, TIED
 from rmd_robot_control.coverage_reach import Reach
 from rmd_robot_control.run_log import RunLog
+from rmd_robot_control import reactive as rx
 
 # 상태. 문자열로 두는 이유는 로그와 `/autonomy/status` 에 그대로 실리기 때문이다.
 IDLE, OBSERVE, PLAN, SEND, RUN, DONE, FAILED = (
@@ -87,6 +88,13 @@ class DriveAutonomyNode(Node):
         self.declare_parameter('max_leg_turns', 6)      # 6회전 = 300mm
         # 정차지마다 결속까지 할지. 이 증분의 기본은 주행 고리만이다.
         self.declare_parameter('tie_at_stop', True)
+        # 순회 방식. 'reactive' = 센서만 보고 돈다(기본), 'map' = 옛 탐욕 플래너.
+        #   왜 반응형이 기본인가 — 지도 기반은 explore_ring 이 **본 적 없는
+        #   600mm 를 지어내서** 거기로 간다. 데크가 끝나도 지도는 모른다.
+        #   반응형에서는 지도가 주행의 입력이 아니라 **산출물**이다.
+        self.declare_parameter('planner', 'reactive')
+        # 레인 상한 (시험용). 0 이면 무제한.
+        self.declare_parameter('max_lanes', 0)
         # 결속 결과를 셀에 되돌릴 때의 짝짓기 허용 오차. 철근 피치가 200mm
         # 안팎이므로 반 피치보다 한참 작아야 옆 셀과 헷갈리지 않는다.
         self.declare_parameter('match_tol_mm', 60.0)
@@ -135,6 +143,17 @@ class DriveAutonomyNode(Node):
 
         self.state = IDLE
         self.plan = None
+        self.planner = str(self.get_parameter('planner').value)
+        self.max_lanes = int(self.get_parameter('max_lanes').value) or None
+        b = self.map.reach_bbox
+        self.react = rx.Reactive(b[1] - b[0], b[3] - b[2],
+                                 lat_mm_per_turn=self.map.lat_mm)
+        self.tied_here = False        # 이 자리에서 이미 묶었나
+        self.t_arrived = 0.0          # 지금 자리에 도착한 시각 (판정 신선도 기준)
+        self.t_wait = 0.0             # deck_edge 판정을 기다리기 시작한 시각
+        self.deck_wait_s = 15.0
+        self.de = {}                  # /deck_edge/status 의 detail
+        self.stop_mm = 300.0          # deck_edge 노드와 같은 문턱
         self.mission = []
         self.moved = (0.0, 0)
         self.det_total = self.det_used = 0
@@ -161,6 +180,9 @@ class DriveAutonomyNode(Node):
         self.create_subscription(String, '/plan/status', self.on_plan, 10)
         self.create_subscription(String, '/mission/status', self.on_mission, 10)
         self.create_subscription(String, '/autonomy/cmd', self.on_cmd, 10)
+        # 데크끝·장애물 판정. **이게 반응형의 눈이다** — "더 갈 수 있나" 가
+        #   지도가 아니라 여기서 온다.
+        self.create_subscription(String, '/deck_edge/status', self.on_deck, 10)
 
         self.create_timer(0.2, self.tick, callback_group=cb)
         self.create_timer(1.0, self.publish_status)
@@ -193,6 +215,38 @@ class DriveAutonomyNode(Node):
             return
         self.phase = d.get('phase', 'idle')
         self.detail = d.get('detail', '')
+
+    def on_deck(self, msg):
+        """deck_edge 판정. 늦거나 끊기면 **보수적으로** 막힌 것으로 본다."""
+        try:
+            self.de = (json.loads(msg.data) or {}).get('detail') or {}
+        except ValueError:
+            pass
+
+    def _sense(self):
+        """진행 방향의 (갈 수 있는 거리, 막힌 방향들, 쓸 수 있나).
+
+        ⚠ 판정의 신선도 기준은 **"몇 초 안"이 아니라 "이 자리에 온 뒤"** 다.
+          고리는 결정할 때 서 있으므로, 도착 후에 찍힌 판정이면 몇 초가
+          지났든 유효하다. 반대로 이동 전에 찍힌 것은 아무리 최신이어도
+          옛 자리의 판정이라 쓰면 안 된다.
+          (고정 3초로 뒀더니, 교차점 RF-DETR 가 같은 GPU 를 쓰는 동안
+           세그가 밀려 age 2~3초가 되면서 멀쩡한 고리가 멈췄다.)
+        """
+        key = 'forward' if self.react.u_dir > 0 else 'backward'
+        d = self.de.get(key) or {}
+        age = float(d.get('age_s', 1e9))
+        ok = bool(d) and age < 30.0 and (time.time() - age) > self.t_arrived
+        if not ok:
+            return None, set(), False
+        blocked = set()
+        for k in ('forward', 'backward'):
+            dd = self.de.get(k) or {}
+            v = (dd.get('frac') or {}).get('verdict')
+            if v == 'STOP' or (dd.get('go_mm') is not None
+                               and dd['go_mm'] <= self.stop_mm):
+                blocked.add(k)
+        return d.get('go_mm'), blocked, True
 
     def on_cmd(self, msg):
         cmd = msg.data.strip().lower()
@@ -298,7 +352,10 @@ class DriveAutonomyNode(Node):
             self.go(DONE)
             return
 
-        plan = self.map.plan_next()
+        plan = (self._reactive_plan() if self.planner == 'reactive'
+                else self.map.plan_next())
+        if plan == 'wait':
+            return                    # 다음 틱에 다시 본다
         if plan is None:
             self.get_logger().info(f'더 갈 곳이 없다 — 완료 ({self.stops}회 정차)')
             self._log_done()
@@ -307,12 +364,60 @@ class DriveAutonomyNode(Node):
 
         self.plan = plan
         self.mission = self.mission_of(plan)
-        kind = '결속' if plan['kind'] == 'tie' else '탐색'
+        kind = {'tie': '결속', 'move': '이동'}.get(plan['kind'], '탐색')
         self.get_logger().info(
             f"계획[{kind}] 전진 {plan['drive_mm']:+.0f}mm · 횡 {plan['turns']:+d}회전 "
-            f"· 셀 {len(plan['cells'])}개 · 비용 {plan['cost_s']:.1f}s")
+            f"· 셀 {len(plan['cells'])}개" +
+            (f" — {plan['why']}" if plan.get('why') else
+             f" · 비용 {plan['cost_s']:.1f}s"))
         self.get_logger().info(f'  미션 {self.mission}')
         self.go(SEND)
+
+    def _reactive_plan(self):
+        """센서만 보고 다음 행동을 정한다. **지도를 읽지 않는다.**
+
+        순서가 중요하다 — **제자리 결속을 먼저 하고, 그 다음에 이동**한다.
+        둘을 한 미션에 묶으면 결속이 끝난 시점에 로봇은 이미 새 자리에 있고,
+        지도는 거기 셀을 아직 모른다. 그러면 결속 결과를 되돌릴 데가 없어
+        **기록(②단계)이 통째로 비어 버린다.**
+        """
+        got = self.map.covered(self.map.ru, self.map.rv)
+        if got and not self.tied_here and self.tie_at_stop:
+            return {'kind': 'tie', 'drive_mm': 0.0, 'turns': 0, 'path': [],
+                    'cells': [c.key() for c, _p in got],
+                    'poses': {c.key(): _p for c, _p in got},
+                    'cost_s': 0.0, 'why': f'제자리 {len(got)}점'}
+
+        go_mm, blocked, fresh = self._sense()
+        if not fresh:
+            # **모르는 채로 전진하지 않는다** — 그 상태로 가면 데크 밖으로
+            #   나간다. 다만 바로 포기하지도 않는다: 추론이 GPU 를 나눠 쓰느라
+            #   한두 틱 늦는 것은 정상이다. 기다렸다가 그래도 안 오면 멈춘다.
+            if self.t_wait == 0.0:
+                self.t_wait = time.time()
+            if time.time() - self.t_wait < self.deck_wait_s:
+                return 'wait'
+            self.get_logger().error(
+                f'/deck_edge/status 가 {self.deck_wait_s:.0f}초 동안 이 자리의 '
+                f'판정을 못 냈다 — 전진 판단 불가. 멈춘다')
+            return None
+        self.t_wait = 0.0
+        self.react.set_pitch(self.map.pitch_u)
+        # ⚠ 횡 **방향**은 측면 305 가 알아야 한다 (미구현). 지금은 양쪽 열린
+        #   것으로 두고 로그에 남긴다 — 추측으로 비키면 데크 밖으로 간다.
+        d = self.react.decide(go_mm, blocked, {1: True, -1: True},
+                              max_lanes=self.max_lanes)
+        if d['kind'] == rx.DONE:
+            self.get_logger().info(f"반응형 종료 — {d['why']}")
+            return None
+        if d['kind'] == rx.LATERAL:
+            self.get_logger().warning('  ⚠ 횡 방향 판정 미구현 — 측면 카메라 없이 간다')
+            return {'kind': 'move', 'drive_mm': 0.0, 'turns': int(d['turns']),
+                    'path': [], 'cells': [], 'poses': {}, 'cost_s': 0.0,
+                    'why': d['why']}
+        return {'kind': 'move', 'drive_mm': float(d['mm']), 'turns': 0,
+                'path': [], 'cells': [], 'poses': {}, 'cost_s': 0.0,
+                'why': d['why']}
 
     def _log_done(self):
         if self.log.ok:
@@ -461,6 +566,14 @@ class DriveAutonomyNode(Node):
         self.stops += 1
         if self.tie_at_stop and p['kind'] == 'tie':
             self.apply_tie(p)
+            self.tied_here = True     # 이 자리는 끝났다 — 다음은 이동이다
+        elif p['kind'] == 'move':
+            # ⚠ 지그재그 상태는 **실제로 움직인 양**으로 갱신한다. 계획값을
+            #   쓰면 미션이 달라졌을 때(예: 횡이 통째로 빠졌을 때) 상태가
+            #   어긋난 채로 계속 돈다.
+            self.react.moved(rx.LATERAL if dv else rx.DRIVE, dv or du, ok=True)
+            self.tied_here = False
+            self.t_arrived = time.time()
         self.get_logger().info(
             f'도착 (u={self.map.ru:.0f} v={self.map.rv:.0f}) — 다시 검출한다')
         c = self.map.counts()
