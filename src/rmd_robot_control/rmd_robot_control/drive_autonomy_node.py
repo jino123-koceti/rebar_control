@@ -38,6 +38,7 @@
 
 import json
 import math
+import os
 import time
 
 import rclpy
@@ -51,6 +52,7 @@ from rebar_base_interfaces.msg import RebarGrid
 
 from rmd_robot_control.coverage_map import CoverageMap, FAILED as CELL_FAILED, TIED
 from rmd_robot_control.coverage_reach import Reach
+from rmd_robot_control.run_log import RunLog
 
 # 상태. 문자열로 두는 이유는 로그와 `/autonomy/status` 에 그대로 실리기 때문이다.
 IDLE, OBSERVE, PLAN, SEND, RUN, DONE, FAILED = (
@@ -88,6 +90,19 @@ class DriveAutonomyNode(Node):
         # 결속 결과를 셀에 되돌릴 때의 짝짓기 허용 오차. 철근 피치가 200mm
         # 안팎이므로 반 피치보다 한참 작아야 옆 셀과 헷갈리지 않는다.
         self.declare_parameter('match_tol_mm', 60.0)
+        # 돌릴 때마다 CSV 로 남긴다 — 빈 문자열이면 끈다.
+        # 왜 기본으로 켜 두나: 2026-10-15~16 야외 시도가 계측을 안 해
+        # **쓸 수 없는 데이터**가 됐다. 기록은 켜 두는 쪽이 기본이어야 한다.
+        # ⚠⚠ 끝나면 **노드를 내린다.** 떠 있으면 `/autonomy/cmd` 가
+        #   브로드캐스트라 다음에 누가 start 를 보낼 때 **이 노드도 받는다** —
+        #   그리고 DONE 상태의 노드는 정차 수를 0 으로 되돌리고 다시 돈다.
+        #   2026-11-05: 끝난 실주행 노드를 안 치운 채 드라이런을 시험하려고
+        #   start 를 쐈더니 **살아 있던 실주행 노드가 장비를 움직였다.**
+        #   끝난 노드가 남아 있으면 장전된 총이다. 상주가 필요하면 끄면 된다.
+        self.declare_parameter('exit_when_done', True)
+        self.declare_parameter(
+            'run_log_dir',
+            os.path.join(os.path.expanduser('~'), 'rebar_runs'))
         # 검출 필터는 `tying_planner` 와 **같은 값**을 쓴다. 다르면 두 층이
         # 서로 다른 점 집합을 보고, 지도에 있는 셀을 결속부가 못 가는 일이 난다.
         self.declare_parameter('min_confidence', 0.5)
@@ -107,6 +122,10 @@ class DriveAutonomyNode(Node):
         self.max_leg_turns = int(g('max_leg_turns').value)
         self.tie_at_stop = bool(g('tie_at_stop').value)
         self.match_tol = float(g('match_tol_mm').value)
+        self.exit_done = bool(g('exit_when_done').value)
+        self.log_dir = str(g('run_log_dir').value or '')
+        self.log = RunLog(self.log_dir, tag='dry' if self.dry_run else 'live')
+        self.t_mark = {}
         self.min_conf = float(g('min_confidence').value)
         self.depth_lo = float(g('depth_min_mm').value)
         self.depth_hi = float(g('depth_max_mm').value)
@@ -118,6 +137,8 @@ class DriveAutonomyNode(Node):
         self.plan = None
         self.mission = []
         self.moved = (0.0, 0)
+        self.det_total = self.det_used = 0
+        self.tie_matched = self.tie_ok = 0
         self.deadline = 0.0
         self.stops = 0
         self.phase = 'idle'
@@ -188,9 +209,14 @@ class DriveAutonomyNode(Node):
             self.go(IDLE)
 
     def go(self, state, why=''):
+        self.t_mark[state] = time.time()
         self.state = state
         if why:
             self.get_logger().info(f'[{state}] {why}')
+        if state in (DONE, FAILED) and self.exit_done:
+            self.get_logger().info('노드를 내린다 (exit_when_done)')
+            self.log.close()
+            raise SystemExit(0 if state == DONE else 1)
 
     # ── 상태 기계 ───────────────────────────────────────────────────────
 
@@ -199,6 +225,8 @@ class DriveAutonomyNode(Node):
             {OBSERVE: self.do_observe, PLAN: self.do_plan,
              SEND: self.do_send, RUN: self.do_run}.get(
                  self.state, lambda: None)()
+        except SystemExit:
+            raise                                   # 종료는 삼키지 않는다
         except Exception as e:                      # 고리가 통째로 멈추지 않게
             self.get_logger().error(f'고리 오류: {e}')
             self.go(FAILED)
@@ -231,6 +259,7 @@ class DriveAutonomyNode(Node):
             return
 
         dets, drop_conf, drop_depth = self.to_canon(grid.detections)
+        self.det_total, self.det_used = len(grid.detections), len(dets)
         # ⚠ **조용히 버리지 않는다.** 왜 점이 줄었는지 로그에 남아야 사람이
         #   안다 (이 저장소는 조용한 필터로 여러 번 시간을 잃었다).
         if drop_conf or drop_depth:
@@ -265,12 +294,14 @@ class DriveAutonomyNode(Node):
         """다음 정차지를 고르고 미션 단계로 바꾼다."""
         if self.stops >= self.max_stops:
             self.get_logger().warning(f'정차 상한 {self.max_stops}회 — 멈춘다')
+            self._log_done()
             self.go(DONE)
             return
 
         plan = self.map.plan_next()
         if plan is None:
             self.get_logger().info(f'더 갈 곳이 없다 — 완료 ({self.stops}회 정차)')
+            self._log_done()
             self.go(DONE)
             return
 
@@ -282,6 +313,12 @@ class DriveAutonomyNode(Node):
             f"· 셀 {len(plan['cells'])}개 · 비용 {plan['cost_s']:.1f}s")
         self.get_logger().info(f'  미션 {self.mission}')
         self.go(SEND)
+
+    def _log_done(self):
+        if self.log.ok:
+            self.get_logger().info('  기록: ' + ' , '.join(self.log.paths(self.log_dir)))
+        elif self.log_dir:
+            self.get_logger().warning(f'  기록 실패 — {self.log_dir} 에 쓸 수 없다')
 
     def mission_of(self, plan):
         """경로(포즈 목록)를 `navigator` 미션 단계로 바꾼다.
@@ -302,7 +339,12 @@ class DriveAutonomyNode(Node):
             for (u0, v0), (u1, v1) in zip(path, path[1:]):
                 du, dv = u1 - u0, v1 - v0
                 if abs(dv) > 1e-6:
-                    legs.append(('v', int(round(dv / self.map.step_v()))))
+                    # ⚠ `step_v()` 가 아니라 `lat_mm` 이다. 전자는 **배근 피치**
+                    #   (≈200mm), 후자는 **횡이동 1회전**(50mm)이다. 피치로
+                    #   나누면 50mm 구간이 round(0.25)=0 이 되어 **횡이동이
+                    #   통째로 사라진다** — 2026-11-05 기록에서 plan_turns 1 이
+                    #   매번 moved_turns 0 으로 나와 드러났다.
+                    legs.append(('v', int(round(dv / self.map.lat_mm))))
                 if abs(du) > 1e-6:
                     legs.append(('u', du))
 
@@ -421,6 +463,27 @@ class DriveAutonomyNode(Node):
             self.apply_tie(p)
         self.get_logger().info(
             f'도착 (u={self.map.ru:.0f} v={self.map.rv:.0f}) — 다시 검출한다')
+        c = self.map.counts()
+        now = time.time()
+        self.log.stop(
+            stop=self.stops, pose_u=round(self.map.ru, 1),
+            pose_v=round(self.map.rv, 1),
+            plan_kind=p['kind'], plan_drive_mm=round(p['drive_mm'], 1),
+            plan_turns=p['turns'], plan_cells=len(p['cells']),
+            plan_cost_s=round(p['cost_s'], 1),
+            mission=' | '.join(self.mission), moved_mm=round(du, 1),
+            moved_turns=dv,
+            det_total=self.det_total, det_used=self.det_used,
+            tie_reported=len(self.points), tie_matched=self.tie_matched,
+            tie_ok=self.tie_ok,
+            cells_pending=c.get('pending', 0), cells_tied=c.get('tied', 0),
+            cells_empty=c.get('empty', 0), cells_blocked=c.get('blocked', 0),
+            t_observe_s=round(self.t_mark.get(PLAN, now)
+                              - self.t_mark.get(OBSERVE, now), 2),
+            t_plan_s=round(self.t_mark.get(SEND, now)
+                           - self.t_mark.get(PLAN, now), 2),
+            t_mission_s=round(now - self.t_mark.get(RUN, now), 2),
+            note='dry' if self.dry_run else '')
         self.go(OBSERVE)
 
     def apply_tie(self, plan):
@@ -441,10 +504,11 @@ class DriveAutonomyNode(Node):
         if self.dry_run:
             for k in keys:
                 self.map.mark(k, TIED, '드라이런 — 결속 성공 가정')
+            self.tie_matched, self.tie_ok = len(keys), len(keys)
             self.get_logger().info(f'  (드라이런) {len(keys)}개 셀을 결속으로 가정')
             return
 
-        hit = 0
+        hit = n_ok = 0
         if not self.points:
             self.get_logger().warning(
                 '  /plan/status 에 점별 결과가 없다 — 결속 결과를 반영 못 한다')
@@ -471,12 +535,27 @@ class DriveAutonomyNode(Node):
             self.map.mark(best, TIED if ok else CELL_FAILED,
                           pt.get('state', ''))
             hit += 1
+            n_ok += 1 if ok else 0
+            # ⚠ `resid_mm` 가 이 기록의 이유다 — 플래너가 "여기 있을 것" 이라
+            #   계산한 자리와 결속부가 "여기 있었다" 고 보고한 자리의 거리.
+            #   쌓이면 **정차마다 재검출하는 구조가 드리프트를 흡수하는가**에
+            #   답할 수 있다 (지금은 가정이다).
+            pu, pv = self.map.uv_of(*best)
+            px, py = self.reach.stage_of_canon(
+                pose, pu - self.map.ru, pv - self.map.rv)
+            self.log.point(
+                stop=self.stops, pose=pose,
+                rep_x=round(sm[0], 1), rep_y=round(sm[1], 1),
+                pred_x=round(px, 1), pred_y=round(py, 1),
+                resid_mm=round(bd, 1),
+                cell_i=best[0], cell_j=best[1], state=pt.get('state', ''))
         # 짝이 안 지어진 셀은 **건드리지 않는다.** 묶였다고 단정하면 영영
         # 다시 안 가고, 실패로 단정하면 쓸데없이 재시도한다. pending 으로
         # 두면 다음에 들를 때 자연히 다시 계획된다.
+        self.tie_matched, self.tie_ok = hit, n_ok
         self.get_logger().info(
             f'  결속 결과 반영 — 보고된 점 {len(self.points)}개 · '
-            f'계획 {len(keys)}개 중 {hit}개 짝지음')
+            f'계획 {len(keys)}개 중 {hit}개 짝지음 ({n_ok}개 성공)')
         if hit < len(keys):
             self.get_logger().warning(
                 f'  짝 못 지은 {len(keys) - hit}개는 pending 으로 둔다')
@@ -500,7 +579,7 @@ def main(args=None):
     node = DriveAutonomyNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass
     finally:
         node.destroy_node()

@@ -723,20 +723,34 @@ class CoverageMap:
         cu = sum(c.u for c in pts) / len(pts)
         cv = sum(c.v for c in pts) / len(pts)
         ru = cu - self.reach_mid[0]
-        turns = round((cv - self.reach_mid[1] - self.rv) / self.lat_mm)
-        rv = self.rv + turns * self.lat_mm
-        if abs(ru - plan['ru']) < 1.0 and abs(rv - plan['rv']) < 1.0:
-            return plan
-        got = {c.key() for c, _p in self.covered(ru, rv)}
-        if not set(cells).issubset(got):
-            return plan
-        pr = self.path_to(ru, rv)
-        if pr is None:
-            return plan
-        cst, path = pr
-        plan = dict(plan, ru=ru, rv=rv, turns=turns, cost_s=cst, path=path,
-                    drive_mm=ru - self.ru,
-                    cells=[c.key() for c, _p in self.covered(ru, rv)])
+        # ⚠ **U 의 가운데정렬은 공짜지만 V 는 아니다.** U 는 어차피 주행
+        #   중이라 몇십 mm 더 가는 값이 없는데, V 는 1회전이 7.2초 + 진입
+        #   3초다. 여유를 최대 25mm 고르게 하려고 10초를 쓰면 안 된다 —
+        #   게다가 `plan_next` 가 `lane_stick` 으로 "이번엔 레인을 지킨다" 고
+        #   정한 것을 여기서 소리 없이 뒤집는다.
+        #   그래서 V 는 **회전수를 늘리지 않는 선에서만** 맞추고, 늘려야
+        #   한다면 레인을 그대로 두고 U 만 맞춘다.
+        #   (시뮬 211 정차 중 33회가 이렇게 늘어 3550mm = 71회전 ≈ 10분,
+        #    레인유지가 뒤집힌 것도 3회. 시뮬 배근이 V 격자에 딱 맞아
+        #    오래 안 보였다 — 실제 배근은 안 맞는다.)
+        t_mid = round((cv - self.reach_mid[1] - self.rv) / self.lat_mm)
+        t_plan = plan.get('turns', 0)
+        tries = ([t_mid] if abs(t_mid) <= abs(t_plan) else []) + [t_plan]
+        for turns in tries:
+            rv = self.rv + turns * self.lat_mm
+            if abs(ru - plan['ru']) < 1.0 and abs(rv - plan['rv']) < 1.0:
+                return plan
+            got = [(c, p) for c, p in self.covered(ru, rv)]
+            if not set(cells).issubset({c.key() for c, _p in got}):
+                continue
+            pr = self.path_to(ru, rv)
+            if pr is None:
+                continue
+            cst, path = pr
+            return dict(plan, ru=ru, rv=rv, turns=turns, cost_s=cst, path=path,
+                        drive_mm=ru - self.ru,
+                        cells=[c.key() for c, _p in got],
+                        poses={c.key(): p for c, p in got})
         return plan
 
     def snapshot(self):
