@@ -61,7 +61,8 @@ print('\n■ 막히면 그때만 비킨다 — 그리고 진행 방향이 뒤집
 r = Reactive(520, 380, pitch_mm=225)
 d = r.decide(go_mm=200, blocked_dirs=set(), side_open={1: True, -1: True})
 check('남은 200 < 스텝 450 → 횡', d['kind'], LATERAL)
-check('  레인 폭 380×0.85 → 7회전', d['turns'], 7)
+# 내림이다 — 올리면 겹침이 의도(15%)보다 얇아진다 (30mm vs 80mm)
+check('  레인 폭 380×0.85 → 6회전(내림)', d['turns'], 6)
 r.moved(LATERAL, d['turns'])
 check('  진행 방향 뒤집힘', r.u_dir, -1)
 d = r.decide(go_mm=None, blocked_dirs=set(), side_open={})
@@ -100,7 +101,7 @@ u = v = 0.0                      # 로봇 위치 (데크 좌하단 기준)
 covered = []
 for _ in range(200):
     go = (DECK_U - u) if r.u_dir > 0 else u          # 그 방향 남은 거리
-    side = {1: v + 380 * 0.85 <= DECK_V, -1: v - 380 * 0.85 >= 0}
+    side = {1: v + 300 <= DECK_V, -1: v - 300 >= 0}
     d = r.decide(go_mm=go, blocked_dirs=set(), side_open=side)
     if d['kind'] == DONE:
         break
@@ -111,11 +112,11 @@ for _ in range(200):
         v += d['turns'] * 50.0; r.moved(LATERAL, d['turns'])
 print(f"  정차 {r.stops}회 · 레인 {r.lanes}개 · 최종 (u={u:.0f}, v={v:.0f})")
 us = [c[0] for c in covered]; vs = sorted({c[1] for c in covered})
-check('레인 수 = 1400/350 + 1', r.lanes + 1, 5)
+check('레인 수 = 1400/300 + 1', r.lanes + 1, 5)
 check('횡 방향이 고정됐다', r.v_locked, True)
 check('U 를 끝까지 훑는다', max(us) >= DECK_U - 450, True)
 check('U 시작점까지 되돌아온다', min(us) <= 450, True)
-check('레인 간격 = 7회전 × 50mm', vs[1] - vs[0] if len(vs) > 1 else 0, 350.0)
+check('레인 간격 = 6회전 × 50mm', vs[1] - vs[0] if len(vs) > 1 else 0, 300.0)
 check('정차 간격 = 스텝', round(sorted(us)[1] - sorted(us)[0]) in (0, 450), True)
 
 print(f"\n{'통과' if not FAIL else '★ 실패 있음'} — {OK} OK / {FAIL} NG")

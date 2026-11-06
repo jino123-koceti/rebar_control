@@ -93,9 +93,19 @@ class Reactive:
         return step_for(self.pitch, self.reach_u)
 
     def lane_turns(self):
-        """한 레인 옮기는 데 필요한 횡 회전수 (겹침 포함)."""
+        """한 레인 옮기는 데 필요한 횡 회전수 (겹침 포함).
+
+        ⚠ **내림이다.** 2026-11-06 발견 — `ceil` 이면 격자(50mm)에 맞추느라
+          **더 멀리** 가서 겹침이 의도보다 **줄어든다**:
+              필요 323mm → ceil 350mm (겹침 30mm·7.9%) ← 의도 15% 보다 얇다
+                         → floor 300mm (겹침 80mm·21.1%)
+          30mm 는 주행 오차(2.2% 실측 ≈ 10mm)와 뷰별 ±12mm 를 더하면 거의 다
+          먹는다. 겹침은 **최소 보장**이어야 하므로 모자라게 가야 맞다.
+          대가는 레인 하나가 더 늘 수 있다는 것인데, 레인 사이에 **묶이지 않은
+          줄**이 남는 쪽이 훨씬 비싸다 (그게 겹침을 둔 이유다).
+        """
         need = self.reach_v * (1.0 - self.lane_overlap)
-        return max(1, int(math.ceil(need / self.lat_mm)))
+        return max(1, int(math.floor(need / self.lat_mm)))
 
     # ---- 결정 ----------------------------------------------------------
     def decide(self, go_mm, blocked_dirs, side_open, max_lanes=None):
