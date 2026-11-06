@@ -98,7 +98,8 @@ class Side:
         self.hist = []              # 최근 go_mm (중앙값용)
         self.median_n = median_n
         self.last = {}
-        self.stamp = 0.0
+        self.stamp = 0.0        # **판정** 시각
+        self.img_t = 0.0        # **영상 도착** 시각 — 둘은 다르다
 
     def ready(self):
         return self.rgb is not None and self.depth is not None and self.K is not None
@@ -182,6 +183,8 @@ class DeckEdgeNode(Node):
 
         self.cg_sub = MutuallyExclusiveCallbackGroup()
         n_med = int(g('median_frames').value)
+        self.max_img_age = float(
+            self.declare_parameter('max_img_age_s', 5.0).value)
         self.sides = {'forward': Side('forward', n_med),
                       'backward': Side('backward', n_med)}
         for key, ns in (('forward', str(g('front_ns').value)),
@@ -235,6 +238,7 @@ class DeckEdgeNode(Node):
     def _on_rgb(self, side, msg):
         try:
             side.rgb = to_bgr(msg)
+            side.img_t = time.time()
         except ValueError as e:
             self.get_logger().error(str(e), throttle_duration_sec=10.0)
 
@@ -349,16 +353,35 @@ class DeckEdgeNode(Node):
                 reasons.append(f'{key}: {why}')
             if s:
                 slow.append(key)
-            detail[key] = dict(side.last, age_s=round(time.time() - side.stamp, 1))
+            now = time.time()
+            ia = round(now - side.img_t, 1) if side.img_t else None
+            detail[key] = dict(side.last, age_s=round(now - side.stamp, 1),
+                               img_age_s=ia)
+            # ⚠ 전후방은 **막지 않는다** — 모른다고 막으면 그 자리에 갇힌다.
+            #   대신 `img_age_s`/`stale` 을 실어 고리가 판단하게 한다.
+            if ia is None or ia >= self.max_img_age:
+                detail[key]['stale'] = True
         side_state = {}
         for key, s in self.lat.items():
-            age = round(time.time() - s.stamp, 1) if s.stamp else None
-            d = dict(s.last, age_s=age)
+            now = time.time()
+            age = round(now - s.stamp, 1) if s.stamp else None
+            img_age = round(now - s.img_t, 1) if s.img_t else None
+            d = dict(s.last, age_s=age, img_age_s=img_age)
+            # ⚠⚠ [2026-11-06] **영상 나이로 본다.** `age_s` 는 판정 나이고,
+            #   카메라가 죽어도 **마지막 프레임을 계속 재추론**하므로 1초
+            #   근처에 머문다. 실제로 측면 305 둘이 죽은 뒤에도 좌 0.621 /
+            #   우 0.388 이 소수점까지 똑같이 나오면서 `age_s 1.0` 이었다 —
+            #   자율 고리는 그 '좌측 열림'을 믿고 횡이동할 참이었다.
             # **모르면 닫힌 것으로 본다.** 횡이동은 데크 밖으로 나가는 방향일 수
             #   있어서, 모르는 채로 비키면 떨어진다. 전진과 반대 규칙이다
             #   (전진은 모른다고 막으면 그 자리에 갇힌다).
-            d['open'] = bool(s.last.get('verdict') == 'GO' and age is not None
-                             and age < 20.0)
+            fresh = img_age is not None and img_age < self.max_img_age
+            d['open'] = bool(s.last.get('verdict') == 'GO' and fresh
+                             and age is not None and age < 20.0)
+            if not fresh:
+                d['stale'] = True
+                d['reason'] = (f'영상 끊김 {img_age:.0f}s' if img_age
+                               else '영상 없음')
             side_state[key] = d
             detail[key] = d
             # ⚠ `block` 에는 넣지 않는다 — 그 목록은 safety_node 가 주행

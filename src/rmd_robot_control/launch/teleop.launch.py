@@ -515,7 +515,15 @@ def generate_launch_description():
             'stale_sec': 20.0,      # 정상 10fps — 20초 없으면 멈춘 것
             'cooldown_sec': 120.0,
             'max_restarts': 3,      # 넘으면 포기하고 크게 알린다 (물리 문제)
-            'match': '__node:=camera_container',   # ⚠ 좁게 — 다른 컨테이너를 잡지 않게
+            # ⚠⚠ [2026-11-06] **`__ns:=/camera` 를 반드시 같이 준다.**
+            #   측면 305 컨테이너의 명령줄에도 `__node:=camera_container`
+            #   토큰이 그대로 있다 — 노드 이름만으로는 **안 좁다.**
+            #   2026-11-05 에 노드 기본값은 고쳤는데 여기가 옛 값으로
+            #   덮어써서 수정이 **운용에 안 걸려 있었다.** 지금 컨테이너가
+            #   셋(교차점·좌·우)이라, 2L 스트림이 20초 끊기면 워치독이
+            #   **셋 다 죽인다.** 워치독은 교차점만 되살리므로 측면은
+            #   영구 정지다.
+            'match': '__node:=camera_container __ns:=/camera',
             'relaunch': 'ros2 launch orbbec_camera gemini2L.launch.py '
                         + ' '.join(f'{k}:={v}' for k, v in CAM_ARGS.items()),
             # ⚠ 되살리기 **전에** USB 권한을 고친다 — udev 가 빠른 재열거에서

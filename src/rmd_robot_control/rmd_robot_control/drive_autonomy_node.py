@@ -258,6 +258,15 @@ class DriveAutonomyNode(Node):
         d = self.de.get(key) or {}
         age = float(d.get('age_s', 1e9))
         ok = bool(d) and age < 30.0 and (time.time() - age) > self.t_arrived
+        # ⚠⚠ [2026-11-06] **영상이 끊겼으면 판정을 쓰지 않는다.** `age_s` 는
+        #   판정 나이라서, 카메라가 죽어도 마지막 프레임을 재추론하며 1초
+        #   근처에 머문다 — 측면 305 둘이 죽은 뒤에도 좌 0.621 / 우 0.388 이
+        #   소수점까지 똑같이 나왔다. 그 '신선한' 값으로 고리가 움직일 참이었다.
+        if d.get('stale'):
+            self.get_logger().warning(
+                f"{key} 판정을 못 쓴다 — 영상 끊김 "
+                f"{d.get('img_age_s')}s (카메라 확인)")
+            ok = False
         if not ok:
             return None, set(), False
         blocked = set()
