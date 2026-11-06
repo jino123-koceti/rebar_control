@@ -309,6 +309,7 @@ class StageNode(Node):
         self.hold_axes = _axis_list(g('brake_hold_axes').value)
         self.hold_sec = float(g('brake_hold_sec').value)
         self.brake_rel = {}        # 축 → 브레이크 해제 확인 (None = 모름)
+        self._brake_ok_t = {}      # 축 → **해제가 확인된 시각** (충돌 유예 기준)
         self._lock_at = {}         # 축 → 이 시각 뒤에 잠근다 (유예 중)
         self.t_grant_lost = 0.0    # 권한을 마지막으로 쥐고 있던 시각
         self._arm_t = {}           # 축 → 해제 요청 시각 (축별 대기용)
@@ -377,8 +378,8 @@ class StageNode(Node):
             if _c.get('motor'):
                 self.create_subscription(
                     Bool, f"/motor_{_c['motor']}/brake",
-                    (lambda k: (lambda m: self.brake_rel.__setitem__(
-                        k, bool(m.data))))(_n), 10)
+                    (lambda k: (lambda m: self._on_brake(k, bool(m.data))))(_n),
+                    10)
         yaw_mid = load_axis_motor_ids(('yaw',)).get('yaw')
         if yaw_mid:
             self.create_subscription(
@@ -1171,7 +1172,21 @@ class StageNode(Node):
             self.hit_cnt[name] = 0
             return False
         # ⚠ 축별 유예다 — 이동 중에 붙인 축도 기동 전류 구간을 건너뛰어야 한다
-        if time.time() - self._arm_t.get(name, 0.0) < self.arm_sec + self.hit_grace:
+        # ⚠⚠ [2026-11-06] **"명령 시점" 이 아니라 "움직이기 시작한 시점" 부터 센다.**
+        #   예전에는 `arm_sec(1.0) + hit_grace(0.7) = 1.7초` 를 명령 시점부터
+        #   무조건 기다렸다. 그런데 `arm_sec` 은 브레이크 해제의 **최악값**이고,
+        #   `_axis_armed` 는 확인이 오면 **즉시** 통과시킨다. 실측하면:
+        #       브레이크 해제 0.141s · 전류 피크 1.13A@0.148s · 0.8A 미만 0.275s
+        #   즉 과도는 **0.28초**에 끝나는데 1.7초를 눈 감고 있었다 —
+        #   30mm/s 로 **42mm 를 무방비로** 내려간다.
+        #   이제 기준은 max(이동 요청, 브레이크 확인) 이고, 브레이크가 아직
+        #   안 풀렸으면 예전처럼 최악값 `arm_sec` 을 쓴다.
+        t_mv = self._arm_t.get(name, 0.0)
+        if self.brake_rel.get(name):
+            t_start = max(t_mv, self._brake_ok_t.get(name, 0.0))
+        else:
+            t_start = t_mv + self.arm_sec
+        if time.time() - t_start < self.hit_grace:
             return False
         a = self.cur_a.get(name)
         if a is None:
@@ -1275,6 +1290,16 @@ class StageNode(Node):
                 continue
             self.accel_pub.publish(String(data=f'{mid} {int(v)}'))
             self.get_logger().info(f"{name} 가감속 {int(v)} dps/s 요청 ({mid})")
+
+    def _on_brake(self, name, ok):
+        """브레이크 상태 수신. **해제된 시각을 같이 남긴다.**
+
+        충돌 유예를 "명령 시점" 이 아니라 "실제로 움직이기 시작한 시점" 부터
+        세기 위해서다. 그 둘이 1.5초 넘게 벌어져 있었다 (아래 `_hit` 참고).
+        """
+        if ok and not self.brake_rel.get(name):
+            self._brake_ok_t[name] = time.time()
+        self.brake_rel[name] = ok
 
     def _axis_armed(self, name):
         """그 축의 브레이크 해제가 확인됐는가. **축별로 본다.**
