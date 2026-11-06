@@ -185,6 +185,9 @@ class StageNode(Node):
         self.declare_parameter('collide_rise_samples', 2)
         # 기준선 시간상수. 짧으면 기준선이 접촉을 따라가 버리고, 길면 가속
         # 전류를 오래 물고 있어 헛걸린다.
+        # 기준선이 **올라갈 때**의 시정수. 접촉이 자라는 시간(~1초)보다
+        #   충분히 느려야 상승 경로가 산다. 내려갈 때는 아래 값을 쓴다.
+        self.declare_parameter('collide_base_tau_up_sec', 6.0)
         self.declare_parameter('collide_base_tau_sec', 0.6)
         # ⚠⚠ **내려갈 때만 보는 축.** 2026-10-04: Z 를 올릴 때도 감지가 걸려
         #   결속점 3개가 전부 실패했다. 위에는 부딪힐 것이 없고, 건이 철근에
@@ -289,6 +292,7 @@ class StageNode(Node):
                         for ax in ('x', 'y', 'z')}
         self.rise_n = int(g('collide_rise_samples').value)
         self.base_tau = float(g('collide_base_tau_sec').value)
+        self.base_tau_up = float(g('collide_base_tau_up_sec').value)
         self.down_only = _axis_list(g('collide_down_only_axes').value)
         self.hit_axes = _axis_list(g('collide_axes').value)
         self.base_a = {}           # 축 → 전류 기준선(A). 이동 중에만 갱신한다
@@ -1182,7 +1186,18 @@ class StageNode(Node):
         if base is None:
             self.base_a[name] = a
         elif a < base + rise * 0.5:
-            k = min(1.0, dt / max(self.base_tau, 1e-3))
+            # ⚠⚠ [2026-11-06] **올라갈 때와 내려갈 때 시정수를 다르게 쓴다.**
+            #   대칭이면 기준선이 **접촉을 끝까지 따라 올라가** 상승 경로가
+            #   눈이 먼다. 실측: 2번 자세에서 절대 경로(4.39A)로 걸렸는데,
+            #   상승 경로를 먼저 보므로 그 순간 `a - base < 0.45` 였다는 뜻이고
+            #   → **기준선이 3.94A 이상**까지 올라가 있었다 (무접촉 0.40A).
+            #   같은 충돌을 1번 자세에서는 상승 경로가 1.15A 에 잡았다 —
+            #   접촉 속도에 따라 멈추는 힘이 **4배** 갈렸다.
+            #   느린 접촉(0.3A/s)은 아예 검출되지 않는다 (시뮬 확인).
+            #   내려가는 쪽은 빠르게 둬야 한다 — 부하가 줄었는데 기준선이
+            #   높게 남으면 다음 접촉을 놓친다.
+            tau = self.base_tau_up if a > base else self.base_tau
+            k = min(1.0, dt / max(tau, 1e-3))
             self.base_a[name] = base + (a - base) * k
         # 1) 상승분 — 접촉은 급히 오른다
         if base is not None and a - base >= rise:
@@ -1199,7 +1214,11 @@ class StageNode(Node):
             return False
         self.hit_cnt[name] = self.hit_cnt.get(name, 0) + 1
         if self.hit_cnt[name] >= self.hit_n:
-            self.hit_why = f'절대 {a:.2f}A (문턱 {self._hit_limit(name):.1f}A)'
+            # ⚠ 기준선을 같이 남긴다. 절대 경로로 걸렸다는 것은 그 순간
+            #   `a - base < rise` 였다는 뜻이라, 기준선이 얼마나 끌려 올라갔는지가
+            #   **원인 그 자체**다. 안 적으면 다음에도 못 가린다.
+            self.hit_why = (f'절대 {a:.2f}A (문턱 {self._hit_limit(name):.1f}A, '
+                            f'기준선 {self.base_a.get(name, float("nan")):.2f}A)')
             return True
         return False
 
