@@ -438,8 +438,14 @@ class DriveAutonomyNode(Node):
         # ⚠ 측면 판정이 없으면 **닫힌 것으로 본다.** 전진과 반대 규칙이다 —
         #   전진은 모른다고 막으면 그 자리에 갇히지만, 횡은 모른 채 비키면
         #   떨어진다. 모르면 고리가 완료로 끝나는 편이 안전하다.
+        # 레인 간격은 **아직 안 묶은 줄의 V 좌표**로 정한다 (고정량이 아니다).
+        #   고정 300mm 는 위상이 레인마다 85mm 밀려 **모든 피치에서 한 줄을
+        #   빠뜨렸다** (2026-11-06 측정). 자세한 근거는 `reactive.lane_turns`.
+        #   빈 리스트면 그쪽을 아직 못 본 것이고, 그때는 고정 폭으로 탐색한다.
+        rows_v = [c.v for c in self.map.pending()]
         d = self.react.decide(go_mm, blocked, self._side_open(),
-                              max_lanes=self.max_lanes)
+                              max_lanes=self.max_lanes,
+                              rows_v=rows_v, rv=self.map.rv)
         if d['kind'] == rx.DONE:
             self.get_logger().info(f"반응형 종료 — {d['why']}")
             return None

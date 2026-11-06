@@ -61,7 +61,8 @@ class Reactive:
     """
 
     def __init__(self, reach_u_mm, reach_v_mm, lat_mm_per_turn=50.0,
-                 pitch_mm=None, u_dir=1, v_dir=1, lane_overlap=0.15):
+                 pitch_mm=None, u_dir=1, v_dir=1, lane_overlap=0.15,
+                 lane_margin_mm=40.0):
         self.reach_u = float(reach_u_mm)
         self.reach_v = float(reach_v_mm)
         self.lat_mm = float(lat_mm_per_turn)
@@ -71,6 +72,9 @@ class Reactive:
         # 레인을 **겹쳐서** 옮긴다. 딱 맞게 옮기면 주행 오차(2.2% 실측)와
         # 검출 누락이 겹쳐 레인 사이에 묶이지 않은 줄이 남는다.
         self.lane_overlap = float(lane_overlap)
+        # 영역 경계에서 이만큼 **안쪽**에 들어와야 "확실히 덮였다" 로 본다.
+        # 주행 오차(2.2% 실측 ≈ 10mm)·뷰별 ±12mm·횡 양자화 ±25mm 를 합친 예산.
+        self.lane_margin = float(lane_margin_mm)
         # ⚠ **횡 방향은 한 번 정하면 끝까지 유지한다.** 막힐 때마다 반대로
         #   틀면 위아래로 **무한 왕복**한다 — 반응형은 설계상 지도를 안 보므로
         #   "이미 덮은 레인" 을 기억하지 못한다 (시뮬에서 레인 28개가 나왔다).
@@ -92,29 +96,70 @@ class Reactive:
     def step_mm(self):
         return step_for(self.pitch, self.reach_u)
 
-    def lane_turns(self):
-        """한 레인 옮기는 데 필요한 횡 회전수 (겹침 포함).
+    def lane_turns(self, rows_v=None, rv=0.0):
+        """다음 레인까지의 횡 회전수. **실측 줄 위치로 매번 다시 잰다.**
 
-        ⚠ **내림이다.** 2026-11-06 발견 — `ceil` 이면 격자(50mm)에 맞추느라
-          **더 멀리** 가서 겹침이 의도보다 **줄어든다**:
-              필요 323mm → ceil 350mm (겹침 30mm·7.9%) ← 의도 15% 보다 얇다
-                         → floor 300mm (겹침 80mm·21.1%)
-          30mm 는 주행 오차(2.2% 실측 ≈ 10mm)와 뷰별 ±12mm 를 더하면 거의 다
-          먹는다. 겹침은 **최소 보장**이어야 하므로 모자라게 가야 맞다.
-          대가는 레인 하나가 더 늘 수 있다는 것인데, 레인 사이에 **묶이지 않은
-          줄**이 남는 쪽이 훨씬 비싸다 (그게 겹침을 둔 이유다).
+        ## 왜 고정량을 버렸나 (2026-11-06 측정)
+
+        고정 300mm 는 **모든 피치에서 한 줄을 빠뜨렸다.** 겹침이 모자란 게
+        아니라 **위상이 밀리는** 것이 원인이다 — 피치 215 에 300mm 를 옮기면
+        레인마다 85mm 밀리고, 몇 레인 뒤 한 줄이 영역 경계에 올라탄다. 그러면
+        그 줄을 빠뜨리거나, 이미 묶은 자리를 또 묶는다.
+
+        "피치의 정수배" 도 같은 병을 앓는다 — 횡은 50mm 양자화라 피치 180 의
+        정수배 360mm 를 못 가고 350mm 로 가서, 레인마다 10mm 가 **누적**된다.
+
+        그래서 피치를 **아예 쓰지 않는다.** 검출된 줄 위치를 직접 보고 매
+        레인 다시 계산하면 양자화 오차가 누적되지 않는다.
+
+            다음 레인 중심 = (아직 안 묶은 첫 줄) + 진행방향 × (영역폭/2 - 여유)
+            회전수        = floor(그 거리 / 50mm)
+
+        ⚠ **내림이다.** 목표를 넘치면 그 줄이 영역 **밖으로** 빠져 다시 잃는다.
+          내림이어도 모자랄 일은 없다 — 그 줄이 안 덮였다는 것이
+          `|v-rv| > half` 이므로 이동량이 항상 `2*half`(300mm)를 넘고,
+          따라서 최소 6회전이다 (찔끔거리지 않는다).
+
+        측정 (데크 V 1400, 영역 380, 여유 40, 모든 위상에 대한 최악):
+            고정 300mm        1줄 빠뜨림 · 24회전
+            피치 정수배        1줄 빠뜨림(피치 180) · 25~28회전
+            **실측 줄 기반**   **0줄** · 27~28회전   ← +4회전(29초)에 미결속 0
+
+        rows_v 가 비면(아직 그쪽을 못 봤다) 고정 폭으로 **탐색**한다. 반응형은
+        지도를 산출물로 보므로 "안 보이는 곳 = 없는 곳" 이 아니다.
+
+        ⚠ 미해결 — 데크 끝의 **마지막 줄**은 이동량을 데크 끝으로 clamp 해야
+          덮이는데, 측면 305 는 `rebar_frac` 불린만 주고 **남은 mm 를 모른다**.
+          측면에 `corridor` 를 붙이면 완결된다 (전후방이 쓰는 그 코드다).
         """
+        half = self.reach_v / 2.0 - self.lane_margin
+        d = self.v_dir
+        ahead = [float(v) for v in (rows_v or ())
+                 if (float(v) - rv) * d > half]
+        if ahead:
+            v1 = min(ahead, key=lambda v: (v - rv) * d)
+            want = v1 + d * half                 # 그 줄이 **가까운 쪽** 경계에
+            t = int(math.floor(abs(want - rv) / self.lat_mm))
+            if t >= 1:
+                return t
+        return self._lane_turns_fixed()
+
+    def _lane_turns_fixed(self):
+        """줄 위치를 모를 때의 탐색 폭. 내림 — 올리면 겹침이 의도보다 얇아진다."""
         need = self.reach_v * (1.0 - self.lane_overlap)
         return max(1, int(math.floor(need / self.lat_mm)))
 
     # ---- 결정 ----------------------------------------------------------
-    def decide(self, go_mm, blocked_dirs, side_open, max_lanes=None):
+    def decide(self, go_mm, blocked_dirs, side_open, max_lanes=None,
+               rows_v=None, rv=0.0):
         """다음 행동. 센서 값만 받는다.
 
         go_mm        전진 가능 거리 (deck_edge). None = 이 판정으로는 제한 없음
         blocked_dirs 차단된 방향 집합 — 'forward' / 'backward'
         side_open    {'+1': bool, '-1': bool} 그쪽 횡으로 갈 수 있나 (측면 카메라)
         max_lanes    레인 상한 (시험용). None 이면 무제한
+        rows_v       **아직 안 묶은** 줄의 V 좌표 (작업 좌표). 레인 간격의 근거
+        rv           지금 횡 위치 (작업 좌표)
 
         반환 {'kind': ..., 'mm'|'turns': ..., 'why': ...}
         """
@@ -141,7 +186,8 @@ class Reactive:
                 self.v_tried.add(d)
                 continue
             self.v_dir = d
-            return {'kind': LATERAL, 'turns': d * self.lane_turns(), 'why': why}
+            t = self.lane_turns(rows_v, rv)
+            return {'kind': LATERAL, 'turns': d * t, 'why': why}
         if self.v_locked:
             return {'kind': DONE, 'why': f'{why} · 횡 {self.v_dir:+d} 쪽도 끝'}
         return {'kind': DONE, 'why': '전진·좌우 모두 막혔다'}
