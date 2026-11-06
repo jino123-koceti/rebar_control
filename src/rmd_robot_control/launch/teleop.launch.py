@@ -579,6 +579,22 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('use_camera')),
     )
 
+    # ── 데크끝·주행가능 판정 (L2) ────────────────────────────────────────
+    # ⚠⚠ [2026-11-06] 이것도 서비스 **밖에서** `ros2 run` 으로 떠 있었다.
+    #   자율 고리는 `/deck_edge/status` 가 없으면 15초 뒤 멈춘다 — 즉 판정
+    #   노드가 죽으면 주행이 그 자리에서 끝난다. 측면 305 와 **같은 종류의
+    #   구멍**이었다 (서비스 밖 = 아무도 안 지킨다 = 죽어도 모른다).
+    #
+    # ⚠ 파라미터를 주지 않는다. 기본값이 곧 현장값이고, 런치가 값을 따로
+    #   들고 있으면 노드 기본값을 고쳐도 **운용에 안 걸린다** — 오늘
+    #   `camera_watchdog` 의 `match` 가 정확히 그렇게 안 걸려 있었다.
+    deck_edge = Node(
+        package='rebar_vision', executable='deck_edge',
+        name='deck_edge_node', output='screen',
+        respawn=True, respawn_delay=5.0,
+        condition=IfCondition(LaunchConfiguration('use_camera')),
+    )
+
     # ── 주행 거리 제어 ───────────────────────────────────────────────────
     # `/drive/step` 으로 mm 단위 전후진. 바퀴 각도로 닫힌 루프를 돈다.
     # ⚠ 전진은 **우측 +, 좌측 −** 다 (모터가 마주 보게 달렸다). 직진 보정 부호는
@@ -659,6 +675,6 @@ def generate_launch_description():
                      ' / 호밍은 자동으로 돌지 않는다 (/homing_cmd 로 시작)']),
         motor, lateral, remote_bridge, remote_teleop, ezi_io, safety, mode_arbiter,
         homing, stage, tying, planner, camera, cam_watch, cam_watch_side,
-        pololu,
+        deck_edge, pololu,
         drive, navigator, detector, ui,
     ])
