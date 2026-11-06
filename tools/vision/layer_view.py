@@ -76,17 +76,24 @@ class LayerView(Node):
         ov[rank == 255] = (110, 110, 110)                # 깊이 없음 = 회색
         im = cv2.addWeighted(im, 0.45, ov, 0.55, 0)
 
-        for (u, v) in self.pts:
+        for i, (u, v) in enumerate(self.pts):
             r = layer_ratio(rank, u, v, 50, up) if up is not None else 0.0
-            col = (0, 255, 0) if r >= 0.35 else (0, 0, 255)
+            win = self.depth[max(0, int(v) - 4):int(v) + 5,
+                             max(0, int(u) - 4):int(u) + 5]
+            win = win[win > 0]
+            z = float(np.median(win)) if win.size else 0.0
+            inwin = 330.0 <= z <= 660.0        # 캘리가 유효한 깊이 구간
+            col = (0, 255, 0) if r >= 0.35 else (
+                (0, 200, 255) if inwin else (0, 0, 255))
             cv2.circle(im, (int(u), int(v)), 50, col, 2)
-            cv2.putText(im, f'{r:.3f}', (int(u) - 30, int(v) - 58),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
-            cv2.putText(im, f'{r:.3f}', (int(u) - 30, int(v) - 58),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+            txt = f'#{i} {r:.2f} z{z:.0f}'
+            for c, th in (((0, 0, 0), 5), (col, 2)):
+                cv2.putText(im, txt, (int(u) - 54, int(v) - 58),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.58, c, th)
         cv2.rectangle(im, (0, 0), (w, 32), (0, 0, 0), -1)
-        cv2.putText(im, f'red=upper band (rank {up}, {centers}mm)  blue=other '
-                        f'layer  gray=no depth   threshold 0.35',
+        cv2.putText(im, f'upper band rank {up} {centers}mm | circle: '
+                        f'GREEN pass  ORANGE in-depth-window(330-660) but fail  '
+                        f'RED out of window | ratio, z=depth mm',
                     (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1)
         cv2.imwrite(self.out, im)
         print(f'  저장: {self.out}')
