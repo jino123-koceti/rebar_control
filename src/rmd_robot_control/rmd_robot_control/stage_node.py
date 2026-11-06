@@ -100,7 +100,7 @@ from rclpy.node import Node
 from std_msgs.msg import Bool, Empty, Float32, Float64MultiArray, Int32, String
 from rebar_base_interfaces.msg import SafetyState
 
-from .axis_config import (envelope_for, envelope_violation, identify_pose,
+from .axis_config import (HOME_MM_DIR, envelope_for, envelope_violation, identify_pose,
                           pose_reason,
                           load_axis_motor_ids,
                           load_envelope, load_pose_id, load_pose_select,
@@ -236,6 +236,19 @@ class StageNode(Node):
         # ⚠ 목표 근처에서는 **정상적으로 감속**하므로 판정하지 않는다.
         #   감속 거리 v²/(2a) 에 여유를 곱해 그 안쪽은 건너뛴다.
         self.declare_parameter('stall_decel_margin', 2.0)
+        # ⚠⚠ [2026-11-06] **하이브리드 판정** (사용자 제안: "z 위치 피드백 +
+        #   전류 같이 하이브리드로 보면 어때?").
+        #   실측에서 **배근에 닿았는데 장비가 들리며 계속 내려간 경우**가 있었다.
+        #   그때 둘 다 "조금씩" 이상해지는데 각자의 문턱은 못 넘는다:
+        #       위치  장비가 들리면 스테이지는 장비 기준으로 **계속 내려간다**
+        #             → 완전 정체가 아니라 **느려질 뿐**이라 정체 판정이 못 잡는다
+        #       전류  무거운 장비를 들어올리느라 **천천히** 오른다
+        #             → 급등 문턱(+0.45A)을 늦게야 넘는다 (실측 1.39초)
+        #   둘을 **AND** 로 묶으면 각각을 더 민감하게 잡아도 헛걸리지 않는다.
+        #   (1번 교차점 오탐도 전류만 튀고 위치는 정상이었다 — AND 면 안 걸린다.)
+        self.declare_parameter('hybrid_speed_ratio', 0.70)   # 이 아래로 느려지고
+        self.declare_parameter('hybrid_rise_a', 0.25)        # 전류가 이만큼 오르면
+        self.declare_parameter('hybrid_samples', 2)          # 2표본 연속이면 충돌
         self.declare_parameter('collide_grace_sec', 0.2)
         self.declare_parameter('tolerance_mm', 1.0)
         self.declare_parameter('move_timeout_sec', 30.0)
@@ -305,7 +318,16 @@ class StageNode(Node):
         #   한다 — 아니면 '도달' 직후에 자세를 못 가려 다음 동작이 거부된다.
         self.declare_parameter('yaw_gun_tol_deg', 1.0)
         # 차단 뒤 스프링백이 정착할 때까지 기다리는 시간
+        # ⚠⚠ [2026-11-06] 이 값은 **상한**이 됐다. 예전에는 차단 뒤 무조건
+        #   이만큼 기다렸는데, 사용자가 "자세변경에서 1초쯤 멈춰 있다" 고
+        #   본 멈춤의 정체가 이것이다 — 0.8초 동안 **아무것도 안 한다.**
+        #   스프링백이 끝나기를 기다리는 것이므로 **각도가 실제로 멈추면**
+        #   더 기다릴 이유가 없다. yaw 엔코더가 7.5Hz 라 2표본 ≈ 0.27초다.
         self.declare_parameter('yaw_settle_sec', 0.8)
+        # 이 각도(건 기준) 안쪽으로 안 움직이면 '멈췄다'
+        self.declare_parameter('yaw_settle_still_deg', 0.05)
+        # 연속 몇 표본이 멈춰 있어야 하는가
+        self.declare_parameter('yaw_settle_still_n', 2)
         # 정착 후 재보정 최대 횟수. 안 줄어들면 기구 문제다
         self.declare_parameter('yaw_settle_passes', 3)
         # ⚠⚠ **오버슈트 선보정** (건 도). 차단하면 축이 **가던 방향으로 더 흘러
@@ -360,6 +382,10 @@ class StageNode(Node):
         self.stall_ratio = float(g('stall_ratio').value)
         self.stall_n = int(g('stall_samples').value)
         self.stall_margin = float(g('stall_decel_margin').value)
+        self.hyb_ratio = float(g('hybrid_speed_ratio').value)
+        self.hyb_rise = float(g('hybrid_rise_a').value)
+        self.hyb_n = int(g('hybrid_samples').value)
+        self._hyb_cnt = {}
         self._stall_cnt = {}
         self._stall_last = {}      # 축 → (시각, mm)
         self._stall_moved = {}     # 축 → 이번 이동에서 제대로 움직인 적 있나
@@ -383,6 +409,10 @@ class StageNode(Node):
         self.yaw_tol = float(g('yaw_tol_deg').value)
         self.yaw_gun_tol = float(g('yaw_gun_tol_deg').value)
         self.yaw_settle_sec = float(g('yaw_settle_sec').value)
+        self.yaw_still_deg = float(g('yaw_settle_still_deg').value)
+        self.yaw_still_n = int(g('yaw_settle_still_n').value)
+        self._yaw_still = 0
+        self._yaw_still_g = None
         self.yaw_max_pass = int(g('yaw_settle_passes').value)
         self.yaw_over = float(g('yaw_overshoot_gun_deg').value)
         self.yaw_fine_tol = float(g('yaw_fine_tol_deg').value)
@@ -936,8 +966,19 @@ class StageNode(Node):
           무한 재시도는 그걸 덮고 전류만 올린다.
         """
         t0, reason = self._yaw_settle
-        if time.time() - t0 < self.yaw_settle_sec:
+        # **각도가 멈추면 기다리지 않는다.** `yaw_settle_sec` 은 상한일 뿐이다.
+        g_now = self.gun_now()
+        if g_now is not None:
+            if (self._yaw_still_g is not None
+                    and abs(g_now - self._yaw_still_g) <= self.yaw_still_deg):
+                self._yaw_still += 1
+            else:
+                self._yaw_still = 0
+            self._yaw_still_g = g_now
+        if (self._yaw_still < self.yaw_still_n
+                and time.time() - t0 < self.yaw_settle_sec):
             return
+        self._yaw_still, self._yaw_still_g = 0, None
         self._yaw_settle = None
         info = self.pose_id or {}
         gun = self.gun_now()
@@ -1250,12 +1291,25 @@ class StageNode(Node):
             t_start = max(t_mv, self._brake_ok_t.get(name, 0.0))
         else:
             t_start = t_mv + self.arm_sec
-        if time.time() - t_start < self.hit_grace:
-            return False
         a = self.cur_a.get(name)
         if a is None:
             return False
         a = abs(a)
+        # ⚠⚠ [2026-11-06 실측 사고] **기준선은 유예 중에 만든다.**
+        #   예전에는 유예가 끝난 **첫 표본**으로 기준선을 잡았는데, 그 표본이
+        #   0.00A 로 들어와 기준선이 0 이 됐다. 그러자 **정상 운전 전류 0.53A가
+        #   "+0.53A 급등"** 으로 읽혀, 배근에 닿기도 전에 충돌로 멈췄다
+        #   (사용자 관찰: "하강 도중에 부딪히기도 전에 멈추고 되돌아감").
+        #   유예 동안 기준선을 쌓아 두면 그 시점에는 이미 실제 운전 전류다.
+        if time.time() - t_start < self.hit_grace:
+            base0 = self.base_a.get(name)
+            # 0 근처 표본은 기준선으로 쓰지 않는다 (응답 전/무부하)
+            if a > 0.02:
+                self.base_a[name] = a if base0 is None else (base0 + a) * 0.5
+                self._base_t[name] = time.time()
+            self.rise_cnt[name] = 0
+            self.hit_cnt[name] = 0
+            return False
         rise = self._rise_limit(name)
         base = self.base_a.get(name)
         # 기준선은 **튀지 않는 동안만** 갱신한다 — 접촉을 따라가면 감지가 죽는다
@@ -1310,6 +1364,7 @@ class StageNode(Node):
             t_start = t_mv + self.arm_sec
         if time.time() - t_start < self.hit_grace:
             self._stall_cnt[name] = 0
+            self._hyb_cnt[name] = 0
             self._stall_last.pop(name, None)
             self._stall_moved[name] = False
             return False
@@ -1335,6 +1390,7 @@ class StageNode(Node):
             return False
         if name in self.down_only and err is not None and err > 0:
             self._stall_cnt[name] = 0
+            self._hyb_cnt[name] = 0
             self._stall_last.pop(name, None)
             self._stall_moved[name] = False
             return False
@@ -1381,6 +1437,23 @@ class StageNode(Node):
                 return True
         else:
             self._stall_cnt[name] = 0
+
+        # ── 하이브리드: 느려짐 **그리고** 전류 상승 ─────────────────────
+        #   어느 한쪽만으로는 문턱을 못 넘는 "장비가 들리는" 경우를 잡는다.
+        a = self.cur_a.get(name)
+        base = self.base_a.get(name)
+        if a is not None and base is not None:
+            slow = v_act < self.hyb_ratio * v_cmd
+            heavy = abs(a) - base >= self.hyb_rise
+            if slow and heavy:
+                self._hyb_cnt[name] = self._hyb_cnt.get(name, 0) + 1
+                if self._hyb_cnt[name] >= self.hyb_n:
+                    self.hit_why = (
+                        f'하이브리드 속도 {v_act / v_cmd * 100:.0f}% '
+                        f'+ 전류 {abs(a) - base:+.2f}A (기준선 {base:.2f})')
+                    return True
+            else:
+                self._hyb_cnt[name] = 0
         return False
 
     def _accel_mm_s2(self, name):
@@ -1428,10 +1501,15 @@ class StageNode(Node):
         #   mm 는 **호밍 원점 기준**이라 모든 축에서 원점이 0 이고 행정은 한쪽
         #   방향뿐이다 (X·Y 는 0..+, Z 는 0..−). 그러니 "지금 있는 쪽" 을 넘어
         #   0 을 통과하는 후퇴는 언제나 틀렸다.
-        if cur <= 0.0 < back:
-            back = 0.0
-        elif back < 0.0 <= cur:
-            back = 0.0
+        #   [2차 수정] "0 을 통과할 때만" 막으면 **이미 밖에 있을 때** 못 막는다 —
+        #   실측에서 z=+0.4mm(원점 위)에서 시작해 +15.4mm 로 나갔다.
+        #   `HOME_MM_DIR` 은 원점이 mm 의 어느 끝인지를 적은 표다
+        #   ('+' = 원점이 최대단 → 행정은 0 이하. Z 가 그렇다).
+        side = HOME_MM_DIR.get(name)
+        if side == '+':
+            back = min(back, 0.0)
+        elif side == '-':
+            back = max(back, 0.0)
         r, _why = envelope_for(self.env, self.cur_pose()[0])
         if r and name in r:
             lo, hi = r[name]
