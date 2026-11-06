@@ -536,6 +536,49 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('use_camera')),
     )
 
+    # ── 측면 305 워치독 ─────────────────────────────────────────────────
+    # ⚠⚠ [2026-11-06] 측면 305 는 `orbbec_side.launch.py` 로 **서비스 밖에서**
+    #   떠 있었다. 그래서 ① 전원을 넣을 때마다 손으로 띄워야 했고 ② 죽어도
+    #   아무도 몰랐다. 오늘 우측이 한 시간 넘게 죽은 채였는데 `deck_edge` 가
+    #   얼어붙은 프레임으로 "좌측 열림" 을 계속 발행했다.
+    #
+    # 왜 쌍으로 다루나 — `orbbec_side.launch.py` 가 좌·우를 **한 런치에서**
+    #   띄운다. 한쪽만 죽이고 그 런치를 다시 돌리면 다른 쪽이 두 개가 된다.
+    #   그래서 토픽 둘을 함께 보고(어느 하나라도 끊기면 발동) 둘을 함께
+    #   죽인 뒤 런치를 다시 돌린다.
+    #
+    # 왜 `exclude` 가 필요한가 — 좌·우를 함께 고를 공통 토큰이
+    #   `__node:=camera_container` 뿐이고 그건 **2L 에도 있다.** 그래서
+    #   "컨테이너 전부 중 2L 만 제외" 로 고른다. 이게 없으면 측면을
+    #   되살리다가 **2L 을 죽이고**, 그 재열거 반복이 USB PHY 를 래치시킨다
+    #   (2026-11-05 에 좌측 305 를 그렇게 잃고 전원 재투입으로야 살렸다).
+    #   실측 검증: match 만 → 3개(2L 포함) / exclude 포함 → 2개(측면만).
+    #
+    # 유예 75초의 근거 — 전원 재투입 뒤 실측하면 열거는 즉시 되는데 **스트림이
+    #   106초 동안 안 열렸다.** 우측이 제 발로 재열거(+114.5s)하고서야 양쪽이
+    #   풀렸다. 초기화 자체는 2.5~7.5초다. 즉 기다릴 게 아니라 **재열거를
+    #   재촉**해야 한다 — 그게 이 워치독이 하는 일이다.
+    cam_watch_side = Node(
+        package='rebar_vision', executable='camera_watchdog',
+        name='camera_watchdog_side', output='screen',
+        parameters=[{
+            'topic': '/camera_left/color/image_raw '
+                     '/camera_right/color/image_raw',
+            'grace_sec': 75.0,
+            'stale_sec': 20.0,
+            'cooldown_sec': 120.0,
+            'max_restarts': 3,
+            'match': '__node:=camera_container',
+            'exclude': '__ns:=/camera',      # ← 2L 을 절대 건드리지 않는다
+            'relaunch': 'ros2 launch rebar_vision orbbec_side.launch.py',
+            'pre_cmd': 'sudo -n /usr/bin/udevadm trigger '
+                       '--subsystem-match=usb --attr-match=idVendor=2bc5',
+            'status_topic': '/camera/watchdog_side',
+        }],
+        respawn=True, respawn_delay=5.0,
+        condition=IfCondition(LaunchConfiguration('use_camera')),
+    )
+
     # ── 주행 거리 제어 ───────────────────────────────────────────────────
     # `/drive/step` 으로 mm 단위 전후진. 바퀴 각도로 닫힌 루프를 돈다.
     # ⚠ 전진은 **우측 +, 좌측 −** 다 (모터가 마주 보게 달렸다). 직진 보정 부호는
@@ -615,6 +658,7 @@ def generate_launch_description():
         LogInfo(msg=['리모콘 조작 구성 기동 — 안전 차단: ', use_safety,
                      ' / 호밍은 자동으로 돌지 않는다 (/homing_cmd 로 시작)']),
         motor, lateral, remote_bridge, remote_teleop, ezi_io, safety, mode_arbiter,
-        homing, stage, tying, planner, camera, cam_watch, pololu,
+        homing, stage, tying, planner, camera, cam_watch, cam_watch_side,
+        pololu,
         drive, navigator, detector, ui,
     ])

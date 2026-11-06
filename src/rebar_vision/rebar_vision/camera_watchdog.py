@@ -53,7 +53,21 @@ from std_msgs.msg import String
 class CameraWatchdog(Node):
     def __init__(self):
         super().__init__('camera_watchdog')
+        # 공백으로 여러 개를 줄 수 있다 — **어느 하나라도** 끊기면 발동한다.
+        #   측면 305 는 좌·우가 한 런치(`orbbec_side.launch.py`)로 같이 뜨니
+        #   쌍으로 다뤄야 한다. 한쪽만 죽이고 그 런치를 다시 돌리면
+        #   **다른 쪽이 두 개**가 된다.
         self.declare_parameter('topic', '/camera/color/image_raw')
+        # ⚠⚠ 이 토큰이 cmdline 에 **있으면 대상에서 뺀다.** `match` 만으로는
+        #   좌·우를 함께 고를 수 없다 — 둘의 구분 토큰이 서로 다르고
+        #   (`__ns:=/camera_left` vs `/camera_right`) 공통 토큰은 2L 에도
+        #   있는 `__node:=camera_container` 뿐이다. 그래서 '컨테이너 전부
+        #   중 2L 만 제외' 로 고른다. **이게 없으면 측면을 되살리다가 2L 을
+        #   죽이고, 그 재열거 반복이 USB PHY 를 래치시킨다** (어제 좌측
+        #   305 를 그렇게 잃었다).
+        self.declare_parameter('exclude', '')
+        # 인스턴스가 둘 이상이면 상태 토픽이 겹친다
+        self.declare_parameter('status_topic', '/camera/watchdog')
         # 기동 유예 — 카메라는 뜨는 데 30초쯤 걸린다. 그 전에 손대면 오히려 방해다
         self.declare_parameter('grace_sec', 75.0)
         # 이만큼 프레임이 없으면 멈춘 것으로 본다. 정상은 10fps 다
@@ -83,7 +97,9 @@ class CameraWatchdog(Node):
         self.declare_parameter('enabled', True)
 
         g = self.get_parameter
-        self.topic = str(g('topic').value)
+        self.topics = [t for t in str(g('topic').value).split() if t]
+        self.topic = ' '.join(self.topics)      # 로그용
+        self.exclude = [t for t in str(g('exclude').value).split() if t]
         self.grace = float(g('grace_sec').value)
         self.stale = float(g('stale_sec').value)
         self.cooldown = float(g('cooldown_sec').value)
@@ -93,16 +109,18 @@ class CameraWatchdog(Node):
         self.pre_cmd = str(g('pre_cmd').value)
         self.enabled = bool(g('enabled').value)
 
-        self.last_frame = None          # 마지막 프레임 시각
+        self.seen = {t: None for t in self.topics}   # 토픽별 마지막 프레임
         self.t0 = time.time()
         self.acted_at = 0.0
         self.restarts = 0
         self.child = None
         self._gave_up = False
 
-        self.create_subscription(Image, self.topic, self._on_frame,
-                                 qos_profile_sensor_data)
-        self.status = self.create_publisher(String, '/camera/watchdog', 10)
+        for t in self.topics:
+            self.create_subscription(
+                Image, t, lambda m, k=t: self._on_frame(k), qos_profile_sensor_data)
+        self.status = self.create_publisher(
+            String, str(g('status_topic').value), 10)
         self.create_timer(2.0, self.tick)
         self.get_logger().info(
             f"카메라 워치독 — {self.topic} 가 {self.stale:.0f}초 끊기면 "
@@ -110,10 +128,17 @@ class CameraWatchdog(Node):
             f"최대 {self.max_restarts}회)"
             + ('' if self.enabled else '  ⚠ enabled=false — 알리기만 한다'))
 
-    def _on_frame(self, _msg):
-        if self.last_frame is None:
-            self.get_logger().info('카메라 프레임 확인 — 감시 시작')
-        self.last_frame = time.time()
+    def _on_frame(self, key):
+        if self.seen.get(key) is None:
+            self.get_logger().info(f'{key} 프레임 확인 — 감시 시작')
+        self.seen[key] = time.time()
+
+    @property
+    def last_frame(self):
+        """감시 중 **가장 오래 끊긴** 토픽의 시각. 하나라도 죽으면 발동한다."""
+        if any(v is None for v in self.seen.values()):
+            return None
+        return min(self.seen.values())
 
     # ---- 복구 ---------------------------------------------------------------
     def _targets(self):
@@ -142,6 +167,7 @@ class CameraWatchdog(Node):
             #   305 를 그렇게 잃고 전원 재투입으로야 살렸다.
             toks = cmd.split()
             if (all(m in toks for m in self.match.split())
+                    and not any(x in toks for x in self.exclude)
                     and 'camera_watchdog' not in cmd):
                 out.append((int(pid), cmd.strip()))
         return out
