@@ -224,6 +224,7 @@ class TyingSequence(Node):
         self.detail = '대기'
         self.t_step = 0.0
         self._sent = 0.0
+        self._saw_move = False
 
         # ⚠ 5Hz 는 겹침 판단에 느리다 — XY 80mm/s 면 한 tick 에 16mm 를 가고
         #   `xy_blend_mm`(40mm) 창을 두세 tick 에 지나간다. 20Hz 로 올린다.
@@ -293,6 +294,7 @@ class TyingSequence(Node):
         self.detail = detail
         self.t_step = time.time()
         self._sent = 0.0
+        self._saw_move = False
         self.get_logger().info(f"[{step.value}] {detail}")
         self._publish()
 
@@ -540,7 +542,18 @@ class TyingSequence(Node):
             self.detail = ('후퇴 ' + ', '.join(f'{k}={v:.1f}'
                                              for k, v in sorted(tgt.items())))
             return
-        if self._stage_busy() or time.time() - self._sent < 1.0:
+        # ⚠⚠ [2026-11-06] **고정 1초 대기를 없앴다.** 예전에는 목표를 보낸 뒤
+        #   1초 동안 완료 검사 자체를 안 했다 — 명령 직후에는 `stage_node` 의
+        #   `moving` 이 아직 False 라 바로 검사하면 "안 움직였는데 다 됐다" 로
+        #   오판하기 때문이다. 그런데 1초는 너무 거칠다: 사용자가 "XY 이동 →
+        #   1초 멈춤 → 회전" 으로 끊겨 보인다고 했고, 자세변경마다 1초씩 샜다.
+        #   **움직이기 시작했는지**를 보면 고정 대기가 필요 없다 — 시작한 뒤에는
+        #   멈추는 즉시 완료로 넘어가고, 끝내 안 움직이면(이미 목표에 있으면)
+        #   예전처럼 1초 뒤에 통과한다.
+        if self._stage_busy():
+            self._saw_move = True
+            return
+        if not self._saw_move and time.time() - self._sent < 1.0:
             return
         cur = dict(zip(('x', 'y'), self._mm()))
         off = {ax: cur[ax] - v for ax, v in self._retract_tgt.items()
