@@ -37,6 +37,7 @@ USB 가 재열거되는데, 새 노드가 **그 재열거 중에 뜨면** SDK �
   안 되면 **멈추고 크게 알린다** — 무한 재시작 루프가 더 나쁘다.
 """
 
+import glob
 import os
 import shlex
 import signal
@@ -94,6 +95,15 @@ class CameraWatchdog(Node):
         #   (`tools/sudoers/rebar-udev-retrigger`). 비어 있거나 권한이 없으면
         #   **조용히 건너뛰고** 되살리기만 한다 — 워치독이 죽으면 안 된다.
         self.declare_parameter('pre_cmd', '')
+        # ⚠⚠ [2026-11-06] **USB 트리에 장치가 있는지 먼저 본다.**
+        #   오늘 측면 305 가 버스에서 통째로 사라졌는데, 워치독이 그걸 모르고
+        #   컨테이너를 3번 재시작했다. 없는 장치는 못 살린다 — 그러면서
+        #   **재열거만 반복해 상황을 악화시킨다** (반복 재열거가 USB PHY 를
+        #   래치시킨다; 자동절전과 겹치면 더 빨리 빠진다).
+        #   여기에 시리얼을 주면, 하나라도 없을 때 **재시작을 건너뛰고**
+        #   크게 알린다. 그 상태는 전원 재투입으로만 풀린다.
+        #   빈 값이면 검사하지 않는다 (기존 동작).
+        self.declare_parameter('usb_serials', '')
         self.declare_parameter('enabled', True)
 
         g = self.get_parameter
@@ -107,6 +117,7 @@ class CameraWatchdog(Node):
         self.match = str(g('match').value)
         self.relaunch = str(g('relaunch').value)
         self.pre_cmd = str(g('pre_cmd').value)
+        self.usb_serials = [x for x in str(g('usb_serials').value).split() if x]
         self.enabled = bool(g('enabled').value)
 
         self.seen = {t: None for t in self.topics}   # 토픽별 마지막 프레임
@@ -171,6 +182,19 @@ class CameraWatchdog(Node):
                     and 'camera_watchdog' not in cmd):
                 out.append((int(pid), cmd.strip()))
         return out
+
+    def _usb_missing(self):
+        """`usb_serials` 중 USB 트리에 **없는** 것. 빈 목록이면 검사 안 함."""
+        if not self.usb_serials:
+            return []
+        have = set()
+        for f in glob.glob('/sys/bus/usb/devices/*/serial'):
+            try:
+                with open(f) as fh:
+                    have.add(fh.read().strip())
+            except OSError:
+                pass
+        return [s for s in self.usb_serials if s not in have]
 
     def _restart(self, why):
         self.restarts += 1
@@ -250,7 +274,17 @@ class CameraWatchdog(Node):
         else:
             why = ('프레임이 한 번도 없다' if age is None
                    else f'{age:.0f}초 동안 프레임 없음')
-            if self.enabled:
+            missing = self._usb_missing()
+            if missing:
+                # 버스에 없는 장치는 재시작으로 못 살린다. 시도 자체가 해롭다.
+                state = '장치 없음'
+                self.get_logger().error(
+                    f"⛔⛔ {', '.join(missing)} 가 **USB 트리에 없다** — "
+                    f"컨테이너를 되살려도 소용없어 재시작을 건너뛴다. "
+                    f"**하드웨어 전원 재투입**이 필요하다 "
+                    f"(케이블·허브도 함께 보라)",
+                    throttle_duration_sec=30.0)
+            elif self.enabled:
                 self._restart(why)
                 state = '되살리는 중'
             else:

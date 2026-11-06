@@ -10,6 +10,39 @@
 #
 #   control=on   이어야 한다 (auto 면 규칙이 안 먹은 것)
 #   서스펜드(ms) 는 **규칙 적용 뒤로 늘지 않아야** 한다
+#
+# 누적값은 **과거 기록**이라 0 이 아닐 수 있다. 진짜 확인은 "더 늘었는가" 이고,
+# 그건 두 번 재야 안다:
+#
+#   tools/usb_suspend_check.sh --watch 120     # 120초 간격으로 두 번 재서 증가분
+
+# ── --watch N : N초 간격으로 두 번 재서 **증가분**을 본다 ──────────────
+if [ "$1" = "--watch" ]; then
+  n="${2:-120}"
+  snap() { for d in /sys/bus/usb/devices/*/; do
+             v=$(cat "$d/idVendor" 2>/dev/null); p=$(cat "$d/product" 2>/dev/null)
+             case "$v$p" in *2bc5*|*Hub*|*hub*) ;; *) continue;; esac
+             echo "$(basename "$d") $(cat "$d/power/runtime_suspended_time" 2>/dev/null)"
+           done; }
+  echo "  ${n}초 동안 서스펜드가 더 쌓이는지 본다…"
+  a=$(snap); sleep "$n"; b=$(snap)
+  grew=0
+  printf "  %-10s %-14s %-14s %s\n" 포트 "전(ms)" "후(ms)" 증가
+  printf "  %s\n" "--------------------------------------------------------"
+  while read -r port before; do
+    after=$(echo "$b" | awk -v k="$port" '$1==k{print $2}')
+    [ -z "$after" ] && after="$before"
+    d=$((after - before))
+    mark=''; if [ "$d" -gt 0 ]; then mark='  ← ★ 아직 잠든다'; grew=$((grew+1)); fi
+    printf "  %-10s %-14s %-14s %+d%s\n" "$port" "$before" "$after" "$d" "$mark"
+  done <<< "$a"
+  echo
+  if [ "$grew" -gt 0 ]; then
+    echo "  ★ $grew 개가 아직 잠든다 — 규칙이 그 장치에 안 먹었다"; exit 1
+  fi
+  echo "  ${n}초 동안 증가 0 ✓  자동절전이 실제로 꺼졌다"
+  exit 0
+fi
 
 printf "  %-9s %-27s %-9s %-8s %-12s\n" 포트 제품 상태 control "서스펜드(ms)"
 printf "  %s\n" "----------------------------------------------------------------------"

@@ -524,6 +524,7 @@ def generate_launch_description():
             #   **셋 다 죽인다.** 워치독은 교차점만 되살리므로 측면은
             #   영구 정지다.
             'match': '__node:=camera_container __ns:=/camera',
+            'usb_serials': CAM_ARGS.get('serial_number', ''),
             'relaunch': 'ros2 launch orbbec_camera gemini2L.launch.py '
                         + ' '.join(f'{k}:={v}' for k, v in CAM_ARGS.items()),
             # ⚠ 되살리기 **전에** USB 권한을 고친다 — udev 가 빠른 재열거에서
@@ -570,6 +571,9 @@ def generate_launch_description():
             'max_restarts': 3,
             'match': '__node:=camera_container',
             'exclude': '__ns:=/camera',      # ← 2L 을 절대 건드리지 않는다
+            # 버스에 없으면 재시작을 건너뛰고 크게 알린다 (전원 재투입 필요).
+            #   시리얼은 `orbbec_side.launch.py` 의 LEFT_SN/RIGHT_SN 과 같다.
+            'usb_serials': 'CV2L3600003P CV2856D000D0',
             'relaunch': 'ros2 launch rebar_vision orbbec_side.launch.py',
             'pre_cmd': 'sudo -n /usr/bin/udevadm trigger '
                        '--subsystem-match=usb --attr-match=idVendor=2bc5',
