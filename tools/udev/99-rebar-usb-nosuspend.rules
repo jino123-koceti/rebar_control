@@ -1,0 +1,56 @@
+# USB 자동절전 끄기 — **카메라가 버스에서 사라지는 원인**
+#
+# ⚠⚠ [2026-11-06 측정] 증상: 측면 305 가 하루에 두 번 USB 트리에서 통째로
+#   사라졌다. 어제는 좌측, 오늘은 우측 — **장치·포트 탓이 아니다.**
+#   udev trigger 도 컨테이너 재시작도 무효였고 **전원 재투입만** 통했다.
+#   워치독이 3번 되살리기를 시도했지만 버스에 없는 장치는 못 살린다.
+#
+# 근거 — 가지별 서스펜드 누적 시간 (`power/runtime_suspended_time`):
+#
+#     버스 2 (305 두 대)
+#       2-3     4-Port USB 3.0 Hub   활성 4,017초 / 서스펜드 **3,700초**
+#       2-3.1   USB5807 Hub          **suspended** (관측 시점)
+#       2-3.2   USB5804 Hub          서스펜드 148초
+#       2-3.2.3 Gemini 305           서스펜드 **25.4초**   ← 카메라도 잠든다
+#
+#     버스 1 (2L·PCAN·Pololu)
+#       1-4 / 1-4.2 / Gemini 2L      서스펜드 **전부 0ms**
+#
+#   **잠드는 가지에서만 카메라가 사라진다.** 2L 은 한 번도 안 빠졌고 그 가지는
+#   서스펜드가 0이다. 좌·우가 번갈아 죽은 것도 "둘 중 복귀에 실패한 쪽" 으로
+#   설명된다. 커널 기본값이 `usbcore.autosuspend=2` 라 **2초** 만에 잠들고,
+#   카메라는 `autosuspend_delay_ms=2000` 이었다.
+#
+#   스트림이 멈추는 순간(컨테이너 재시작·워치독 발동)이 곧 잠들 기회다.
+#   그래서 **되살리려는 시도 자체가 사라질 기회를 만든다** — 오늘 우측이
+#   워치독의 3연속 재시작 뒤에 없어진 것이 그 모양이다.
+#
+# ⚠ 허브까지 막아야 한다. 카메라만 막으면 **허브가 잠들 때 가지째 끌려간다.**
+#   아래 허브 ID 는 버스 1·2 에 같은 모델이 쓰인다 — 버스 1 은 원래 안 잠드니
+#   무해하고, PCAN·Pololu·WiFi 동글 가지도 같이 깨어 있게 된다.
+#
+# 대가: 대기 전력이 조금 는다. 모터 전류에 비하면 무시할 수준이다.
+#
+# 설치:
+#   sudo cp tools/udev/99-rebar-usb-nosuspend.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+#   sudo udevadm trigger --subsystem-match=usb
+#   확인: tools/usb_suspend_check.sh
+
+# ── Orbbec 카메라 (2L 0673 · 305 0840, 벤더 전체) ───────────────────────
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2bc5", \
+  TEST=="power/control", ATTR{power/control}="on"
+
+# ── 카메라가 달린 허브들 ────────────────────────────────────────────────
+# 0bda:0420 4-Port USB 3.0 Hub   (2-3,  305 두 대의 상위)
+# 0bda:5420 4-Port USB 2.0 Hub   (1-4,  2L·PCAN·Pololu 의 상위)
+# 110a:0414 USB5804/USB2804 Hub  (2-3.2 / 1-4.2)
+# 110a:0417 USB5807/USB2807 Hub  (2-3.1 / 1-4.1)
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="0420", \
+  TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="5420", \
+  TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="110a", ATTR{idProduct}=="0414", \
+  TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="110a", ATTR{idProduct}=="0417", \
+  TEST=="power/control", ATTR{power/control}="on"
