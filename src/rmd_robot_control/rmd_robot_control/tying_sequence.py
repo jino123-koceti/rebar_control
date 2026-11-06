@@ -649,6 +649,15 @@ class TyingSequence(Node):
             return self._enter(Step.Z_UP, 'Z 상승')
         now = time.time()
         if self._fire_phase == 0:
+            # ⚠ **발사마다 다시 읽는다.** 기동 때 한 번만 읽으면 `ros2 param set`
+            #   도 런치 수정도 안 먹는다 — respawn 은 **기동 당시 인자**를 다시
+            #   쓰기 때문이다 (`stage_node._begin` 이 같은 이유로 매 이동 재독).
+            #   건 시간은 현장에서 맞춰야 하는 값이라(2026-11-06 실측으로 1.0 →
+            #   0.35) 서비스 재시작 없이 바꿀 수 있어야 한다. 재시작하면 호밍이
+            #   날아간다.
+            g = self.get_parameter
+            self.gun_fire = float(g('gun_fire_sec').value)
+            self.gun_back = float(g('gun_return_sec').value)
             self._fire_phase, self._fire_t = 1, now
             self.gun_pub.publish(Float32(data=self.gun_speed))
             self.detail = f'결속건 당김 {self.gun_fire:.1f}s'
