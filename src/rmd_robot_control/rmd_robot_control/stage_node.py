@@ -362,6 +362,7 @@ class StageNode(Node):
         self.stall_margin = float(g('stall_decel_margin').value)
         self._stall_cnt = {}
         self._stall_last = {}      # 축 → (시각, mm)
+        self._stall_moved = {}     # 축 → 이번 이동에서 제대로 움직인 적 있나
         self.hit_grace = float(g('collide_grace_sec').value)
         self.cur_a = {}            # 축 → 최근 전류(A). 표본이 없으면 키가 없다
         self.hit_cnt = {}          # 축 → 문턱 초과 연속 횟수
@@ -1310,6 +1311,7 @@ class StageNode(Node):
         if time.time() - t_start < self.hit_grace:
             self._stall_cnt[name] = 0
             self._stall_last.pop(name, None)
+            self._stall_moved[name] = False
             return False
         return self._stalled(name, err)
 
@@ -1334,6 +1336,7 @@ class StageNode(Node):
         if name in self.down_only and err is not None and err > 0:
             self._stall_cnt[name] = 0
             self._stall_last.pop(name, None)
+            self._stall_moved[name] = False
             return False
         cur = self.mm_of(name)
         if cur is None:
@@ -1358,6 +1361,18 @@ class StageNode(Node):
                 self._stall_cnt[name] = 0
                 return False
         v_act = abs(cur - prev[1]) / dt
+        # ⚠⚠ [2026-11-06 실측 사고] **한 번이라도 제대로 움직인 뒤에만 판정한다.**
+        #   `[move_xy]` 중 Z 를 미리 보내는 블렌드 구간에서 Z 가 **아직 출발하지
+        #   않은 것**을 "0mm/s = 정체" 로 보고 헛걸렸다. 그 결과 z -0.6mm 에서
+        #   충돌로 판정해 **+14.4mm 로 후퇴** — 행정 위쪽(원점)을 넘겼다.
+        #   유예(시간)만으로는 못 막는다. 브레이크가 이미 풀려 있으면 유예가
+        #   이동 요청 시각부터 세어져, 명령이 모터에 먹기 전에 창이 끝난다.
+        #   "움직인 적이 있다" 를 본다 — 진짜 충돌은 **움직인 뒤**에 일어난다.
+        if not self._stall_moved.get(name):
+            if v_act >= 0.5 * v_cmd:
+                self._stall_moved[name] = True
+            self._stall_cnt[name] = 0
+            return False
         if v_act < self.stall_ratio * v_cmd:
             self._stall_cnt[name] = self._stall_cnt.get(name, 0) + 1
             if self._stall_cnt[name] >= self.stall_n:
@@ -1406,6 +1421,17 @@ class StageNode(Node):
             self.get_logger().error(self.detail)
             return self._stop(self.detail)
         back = cur - math.copysign(self.hit_back, err)
+        # ⚠⚠ [2026-11-06 실측 사고] **후퇴가 호밍 원점을 넘지 않게 자른다.**
+        #   z -0.6mm(거의 맨 위)에서 충돌 판정이 나자 15mm 후퇴가 **+14.4mm** 로
+        #   행정 밖(원점 위)으로 나갔다. 작업영역 표(`envelope`)에는 Z 가 없어서
+        #   아래 clamp 가 Z 를 못 막는다.
+        #   mm 는 **호밍 원점 기준**이라 모든 축에서 원점이 0 이고 행정은 한쪽
+        #   방향뿐이다 (X·Y 는 0..+, Z 는 0..−). 그러니 "지금 있는 쪽" 을 넘어
+        #   0 을 통과하는 후퇴는 언제나 틀렸다.
+        if cur <= 0.0 < back:
+            back = 0.0
+        elif back < 0.0 <= cur:
+            back = 0.0
         r, _why = envelope_for(self.env, self.cur_pose()[0])
         if r and name in r:
             lo, hi = r[name]
