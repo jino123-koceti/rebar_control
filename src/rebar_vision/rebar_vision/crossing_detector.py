@@ -129,6 +129,14 @@ class CrossingDetector(Node):
         #   여러 장 중 하나만 값이 있으면 살아나므로 유효율도 같이 올라간다.
         #   ⚠ 지연은 없다 — 콜백에서 미리 쌓아 둔 것을 쓴다. 1 이면 옛 동작과 같다.
         self.declare_parameter('depth_frames', 5)      # 합칠 depth 장수 (1 = 끔)
+        # ⚠⚠ [2026-11-06] **컬러도 여러 시점을 모아 추론한다.** `frames` 는 같은
+        #   한 장을 재추론해서 흔들림을 못 줄인다(위 주석). 실제로 x·y 를 안정
+        #   시키려면 **서로 다른 시점의 영상**에서 검출해 합쳐야 한다 —
+        #   `_merge` 가 merge_px 안의 검출을 **평균**내므로 그냥 같이 넣으면 된다.
+        #   근거(2026-11-06 캘리): 같은 교차점을 다시 검출하면 좌표가 1.1~2.6mm
+        #   흔들린다. 캘리 잔차 3.68mm 의 상당 부분이 이 잡음이고, N장 평균이면
+        #   √N 으로 준다. 추론이 N배 걸리지만 검출 시간은 결속 예산 밖이다.
+        self.declare_parameter('color_frames', 3)     # 추론할 서로 다른 컬러 장수
         # 모델 검출(녹색) vs 실제 출력(빨강) 겹쳐 그린 그림. 빈 문자열이면 안 그린다.
         # ⚠ **절대경로여야 한다** — 상대경로는 노드의 작업 디렉터리(서비스 기준)에
         #   떨어져서 찾을 수 없다 (2026-10-16 에 실제로 그랬다).
@@ -147,6 +155,8 @@ class CrossingDetector(Node):
         self.n_depth = max(1, int(g('depth_frames').value))
         from collections import deque
         self.depth_buf = deque(maxlen=self.n_depth)
+        self.n_color = max(1, int(g('color_frames').value))
+        self.color_buf = deque(maxlen=12)   # 최근 컬러 메시지 (변환은 검출 때만)
         self.classes = list(cfg['class_names'])
 
         if not os.path.isabs(self.weights):
@@ -242,6 +252,7 @@ class CrossingDetector(Node):
     # ---- 입력 --------------------------------------------------------------
     def _on_color(self, msg):
         self.color = msg
+        self.color_buf.append(msg)      # 변환은 하지 않는다 — 검출 때 쓸 것만 바꾼다
 
     def _on_depth(self, msg):
         self.depth = msg
@@ -321,16 +332,37 @@ class CrossingDetector(Node):
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         dimg = self._depth_stack()
 
-        # 여러 프레임 합치기 — 같은 영상에 대해 반복 추론해 흔들림을 줄인다
+        # **서로 다른 시점**의 컬러 여러 장에서 검출해 합친다 (`color_frames`).
+        #   `_merge` 가 가까운 검출의 좌표를 평균내므로 그대로 넣으면 평균이 된다.
+        #   `frames`(같은 장 재추론)와 달리 이쪽은 실제로 흔들림을 줄인다.
+        self.n_color = max(1, int(g('color_frames').value))
+        imgs = [rgb]
+        if self.n_color > 1:
+            seen = {id(self.color)}
+            for m in reversed(list(self.color_buf)[:-1]):
+                if len(imgs) >= self.n_color:
+                    break
+                if id(m) in seen:
+                    continue
+                seen.add(id(m))
+                try:
+                    imgs.append(cv2.cvtColor(
+                        self.bridge.imgmsg_to_cv2(m, desired_encoding='bgr8'),
+                        cv2.COLOR_BGR2RGB))
+                except Exception:
+                    pass
         raw = []
-        for _ in range(max(1, self.n_frames)):
-            det = self.model.predict(rgb, threshold=self.threshold,
-                                     include_source_image=False)
-            for (x1, y1, x2, y2), cid, conf in zip(det.xyxy, det.class_id,
-                                                   det.confidence):
-                cid = int(cid)
-                name = self.classes[cid] if 0 <= cid < len(self.classes) else f'slot{cid}'
-                raw.append([(x1 + x2) / 2.0, (y1 + y2) / 2.0, name, float(conf)])
+        for _img in imgs:
+            for _ in range(max(1, self.n_frames)):
+                det = self.model.predict(_img, threshold=self.threshold,
+                                         include_source_image=False)
+                for (x1, y1, x2, y2), cid, conf in zip(det.xyxy, det.class_id,
+                                                       det.confidence):
+                    cid = int(cid)
+                    name = (self.classes[cid] if 0 <= cid < len(self.classes)
+                            else f'slot{cid}')
+                    raw.append([(x1 + x2) / 2.0, (y1 + y2) / 2.0,
+                                name, float(conf)])
 
         merged = self._merge(raw)
         total = len(merged)
