@@ -263,9 +263,9 @@ class RemoteTeleop(Node):
                     "/safety/state 를 못 받고 있다 — X·Y 리미트 차단이 동작하지 않는다 "
                     "(safety_node 확인). 조작은 그대로 통과시킨다")
             return dps
-        d = int((self.ax.get(axis) or {}).get('home_dir', 1))
-        mm_dir = '+' if (-1 if dps > 0 else 1) * d > 0 else '-'
-        key = f'{axis}{mm_dir}'
+        # 환산은 `axis_config.mm_dir_of` 하나만 쓴다 (Z 가 거꾸로였던 이유는 거기).
+        key = mm_dir_of(axis, dps, (self.ax.get(axis) or {}).get('home_dir', 1))
+        mm_dir = key[-1]
         if key in self.blocked:
             if key not in self._limit_noted:
                 self._limit_noted.add(key)

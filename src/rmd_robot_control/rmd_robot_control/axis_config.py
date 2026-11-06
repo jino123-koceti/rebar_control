@@ -728,3 +728,45 @@ def load_stage_axes(names=('x', 'y', 'z')):
             gravity=bool(cfg.get('gravity_load', False)),
         )
     return out
+
+
+# ── 리미트 차단의 mm 방향 규약 ────────────────────────────────────────────
+# ⚠⚠ **`home_dir` 만으로는 mm 방향을 알 수 없다.** 이걸 몰라서 2026-11-06 에
+#   `use_safety:=true` 로 켜자마자 **호밍이 실패**했다.
+#
+#   `home_dir` 은 "원점 리미트로 가는 **모터 속도 부호**" 다. mm 는 **호밍 원점
+#   기준**이고, 원점이 mm 범위의 어느 쪽 끝인지가 **축마다 다르다**:
+#       x  x_min(원점)     → 0 .. +453.7   | y 도 같다
+#       z  z_min(원점·위)  → 0 .. **-139.2**   ← mm 가 아래로 갈수록 음수
+#   그래서 "원점 쪽으로 간다" 가 x·y 는 `x-`, **Z 는 `z+`** 다.
+#
+#   옛 식은 `(-1 if dps > 0 else 1) * home_dir` 로 **원점이 늘 mm 최소단에
+#   있다고 가정**했다. x·y 는 맞았지만 Z 는 뒤집혔고, 결과가 보호가 아니라
+#   **가두기**였다 — 호밍이 z_min 에서 후퇴하려는 명령을 L1 이 `z+`(= 리미트로
+#   더 들어가는 방향)로 읽고 0 으로 깎아, 8초를 뺐는데도 센서가 안 풀렸다.
+#
+# 값 = **원점 리미트로 더 들어가는 mm 방향.** `safety_node.LIMIT_BLOCKS` 의
+# `<축>_min` 항목과 **같은 사실**이다 — 한쪽만 바꾸면 또 어긋난다.
+#
+# ✔ 교차검증 — `stage_node._blocked(name, err)` 는 **mm 오차 부호**로만 판정해서
+#   부호 환산 자체가 없다 (그래서 Z 버그도 없었다). 그 규약을 모터 속도로 옮기면
+#   "양수 dps → 엔코더 각 감소 → mm 감소"(mm_per_deg 가 x·y·z 셋 다 양수) 이므로
+#   `'-' if dps > 0 else '+'` 가 된다 — home_dir 도 이 표도 필요 없는 식이다.
+#   근거가 전혀 겹치지 않는데 아래 식과 **12개 경우 전부 답이 같다**
+#   (`tools/test/mm_dir_check.py`). 그래서 이 표를 믿을 수 있다.
+HOME_MM_DIR = {'x': '-', 'y': '-', 'z': '+'}
+
+
+def mm_dir_of(axis, speed_dps, home_dir):
+    """모터 속도 부호 → mm 방향 라벨(`'z+'` 꼴). `blocked_axes` 와 비교할 값이다.
+
+    `position_control_node._safety_clamp_axis` 와 `remote_teleop_node._limit_clamp`
+    가 **이 함수만** 쓴다. 규약이 두 노드에 따로 적혀 있던 것이 버그의 뿌리였다.
+
+    yaw 는 `yaw_home` 뿐이라 min/max 규약이 없다 — `blocked_axes` 에 yaw 가
+    담기지 않으므로 어떤 라벨이 나와도 매치되지 않는다.
+    """
+    toward_home = (float(speed_dps) > 0) == (int(home_dir) > 0)
+    into = HOME_MM_DIR.get(axis, '-')
+    away = '-' if into == '+' else '+'
+    return f'{axis}{into if toward_home else away}'

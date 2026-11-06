@@ -1567,9 +1567,10 @@ class PositionControlNode(Node):
         #   리미트에 닿으면 **빠져나오는 방향이 막히고 처박는 방향이 열렸다.**
         #   z 는 `home_dir -1` 이라 우연히 맞았다. `remote_teleop_node._limit_clamp`
         #   와 **같은 식**을 쓴다 — 두 노드가 다른 규약을 쓰던 것이 문제의 뿌리였다.
-        d = int(self.home_dir.get(axis, 1))
-        mm_dir = '+' if (-1 if speed_dps > 0 else 1) * d > 0 else '-'
-        want = f"{axis}{mm_dir}"
+        #   [2026-11-06] 환산을 `axis_config.mm_dir_of` 로 넘겼다. 여기 있던 식은
+        #   **원점이 늘 mm 최소단**이라고 가정해서 **Z 가 거꾸로** 동작했다 —
+        #   `use_safety:=true` 로 켠 첫날 호밍이 z_min 에서 못 빠져나와 실패했다.
+        want = mm_dir_of(axis, speed_dps, self.home_dir.get(axis, 1))
         if want in self.safety.blocked_axes:
             if self._safety_blocked_logged != want:
                 self._safety_blocked_logged = want
