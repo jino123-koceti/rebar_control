@@ -138,6 +138,19 @@ class TyingSequence(Node):
         self.declare_parameter('gun_enabled', False)
         self.declare_parameter('gun_topic', '/motor_0/vel')
         self.declare_parameter('gun_speed', 1.0)     # Pololu Float32 -1.0~1.0
+        # ⚠⚠ [2026-11-06] Z 상승과 XY 후퇴를 **겹친다.**
+        #   예전에는 Z 가 `z_safe`(0mm)에 **완전히 도착한 뒤**에야 XY 후퇴를
+        #   시작했다. 둘이 직렬로 쌓여 자세 변경이 13.8초였다 (실측 분해:
+        #   Z 3.55 + XY후퇴 4.75 + 회전 4.60 + 접근 0.90).
+        #   `stage_node` 는 **이동 중 목표를 합친다** (로그의 `이동 중 목표
+        #   합침 — 새 축 y`). 그리고 건이 배근을 벗어나는 높이는 `z_clear`
+        #   (-12mm)로 따로 정의돼 있다 — `_do_z_up` 이 이미 그 기준으로 끝낸다.
+        #   그래서 Z 가 `z_clear` 만 지나면 XY 를 같이 보내도 안전하고,
+        #   자세 변경이 **Z + XY → max(Z, XY)** 가 된다.
+        #   ⚠ 회전은 못 겹친다 — `stage_node` 가 이동 중 회전을 **거부**한다
+        #     (한 번에 한 동작). 후퇴가 끝나야 돌릴 수 있다.
+        #   문제가 보이면 false 로 끄면 예전 동작이다.
+        self.declare_parameter('overlap_z_retract', True)
         self.declare_parameter('gun_fire_sec', 1.0)
         self.declare_parameter('gun_return_sec', 1.0)
 
@@ -153,6 +166,7 @@ class TyingSequence(Node):
         self.z_hi = float(self.get_parameter('z_tie_max_mm').value)
         self.gun_on = bool(self.get_parameter('gun_enabled').value)
         self.gun_speed = float(self.get_parameter('gun_speed').value)
+        self.overlap_zr = bool(self.get_parameter('overlap_z_retract').value)
         self.gun_fire = float(self.get_parameter('gun_fire_sec').value)
         self.gun_back = float(self.get_parameter('gun_return_sec').value)
 
@@ -433,6 +447,12 @@ class TyingSequence(Node):
     def _do_z_clear(self):
         if self._z_arrived(self.z_safe):
             return self._after_z_clear('Z 안전높이 확보')
+        # **벗어난 높이를 지나면 기다리지 않는다.** Z 는 계속 올라가고, 다음
+        #   단계의 XY 목표가 `stage_node` 에서 합쳐진다. 근거는 위 파라미터 주석.
+        z = self._z()
+        if (self.overlap_zr and self._sent and z is not None
+                and z >= self.z_clear):
+            return self._after_z_clear(f'Z {z:.0f}mm — 벗어남, XY 를 겹쳐 보낸다')
         if self._stage_busy():
             return
         if time.time() - self._sent > 1.0:
@@ -510,7 +530,9 @@ class TyingSequence(Node):
                 names = ', '.join(passed)
                 return self._enter(Step.ROTATE,
                                    f'[{names}] 교집합 안 — 후퇴 불필요, 회전')
-            if self._stage_busy():
+            # 겹치기 중에는 Z 가 아직 올라가는 중이라 `moving` 이 참이다.
+            #   그래도 보낸다 — `stage_node` 가 축별로 합친다.
+            if self._stage_busy() and not self.overlap_zr:
                 return
             self._retract_tgt = tgt
             self._sent = time.time()
