@@ -261,13 +261,24 @@ class PositionControlNode(Node):
         # ⚠ speed_limit 은 motor_protection_state['speed_limited'] 가 True 일 때만
         #   쓰이고 그 기능은 아직 비활성이다(940줄 주석). 값은 잠정치다.
         self.motor_current_limits = {
-            0x141: {'name': '우측주행', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 100},
-            0x142: {'name': '좌측주행', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 100},
+            # ⚠⚠ [2026-11-06] `rated` 는 **데이터시트 정격**이다 (경고 로그의 기준값).
+            #   X4-36 = RMD-X4-P36-36-C 정격 상전류 **6.1A(rms)** · 피크 21.5A.
+            #   7.8A 는 **X4-10 값**이었다 — X 가 2026-10-04 에 X4-36 으로 교체됐는데
+            #   이 표가 안 따라왔다. 그 탓에 로그가 "정격 7.8A" 로 찍혀 여유를
+            #   28% 과대평가하게 만든다 (가속을 올릴 때 바로 오판으로 이어진다).
+            # ⚠⚠ **이 표는 경고만 한다.** `danger`/`emergency` 를 넘어도 아래 코드가
+            #   로그만 남기고 **모터를 멈추지 않는다** ("자동 정지는 나중에").
+            #   즉 상부축에는 자동 전류 보호가 **없다.** 속도·가속을 올리는 작업은
+            #   반드시 전류를 직접 보면서 해야 한다.
+            0x141: {'name': '우측주행', 'rated': 6.1, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 100},
+            0x142: {'name': '좌측주행', 'rated': 6.1, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 100},
             # 횡이동 2축 (X4-36). 2차년도는 0x143 1축이었다.
             0x143: {'name': '횡이동#1', 'rated': 6.1, 'warning': 8.0, 'danger': 12.0, 'emergency': 18.0, 'speed_limit': 100},
             0x144: {'name': '횡이동#2', 'rated': 6.1, 'warning': 8.0, 'danger': 12.0, 'emergency': 18.0, 'speed_limit': 100},
             # 상부 스테이지
-            0x145: {'name': 'X축', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 200},
+            # X 는 X4-36 (2026-10-04 교체) — 횡이동 0x143/144 와 같은 모터다
+            0x145: {'name': 'X축', 'rated': 6.1, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 200},
+            # Y·Z·yaw 는 상부 공통값 X4-10 / 감속비 12.5 (axes.yaml 595줄)
             0x146: {'name': 'Y축', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 200},
             0x147: {'name': 'Z축(리프팅)', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 75},
             0x148: {'name': 'Yaw', 'rated': 7.8, 'warning': 9.0, 'danger': 12.0, 'emergency': 15.0, 'speed_limit': 67},
