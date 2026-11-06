@@ -75,6 +75,7 @@ class Reactive:
         # 영역 경계에서 이만큼 **안쪽**에 들어와야 "확실히 덮였다" 로 본다.
         # 주행 오차(2.2% 실측 ≈ 10mm)·뷰별 ±12mm·횡 양자화 ±25mm 를 합친 예산.
         self.lane_margin = float(lane_margin_mm)
+        self.lane_why = ''            # 마지막 레인 간격의 **근거** (로그용)
         # ⚠ **횡 방향은 한 번 정하면 끝까지 유지한다.** 막힐 때마다 반대로
         #   틀면 위아래로 **무한 왕복**한다 — 반응형은 설계상 지도를 안 보므로
         #   "이미 덮은 레인" 을 기억하지 못한다 (시뮬에서 레인 28개가 나왔다).
@@ -141,7 +142,13 @@ class Reactive:
             want = v1 + d * half                 # 그 줄이 **가까운 쪽** 경계에
             t = int(math.floor(abs(want - rv) / self.lat_mm))
             if t >= 1:
+                # ⚠ 근거를 남긴다. 실측 기반 값이 우연히 옛 고정값(350mm)과
+                #   같을 수 있어서, 로그만 보면 폴백과 구분이 안 된다.
+                self.lane_why = f'줄 V={v1:.0f} 기준 (안 묶은 첫 줄)'
                 return t
+        n = len(rows_v or ())
+        self.lane_why = ('줄 모름 → 탐색 폭' if not n
+                         else f'앞쪽에 안 묶은 줄 없음({n}개는 영역 안) → 탐색 폭')
         return self._lane_turns_fixed()
 
     def _lane_turns_fixed(self):
@@ -187,7 +194,8 @@ class Reactive:
                 continue
             self.v_dir = d
             t = self.lane_turns(rows_v, rv)
-            return {'kind': LATERAL, 'turns': d * t, 'why': why}
+            return {'kind': LATERAL, 'turns': d * t,
+                    'why': f'{why} · {self.lane_why}'}
         if self.v_locked:
             return {'kind': DONE, 'why': f'{why} · 횡 {self.v_dir:+d} 쪽도 끝'}
         return {'kind': DONE, 'why': '전진·좌우 모두 막혔다'}
@@ -212,6 +220,7 @@ class Reactive:
         return {'u_dir': self.u_dir, 'v_dir': self.v_dir, 'v_locked': self.v_locked,
                 'pitch_mm': self.pitch,
                 'step_mm': round(self.step_mm()), 'lane_turns': self.lane_turns(),
+                'lane_why': self.lane_why,
                 'stops': self.stops, 'lanes': self.lanes,
                 'v_tried': sorted(self.v_tried)}
 
