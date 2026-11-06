@@ -177,5 +177,65 @@ check('U 시작점까지 되돌아온다', min(us) <= 450, True)
 check('레인 간격 = 6회전 × 50mm', vs[1] - vs[0] if len(vs) > 1 else 0, 300.0)
 check('정차 간격 = 스텝', round(sorted(us)[1] - sorted(us)[0]) in (0, 450), True)
 
+
+print('\n■ \'ㄹ\' 주행 — 교차점 격자를 깐 가상 데크에서 **실측 줄 간격**으로')
+# 왜 이 시험이 따로 필요한가 — 위의 "가상 데크 순회" 는 `rows_v` 를 안 넘겨
+# **고정 폭 폴백**으로 돈다. 실측 줄 기반 간격(2026-11-06 추가)과 'ㄹ' 모양이
+# **같은 테스트에서 함께** 증명된 적이 없었다. 여기서 둘을 같이 본다.
+#
+# 흉내 냄 — 교차점 격자, 결속영역, 데크 경계, 횡 50mm 양자화, 지도 누적
+# 안 냄   — 검출 실패·충돌. 그건 실기에서 본다
+DU, DV = 3000.0, 1400.0
+PU, PV = 232.0, 215.0
+HU, HV = 520 / 2, 380 / 2          # 결속영역 반폭
+cross = [(i * PU, j * PV) for i in range(int(DU / PU) + 1)
+         for j in range(int(DV / PV) + 1)]
+rr = Reactive(520, 380, pitch_mm=PU)
+u = v = 0.0
+tied, path, flips = set(), [(u, v)], 0
+prev_udir = rr.u_dir
+for _ in range(400):
+    # 정차 결속 — 영역 안의 교차점을 묶는다
+    for c in cross:
+        if abs(c[0] - u) <= HU and abs(c[1] - v) <= HV:
+            tied.add(c)
+    # 지도에서 "아직 안 묶은 줄" 을 넘긴다 (노드가 map.pending() 으로 하는 것)
+    rows_v = sorted({c[1] for c in cross if c not in tied})
+    go = (DU - u) if rr.u_dir > 0 else u
+    side = {d: (0.0 <= v + d * 50.0 <= DV) for d in (1, -1)}
+    d = rr.decide(go_mm=go, blocked_dirs=set(), side_open=side, rows_v=rows_v,
+                  rv=v)
+    if d['kind'] == DONE:
+        break
+    if d['kind'] == DRIVE:
+        u = min(max(u + d['mm'], 0.0), DU)
+        rr.moved(DRIVE, d['mm'])
+    else:
+        nv = v + d['turns'] * 50.0
+        if not (0.0 <= nv <= DV):          # 데크 밖 — 측면이 막았을 상황
+            break
+        v = nv
+        rr.moved(LATERAL, d['turns'])
+        if rr.u_dir != prev_udir:
+            flips += 1
+            prev_udir = rr.u_dir
+    path.append((u, v))
+
+miss = [c for c in cross if c not in tied]
+print(f"  정차 {rr.stops}회 · 레인 {rr.lanes}개 · 방향 전환 {flips}회 · "
+      f"교차점 {len(tied)}/{len(cross)} 결속")
+check("'ㄹ' 이려면 방향 전환이 2회 이상", flips >= 2, True)
+check('레인마다 진행 방향이 뒤집힌다', flips, rr.lanes)
+check('U 를 양쪽 끝까지 훑는다',
+      max(p[0] for p in path) >= DU - 520 and min(p[0] for p in path) <= 520,
+      True)
+check('V 를 데크 폭만큼 훑는다', max(p[1] for p in path) >= DV - 380, True)
+# 끝줄은 측면 거리(mm)가 없어 clamp 를 못 하는 **알려진 구멍**이다.
+# 그 한 줄(= V 한 값)을 넘는 누락이 있으면 간격 규칙이 깨진 것이다.
+missed_rows = sorted({c[1] for c in miss})
+print(f"  빠뜨린 교차점 {len(miss)}개 · 그 줄 V = "
+      f"{[round(x) for x in missed_rows] or '없음'}")
+check('빠뜨림이 있어도 **끝줄 한 줄 이내**', len(missed_rows) <= 1, True)
+
 print(f"\n{'통과' if not FAIL else '★ 실패 있음'} — {OK} OK / {FAIL} NG")
 sys.exit(1 if FAIL else 0)
