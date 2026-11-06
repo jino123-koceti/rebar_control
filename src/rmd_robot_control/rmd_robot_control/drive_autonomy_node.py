@@ -433,19 +433,19 @@ class DriveAutonomyNode(Node):
             return None
         self.t_wait = 0.0
         self.react.set_pitch(self.map.pitch_u)
+        # ⚠ 횡 레인은 **V 피치**를 쓴다 — 전진 스텝의 U 피치와 다른 값이다
+        #   (실측 X232/Y215). 예전에는 U 만 넘겨서 횡이 엉뚱한 축을 봤다.
+        self.react.set_pitch_v(self.map.pitch_v)
         # ⚠ 부호 규약: **+ 가 좌측 횡이동** (0x143=+1 / 0x144=-1, 2026-09-08
         #   실물 검증). 여기서 뒤집히면 **반대쪽으로 비켜 데크 밖으로 간다.**
         # ⚠ 측면 판정이 없으면 **닫힌 것으로 본다.** 전진과 반대 규칙이다 —
         #   전진은 모른다고 막으면 그 자리에 갇히지만, 횡은 모른 채 비키면
         #   떨어진다. 모르면 고리가 완료로 끝나는 편이 안전하다.
-        # 레인 간격은 **아직 안 묶은 줄의 V 좌표**로 정한다 (고정량이 아니다).
-        #   고정 300mm 는 위상이 레인마다 85mm 밀려 **모든 피치에서 한 줄을
-        #   빠뜨렸다** (2026-11-06 측정). 자세한 근거는 `reactive.lane_turns`.
-        #   빈 리스트면 그쪽을 아직 못 본 것이고, 그때는 고정 폭으로 탐색한다.
-        rows_v = [c.v for c in self.map.pending()]
+        # 레인 간격은 **V 피치의 정수배 + 겹침 하한**이다. 근거는
+        #   `reactive.lane_turns` — 고정량은 줄을 빠뜨리고, 실측 줄 위치는
+        #   "검출 안 됨"을 "없음"으로 믿어 더 위험했다 (2026-11-06 측정).
         d = self.react.decide(go_mm, blocked, self._side_open(),
-                              max_lanes=self.max_lanes,
-                              rows_v=rows_v, rv=self.map.rv)
+                              max_lanes=self.max_lanes)
         if d['kind'] == rx.DONE:
             self.get_logger().info(f"반응형 종료 — {d['why']}")
             return None

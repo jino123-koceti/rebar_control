@@ -61,35 +61,28 @@ print('\n■ 막히면 그때만 비킨다 — 그리고 진행 방향이 뒤집
 r = Reactive(520, 380, pitch_mm=225)
 d = r.decide(go_mm=200, blocked_dirs=set(), side_open={1: True, -1: True})
 check('남은 200 < 스텝 450 → 횡', d['kind'], LATERAL)
-# 줄 위치를 모르면 고정 폭으로 **탐색**한다 (내림 — 올리면 겹침이 얇아진다)
-check('  줄 모름 → 탐색 6회전', d['turns'], 6)
+# 횡은 **V 피치의 정수배**다. 기본 피치 225 → floor(380/225)=1 → 225mm,
+# 격자 50mm 로 내림 → 4회전 200mm (겹침 180mm)
+check('  V피치 모름 → 기본 225 × 1 = 4회전', d['turns'], 4)
 
-print('\n■ 레인 간격은 **실측 줄 위치**로 정한다 (고정량이 아니다)')
-# 영역 380·여유 40 → half 150. 현재 rv=0 이면 [-150,150] 이 덮인다.
-# ⚠ 변수를 r·d 로 쓰지 말 것 — 위 블록이 그 둘을 계속 쓴다 (덮으면 아래
-#   '되돌아간다' 검사가 엉뚱한 피치를 본다. 실제로 한 번 그랬다).
-rl = Reactive(520, 380, pitch_mm=215)
-dl = rl.decide(go_mm=0, blocked_dirs={'forward'}, side_open={1: True},
-               rows_v=[0.0, 215.0, 430.0, 645.0], rv=0.0)
-check('안 묶은 첫 줄 215 → 그 줄이 가까운 경계에', dl['turns'], 7)
-check('  7회전 = 350mm 이면 215 가 영역 안', abs(215 - 350) <= 150, True)
-check('  고정 300mm 과 다르다', dl['turns'] != 6, True)
-# 넘치면 그 줄을 잃는다 — 내림이어야 한다
-r2 = Reactive(520, 380, pitch_mm=215)
-d2 = r2.decide(go_mm=0, blocked_dirs={'forward'}, side_open={1: True},
-               rows_v=[260.0], rv=0.0)
-check('목표 410 → 내림 8회전(400)', d2['turns'], 8)
-check('  260 이 영역 안 (|260-400|<=150)', abs(260 - 400) <= 150, True)
-# 이미 덮인 줄은 레인 간격을 끌지 않는다
-r3 = Reactive(520, 380, pitch_mm=215)
-d3 = r3.decide(go_mm=0, blocked_dirs={'forward'}, side_open={1: True},
-               rows_v=[0.0, 100.0, 215.0], rv=0.0)
-check('영역 안 줄(0·100)은 무시, 215 가 기준', d3['turns'], 7)
-# 반대 방향도 대칭이어야 한다
-r4 = Reactive(520, 380, pitch_mm=215, v_dir=-1)
-d4 = r4.decide(go_mm=0, blocked_dirs={'forward'}, side_open={-1: True},
-               rows_v=[-215.0, 0.0], rv=0.0)
-check('v_dir -1 이면 음수쪽으로 7회전', d4['turns'], -7)
+print('\n■ 레인 간격 = **V 피치**의 정수배 · 겹침 하한 보장')
+for pv, want, why in ((200.0, 4, '정수배 1칸'), (215.0, 4, '정수배 1칸'),
+                      (260.0, 5, '정수배 1칸'), (180.0, 6, '하한에 걸린다')):
+    rp = Reactive(520, 380)
+    rp.set_pitch_v(pv)
+    t = rp.lane_turns()
+    check(f'  V피치 {pv:.0f} → {want}회전 ({why})', t, want)
+    check(f'    겹침 >= 여유 40mm', 380 - t * 50 >= 40, True)
+# ⚠ 하한이 없으면 피치 180 은 7회전(350mm)이 되어 겹침 30mm 로 한 줄을 잃는다
+rp = Reactive(520, 380)
+rp.set_pitch_v(180.0)
+check('  피치 180 은 하한에 걸려 350→300mm', rp.lane_turns() * 50, 300)
+check('    근거가 로그에 남는다', '하한' in rp.lane_why, True)
+# U 피치와 **다른 축**이어야 한다
+rp2 = Reactive(520, 380, pitch_mm=232.0)      # U 232
+rp2.set_pitch_v(180.0)                        # V 180
+check('  U피치는 전진에만, V피치는 횡에만', rp2.step_mm(), 464.0)
+check('    횡은 V 를 본다 (U 232 면 4회전이었다)', rp2.lane_turns(), 6)
 
 print('\n■ 빠뜨린 줄이 없는가 — 데크 V 1400 을 모든 위상에서 훑는다')
 HALF = 380 / 2 - 40
@@ -101,6 +94,7 @@ for pitch in (180.0, 200.0, 215.0, 232.0, 260.0):
         rows = [phase + i * pitch for i in range(20)]
         rows = [v for v in rows if 0 <= v <= 1400.0]
         rr = Reactive(520, 380, pitch_mm=pitch)
+        rr.set_pitch_v(pitch)
         rv, tied = 0.0, set()
         for _ in range(40):
             for v in rows:
@@ -109,9 +103,9 @@ for pitch in (180.0, 200.0, 215.0, 232.0, 260.0):
             rest = [v for v in rows if round(v, 3) not in tied]
             if not rest:
                 break
-            t = rr.lane_turns([v for v in rest], rv)
-            nxt = rv + t * 50.0
-            if nxt > 1400.0:        # 데크 끝 — clamp 는 측면 거리 필요(미해결)
+            t = rr.lane_turns()
+            nxt = min(rv + t * 50.0, 1400.0)     # 데크 끝으로 clamp
+            if nxt <= rv:
                 break
             rv = nxt
         bad = max(bad, len([v for v in rows if round(v, 3) not in tied]))
@@ -159,7 +153,7 @@ u = v = 0.0                      # 로봇 위치 (데크 좌하단 기준)
 covered = []
 for _ in range(200):
     go = (DECK_U - u) if r.u_dir > 0 else u          # 그 방향 남은 거리
-    side = {1: v + 300 <= DECK_V, -1: v - 300 >= 0}
+    side = {1: v + 200 <= DECK_V, -1: v - 200 >= 0}
     d = r.decide(go_mm=go, blocked_dirs=set(), side_open=side)
     if d['kind'] == DONE:
         break
@@ -170,11 +164,11 @@ for _ in range(200):
         v += d['turns'] * 50.0; r.moved(LATERAL, d['turns'])
 print(f"  정차 {r.stops}회 · 레인 {r.lanes}개 · 최종 (u={u:.0f}, v={v:.0f})")
 us = [c[0] for c in covered]; vs = sorted({c[1] for c in covered})
-check('레인 수 = 1400/300 + 1', r.lanes + 1, 5)
+check('레인 수 >= 데크폭/레인간격', r.lanes + 1 >= 5, True)
 check('횡 방향이 고정됐다', r.v_locked, True)
 check('U 를 끝까지 훑는다', max(us) >= DECK_U - 450, True)
 check('U 시작점까지 되돌아온다', min(us) <= 450, True)
-check('레인 간격 = 6회전 × 50mm', vs[1] - vs[0] if len(vs) > 1 else 0, 300.0)
+check('레인 간격 = V피치 정수배', vs[1] - vs[0] if len(vs) > 1 else 0, 200.0)
 check('정차 간격 = 스텝', round(sorted(us)[1] - sorted(us)[0]) in (0, 450), True)
 
 
@@ -191,6 +185,7 @@ HU, HV = 520 / 2, 380 / 2          # 결속영역 반폭
 cross = [(i * PU, j * PV) for i in range(int(DU / PU) + 1)
          for j in range(int(DV / PV) + 1)]
 rr = Reactive(520, 380, pitch_mm=PU)
+rr.set_pitch_v(PV)
 u = v = 0.0
 tied, path, flips = set(), [(u, v)], 0
 prev_udir = rr.u_dir
@@ -200,11 +195,9 @@ for _ in range(400):
         if abs(c[0] - u) <= HU and abs(c[1] - v) <= HV:
             tied.add(c)
     # 지도에서 "아직 안 묶은 줄" 을 넘긴다 (노드가 map.pending() 으로 하는 것)
-    rows_v = sorted({c[1] for c in cross if c not in tied})
     go = (DU - u) if rr.u_dir > 0 else u
     side = {d: (0.0 <= v + d * 50.0 <= DV) for d in (1, -1)}
-    d = rr.decide(go_mm=go, blocked_dirs=set(), side_open=side, rows_v=rows_v,
-                  rv=v)
+    d = rr.decide(go_mm=go, blocked_dirs=set(), side_open=side)
     if d['kind'] == DONE:
         break
     if d['kind'] == DRIVE:

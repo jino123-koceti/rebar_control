@@ -66,7 +66,8 @@ class Reactive:
         self.reach_u = float(reach_u_mm)
         self.reach_v = float(reach_v_mm)
         self.lat_mm = float(lat_mm_per_turn)
-        self.pitch = pitch_mm
+        self.pitch = pitch_mm          # U — 전진 스텝용
+        self.pitch_v = None            # V — 횡 레인용. **다른 값이다**
         self.u_dir = 1 if u_dir >= 0 else -1
         self.v_dir = 1 if v_dir >= 0 else -1
         # 레인을 **겹쳐서** 옮긴다. 딱 맞게 옮기면 주행 오차(2.2% 실측)와
@@ -94,79 +95,72 @@ class Reactive:
             return True
         return False
 
+    def set_pitch_v(self, pitch_mm):
+        """**횡 방향** 피치. 전진 스텝의 U 피치와 다르다 (실측 X232/Y215)."""
+        if pitch_mm and MIN_PITCH_MM <= float(pitch_mm) <= MAX_PITCH_MM:
+            self.pitch_v = float(pitch_mm)
+            return True
+        return False
+
     def step_mm(self):
         return step_for(self.pitch, self.reach_u)
 
-    def lane_turns(self, rows_v=None, rv=0.0):
-        """다음 레인까지의 횡 회전수. **실측 줄 위치로 매번 다시 잰다.**
+    def lane_turns(self):
+        """다음 레인까지의 횡 회전수 — **V 피치의 정수배**, 겹침 하한 보장.
 
-        ## 왜 고정량을 버렸나 (2026-11-06 측정)
+        ## 왜 피치 기반인가 (2026-11-06, 두 번 뒤집힌 끝에)
 
-        고정 300mm 는 **모든 피치에서 한 줄을 빠뜨렸다.** 겹침이 모자란 게
-        아니라 **위상이 밀리는** 것이 원인이다 — 피치 215 에 300mm 를 옮기면
-        레인마다 85mm 밀리고, 몇 레인 뒤 한 줄이 영역 경계에 올라탄다. 그러면
-        그 줄을 빠뜨리거나, 이미 묶은 자리를 또 묶는다.
+        ① 처음엔 고정 겹침 15% 였다. 측정하니 **모든 피치에서 한 줄을
+           빠뜨렸다** — 위상이 레인마다 밀려 결국 한 줄이 경계에 올라탄다.
+        ② 그래서 **실측 줄 위치**로 바꿨다. 검출이 완벽하면 0 빠뜨림이었다.
+           그런데 그 방식은 **"검출된 줄이 없다"를 "줄이 없다"로 믿는다.**
+           검출은 이 시스템에서 가장 못 믿을 부분이다 — 한 줄이 아예 안
+           잡히면 **건너뛰고 지나가고, `v_locked` 탓에 되돌아오지도 않는다.**
+           지도 기반을 버린 이유(없는 걸 지어낸다)의 **거울상**이다.
+        ③ 그래서 피치 기반으로 돌아왔다. 피치 정수배가 깨지던 유일한 경우
+           (피치 180: 2×180=360 을 50 격자로 못 가 350mm, 겹침 30mm)는
+           **겹침 하한**으로 막는다.
 
-        "피치의 정수배" 도 같은 병을 앓는다 — 횡은 50mm 양자화라 피치 180 의
-        정수배 360mm 를 못 가고 350mm 로 가서, 레인마다 10mm 가 **누적**된다.
+        측정 (데크 V 1400, 전 위상, 데크끝 clamp 포함):
 
-        그래서 피치를 **아예 쓰지 않는다.** 검출된 줄 위치를 직접 보고 매
-        레인 다시 계산하면 양자화 오차가 누적되지 않는다.
+            검출 완벽   피치기반+하한 **0 빠뜨림**  / 줄기반 0
+            검출 85%    피치기반 3~4            / 줄기반 3~**4**
+            검출 70%    피치기반 **3~5**         / 줄기반 **5**
 
-            다음 레인 중심 = (아직 안 묶은 첫 줄) + 진행방향 × (영역폭/2 - 여유)
-            회전수        = floor(그 거리 / 50mm)
+        피치 기반이 **한 번도 더 나쁘지 않고** 피치 260 에서는 25 vs 28회전으로
+        더 싸다. 누적 오차를 안고 가도 이쪽이 맞다.
 
-        ⚠ **내림이다.** 목표를 넘치면 그 줄이 영역 **밖으로** 빠져 다시 잃는다.
-          내림이어도 모자랄 일은 없다 — 그 줄이 안 덮였다는 것이
-          `|v-rv| > half` 이므로 이동량이 항상 `2*half`(300mm)를 넘고,
-          따라서 최소 6회전이다 (찔끔거리지 않는다).
-
-        측정 (데크 V 1400, 영역 380, 여유 40, 모든 위상에 대한 최악):
-            고정 300mm        1줄 빠뜨림 · 24회전
-            피치 정수배        1줄 빠뜨림(피치 180) · 25~28회전
-            **실측 줄 기반**   **0줄** · 27~28회전   ← +4회전(29초)에 미결속 0
-
-        rows_v 가 비면(아직 그쪽을 못 봤다) 고정 폭으로 **탐색**한다. 반응형은
-        지도를 산출물로 보므로 "안 보이는 곳 = 없는 곳" 이 아니다.
+        ⚠ **V 피치를 쓴다.** 전진 스텝의 U 피치와 다른 값이다 (실측 X232/Y215).
+          `set_pitch_v()` 로 따로 받는다 — 예전에는 U 피치만 넘어왔다.
 
         ⚠ 미해결 — 데크 끝의 **마지막 줄**은 이동량을 데크 끝으로 clamp 해야
           덮이는데, 측면 305 는 `rebar_frac` 불린만 주고 **남은 mm 를 모른다**.
           측면에 `corridor` 를 붙이면 완결된다 (전후방이 쓰는 그 코드다).
         """
-        half = self.reach_v / 2.0 - self.lane_margin
-        d = self.v_dir
-        ahead = [float(v) for v in (rows_v or ())
-                 if (float(v) - rv) * d > half]
-        if ahead:
-            v1 = min(ahead, key=lambda v: (v - rv) * d)
-            want = v1 + d * half                 # 그 줄이 **가까운 쪽** 경계에
-            t = int(math.floor(abs(want - rv) / self.lat_mm))
-            if t >= 1:
-                # ⚠ 근거를 남긴다. 실측 기반 값이 우연히 옛 고정값(350mm)과
-                #   같을 수 있어서, 로그만 보면 폴백과 구분이 안 된다.
-                self.lane_why = f'줄 V={v1:.0f} 기준 (안 묶은 첫 줄)'
-                return t
-        n = len(rows_v or ())
-        self.lane_why = ('줄 모름 → 탐색 폭' if not n
-                         else f'앞쪽에 안 묶은 줄 없음({n}개는 영역 안) → 탐색 폭')
-        return self._lane_turns_fixed()
+        pv = float(self.pitch_v or DEFAULT_PITCH_MM)
+        if not (MIN_PITCH_MM <= pv <= MAX_PITCH_MM):
+            pv = DEFAULT_PITCH_MM
+        k = max(1, int(self.reach_v // pv))
+        t = max(1, int(math.floor(k * pv / self.lat_mm)))
+        # 겹침 하한 — 없으면 피치 180 에서 겹침이 30mm 로 얇아져 한 줄을 잃는다
+        cap = max(1, int(math.floor((self.reach_v - self.lane_margin)
+                                    / self.lat_mm)))
+        if t > cap:
+            self.lane_why = (f'V피치 {pv:.0f}×{k} = {k * pv:.0f}mm → '
+                             f'겹침 하한으로 {cap * self.lat_mm:.0f}mm')
+            return cap
+        self.lane_why = f'V피치 {pv:.0f}mm × {k}'
+        return t
 
-    def _lane_turns_fixed(self):
-        """줄 위치를 모를 때의 탐색 폭. 내림 — 올리면 겹침이 의도보다 얇아진다."""
-        need = self.reach_v * (1.0 - self.lane_overlap)
-        return max(1, int(math.floor(need / self.lat_mm)))
 
     # ---- 결정 ----------------------------------------------------------
-    def decide(self, go_mm, blocked_dirs, side_open, max_lanes=None,
-               rows_v=None, rv=0.0):
+    def decide(self, go_mm, blocked_dirs, side_open, max_lanes=None):
         """다음 행동. 센서 값만 받는다.
 
         go_mm        전진 가능 거리 (deck_edge). None = 이 판정으로는 제한 없음
         blocked_dirs 차단된 방향 집합 — 'forward' / 'backward'
         side_open    {'+1': bool, '-1': bool} 그쪽 횡으로 갈 수 있나 (측면 카메라)
         max_lanes    레인 상한 (시험용). None 이면 무제한
-        rows_v       **아직 안 묶은** 줄의 V 좌표 (작업 좌표). 레인 간격의 근거
-        rv           지금 횡 위치 (작업 좌표)
 
         반환 {'kind': ..., 'mm'|'turns': ..., 'why': ...}
         """
@@ -193,7 +187,7 @@ class Reactive:
                 self.v_tried.add(d)
                 continue
             self.v_dir = d
-            t = self.lane_turns(rows_v, rv)
+            t = self.lane_turns()
             return {'kind': LATERAL, 'turns': d * t,
                     'why': f'{why} · {self.lane_why}'}
         if self.v_locked:
@@ -218,7 +212,7 @@ class Reactive:
 
     def snapshot(self):
         return {'u_dir': self.u_dir, 'v_dir': self.v_dir, 'v_locked': self.v_locked,
-                'pitch_mm': self.pitch,
+                'pitch_mm': self.pitch, 'pitch_v_mm': self.pitch_v,
                 'step_mm': round(self.step_mm()), 'lane_turns': self.lane_turns(),
                 'lane_why': self.lane_why,
                 'stops': self.stops, 'lanes': self.lanes,
