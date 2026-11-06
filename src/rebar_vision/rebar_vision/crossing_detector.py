@@ -96,6 +96,20 @@ class CrossingDetector(Node):
         #   근거 그림: docs/design/figures/layer_roi_split.png 등
         self.declare_parameter('layer_ratio_min', 0.35)
         self.declare_parameter('layer_radius_px', 50)
+        # ⚠⚠ [2026-11-06] **1단 배근 구간에서는 층 필터를 건너뛴다.**
+        #   테스트베드가 1단·2단 **혼재**라 전역으로 끌 수도, 켤 수도 없다.
+        #   끄면 2단 구간에서 허위 교차점에 건을 내리고, 켜면 1단 구간에서
+        #   검출이 전멸한다 (실측: 8개 전부 탈락, 비율 0.000~0.313).
+        #   가르는 근거는 **띠 개수**다. `_bands` 가 12mm 보다 좁은 틈은 같은
+        #   층으로 묶으므로, 상·하부근(70~75mm 간격)은 확실히 두 띠로 갈린다:
+        #       1단  층 중심 [160, 0]mm   → 철근 띠 1개 + 데크
+        #       2단  층 중심 [160, 88, 0] → 철근 띠 2개 + 데크
+        #   철근 띠가 하나뿐이면 **가를 층이 없다** → 필터를 건너뛴다.
+        #   ⚠ 2단인데 하부근이 가려져 안 보이면 1단으로 오인한다. 그때는
+        #     허위 교차점이 통과하므로, 의심되면 false 로 끈다.
+        self.declare_parameter('single_layer_pass', True)
+        # 데크 평면에서 이 높이 이상인 띠만 '철근 띠'로 센다 (데크 자체 제외)
+        self.declare_parameter('layer_floor_mm', 50.0)
         # ⚠⚠ [2026-10-17] 3 → **1**. 이름과 달리 **프레임을 모으는 게 아니라
         #   같은 RGB 한 장에 추론을 N 번 반복**한다 (아래 detect 참고).
         #   RF-DETR 은 결정론적이라 결과가 거의 같다 — 흔들림을 못 줄인다.
@@ -426,6 +440,20 @@ class CrossingDetector(Node):
         sx, sy = scale
         Kd = (fx / sx, fy / sy, cx / sx, cy / sy)
         rank, info = rank_map(np.asarray(dimg, dtype=np.float32), Kd)
+
+        # 1단 구간인가 — 철근 띠가 하나뿐이면 가를 층이 없다
+        floor_mm = float(self.get_parameter('layer_floor_mm').value)
+        heights = sorted((-c for c in info['centers']), reverse=True)
+        rebar_bands = [h for h in heights if h >= floor_mm]
+        if (bool(self.get_parameter('single_layer_pass').value)
+                and len(rebar_bands) < 2):
+            self.get_logger().info(
+                f"1단 배근 구간 — 층 필터 건너뜀 "
+                f"(철근 띠 {len(rebar_bands)}개, 층 중심 "
+                f"{[round(h) for h in heights]}mm)",
+                throttle_duration_sec=10.0)
+            return dets
+
         up = pick_rank(info, 120, 300, 'high')
         if up is None:
             self.get_logger().warning(
