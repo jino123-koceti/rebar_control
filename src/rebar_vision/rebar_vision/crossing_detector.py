@@ -404,6 +404,15 @@ class CrossingDetector(Node):
 
         ⚠ **조용히 버리지 않는다** — 몇 개를 어떤 비율로 버렸는지 남긴다.
         """
+        # ⚠⚠ [2026-11-06] **매번 다시 읽는다** (`debug_png` 와 같은 이유).
+        #   층 필터는 **2단 배근 전용**이다. 하부근이 없는 1단 배근에서는
+        #   가를 층이 없는데도 "상부근 띠에 35% 이상" 을 요구해 **검출을
+        #   전멸시킨다** — 실측 비율 0.000~0.304 로 8개 전부 탈락했다.
+        #   배근 방식은 현장에서 바뀌는데 기동 시 한 번만 읽으면 서비스를
+        #   재시작해야 하고, 그러면 **호밍이 날아간다.** 그래서 런타임 값이다:
+        #       ros2 param set /crossing_detector layer_ratio_min 0.0   # 1단
+        #       ros2 param set /crossing_detector layer_ratio_min 0.35  # 2단
+        self.layer_min = float(self.get_parameter('layer_ratio_min').value)
         if self.layer_min <= 0 or not dets or self.K is None:
             return dets
         try:
