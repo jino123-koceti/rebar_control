@@ -219,6 +219,23 @@ class StageNode(Node):
         #   실측: 감지 1.22초/1.73A → **0.98초/0.96A**.
         #   창 0.54 → 0.34초, 60mm/s 에서 깊이 32 → 20mm
         #   (아침 설정 1.7초 × 40.8mm/s = 69mm 의 3.5분의 1).
+        # ⚠⚠ [2026-11-06] **속도 결손 감지** — 전류보다 빠르다.
+        #   사용자 제안: "z속도를 알고 있으니 엔코더 피드백하면서 속도 대비
+        #   더디거나 정체되는 곳을 충격으로 인지하도록".
+        #   전류는 힘이 **쌓여야** 보이지만 위치는 접촉하는 **순간** 어긋난다.
+        #   실측: 전류 경로는 접촉 후 약 0.3초 걸렸고, 그 사이 60mm/s 로
+        #   17mm 를 밀고 들어간 뒤 감속에 12mm 를 더 썼다 — 스테이지가 휘고
+        #   장비가 들리는 게 눈에 보일 정도였다.
+        #   위치 발행을 40Hz 로 올렸으므로(0x92 응답마다 발행) 2~3표본
+        #   = 0.05~0.08초에 판정할 수 있다.
+        self.declare_parameter('stall_detect', True)
+        # 명령 속도 대비 이 비율 **아래**면 정체로 본다
+        self.declare_parameter('stall_ratio', 0.35)
+        # 연속 표본 수 (40Hz 기준 3 = 0.075초)
+        self.declare_parameter('stall_samples', 3)
+        # ⚠ 목표 근처에서는 **정상적으로 감속**하므로 판정하지 않는다.
+        #   감속 거리 v²/(2a) 에 여유를 곱해 그 안쪽은 건너뛴다.
+        self.declare_parameter('stall_decel_margin', 2.0)
         self.declare_parameter('collide_grace_sec', 0.2)
         self.declare_parameter('tolerance_mm', 1.0)
         self.declare_parameter('move_timeout_sec', 30.0)
@@ -339,6 +356,12 @@ class StageNode(Node):
         self.rise_cnt = {}         # 축 → 상승분 초과 연속 횟수
         self._base_t = {}          # 축 → 기준선 갱신 시각
         self.hit_back = float(g('collide_backoff_mm').value)
+        self.stall_on = bool(g('stall_detect').value)
+        self.stall_ratio = float(g('stall_ratio').value)
+        self.stall_n = int(g('stall_samples').value)
+        self.stall_margin = float(g('stall_decel_margin').value)
+        self._stall_cnt = {}
+        self._stall_last = {}      # 축 → (시각, mm)
         self.hit_grace = float(g('collide_grace_sec').value)
         self.cur_a = {}            # 축 → 최근 전류(A). 표본이 없으면 키가 없다
         self.hit_cnt = {}          # 축 → 문턱 초과 연속 횟수
@@ -1277,6 +1300,86 @@ class StageNode(Node):
             return True
         return False
 
+    def _stalled_armed(self, name, err):
+        """`_stalled` 를 **유예를 지난 뒤에만** 부른다 (가속 구간은 원래 느리다)."""
+        t_mv = self._arm_t.get(name, 0.0)
+        if self.brake_rel.get(name):
+            t_start = max(t_mv, self._brake_ok_t.get(name, 0.0))
+        else:
+            t_start = t_mv + self.arm_sec
+        if time.time() - t_start < self.hit_grace:
+            self._stall_cnt[name] = 0
+            self._stall_last.pop(name, None)
+            return False
+        return self._stalled(name, err)
+
+    def _stalled(self, name, err):
+        """명령 속도 대비 **실제로 못 가고 있는가.** 전류보다 먼저 안다.
+
+        전류는 접촉 힘이 **쌓여야** 문턱을 넘지만, 위치는 접촉하는 **순간**부터
+        명령과 어긋난다. 그래서 하강 중 배근 충돌을 훨씬 빨리 잡는다
+        (실측: 전류 경로 약 0.3초 → 여기 0.05~0.08초).
+
+        ⚠ 목표 근처에서는 **정상적으로 감속**한다. 그걸 정체로 보면 매 이동이
+          충돌로 끝난다. 감속 거리 `v²/(2a)` 에 여유를 곱한 안쪽은 건너뛴다.
+        ⚠ 가속 구간도 느리다 — `_hit` 과 같은 유예(움직이기 시작한 시점부터)를
+          쓴다. 호출부에서 유예를 통과한 뒤에만 부른다.
+        ⚠ 표본이 비거나 시간 간격이 이상하면 **판정하지 않는다** (없는 것을
+          0 으로 보면 보호가 조용히 꺼지는 것과 같다).
+        """
+        if not self.stall_on or self.retreating is not None:
+            return False
+        if name not in self.hit_axes:
+            return False
+        if name in self.down_only and err is not None and err > 0:
+            self._stall_cnt[name] = 0
+            self._stall_last.pop(name, None)
+            return False
+        cur = self.mm_of(name)
+        if cur is None:
+            return False
+        now = time.time()
+        prev = self._stall_last.get(name)
+        self._stall_last[name] = (now, cur)
+        if prev is None:
+            return False
+        dt = now - prev[0]
+        if dt <= 1e-3 or dt > 0.5:        # 표본이 너무 붙거나 끊겼다
+            self._stall_cnt[name] = 0
+            return False
+
+        v_cmd = self._speed_for(name) * abs(self.ax[name]['mm_per_deg'] or 0.0)
+        if v_cmd <= 1e-3:
+            return False
+        # 목표까지 남은 거리가 감속 구간 안이면 느린 것이 정상이다
+        a = self._accel_mm_s2(name)
+        if a > 0 and err is not None:
+            if abs(err) <= self.stall_margin * v_cmd * v_cmd / (2.0 * a):
+                self._stall_cnt[name] = 0
+                return False
+        v_act = abs(cur - prev[1]) / dt
+        if v_act < self.stall_ratio * v_cmd:
+            self._stall_cnt[name] = self._stall_cnt.get(name, 0) + 1
+            if self._stall_cnt[name] >= self.stall_n:
+                self.hit_why = (f'정체 {v_act:.0f}/{v_cmd:.0f}mm/s '
+                                f'({v_act / v_cmd * 100:.0f}%, {self.stall_n}표본)')
+                return True
+        else:
+            self._stall_cnt[name] = 0
+        return False
+
+    def _accel_mm_s2(self, name):
+        """그 축의 **출력축** 가속 [mm/s²]. 설정은 모터축이라 감속비로 나눈다."""
+        try:
+            v = float(self.get_parameter(f'accel_dpss_{name}').value)
+        except Exception:
+            return 0.0
+        gear = float((self.ax.get(name) or {}).get('gear') or 0.0)
+        mmpd = abs(float((self.ax.get(name) or {}).get('mm_per_deg') or 0.0))
+        if v <= 0 or gear <= 0 or mmpd <= 0:
+            return 0.0
+        return v / gear * mmpd
+
     def _rise_limit(self, name):
         """그 축의 상승분 문턱(A). 축별 값이 0 이면 공통값을 쓴다."""
         return self.rise_ax.get(name) or self.rise_a
@@ -1498,7 +1601,10 @@ class StageNode(Node):
                 self.get_logger().warning(f"{name}: 안전 차단으로 그 방향 이동 불가")
                 done.append(name)
                 continue
-            if self._hit(name, err):
+            # ⚠ 전류와 **정체** 둘 중 먼저 걸리는 쪽으로 멈춘다. 성격이 달라
+            #   서로를 받쳐 준다 — 전류는 느린 접촉에 둔감하고, 정체는 힘이
+            #   약해도 "못 간다"를 즉시 본다.
+            if self._hit(name, err) or self._stalled_armed(name, err):
                 return self._retreat(name, err)
             self.pos_pubs[name].publish(
                 Float64MultiArray(data=[goal_deg, self._speed_for(name)]))

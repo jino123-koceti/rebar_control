@@ -506,7 +506,17 @@ class PositionControlNode(Node):
                               self._accel_once.cancel()))
         self.status_timer = self.create_timer(0.1, self.publish_status)  # 10Hz
         # self.motor_status_timer = self.create_timer(0.1, self.read_motor_status)  # 비활성화 (CAN 부하 감소)
-        self.position_control_timer = self.create_timer(0.1, self.position_control_loop)  # 10Hz로 변경 (과부하 방지)
+        # ⚠⚠ [2026-11-06] 10Hz → **파라미터**(기본 50Hz). 위치 피드백이
+        #   느리면 **충돌을 늦게 안다** — 하강 중 배근에 부딪혔을 때
+        #   '명령은 내려가는데 실제로 안 내려간다'를 10Hz(표본당 0.1초,
+        #   60mm/s 에서 6mm)로는 두세 표본을 봐야 확신한다.
+        #   '과부하 방지'로 10Hz 였는데, 폴링은 **`is_moving` 인 모터만**
+        #   한다. 0x92 1회가 요청+응답 약 220bit 이므로 50Hz 에서
+        #   한 축 11 kbit/s · 8축 전부라도 88 kbit/s — CAN 1Mbps 의 8.8% 다.
+        self.declare_parameter('position_poll_hz', 50.0)
+        self._poll_hz = max(1.0, float(self.get_parameter('position_poll_hz').value))
+        self.position_control_timer = self.create_timer(
+            1.0 / self._poll_hz, self.position_control_loop)
         # cmd_vel 끊김 감시 (10Hz) 와 보호 래치 해제 구동 (2Hz)
         self.drive_watchdog_timer = self.create_timer(0.1, self.drive_watchdog_tick)
         self.joint_watchdog_timer = self.create_timer(0.05, self.joint_watchdog_tick)
@@ -1166,7 +1176,10 @@ class PositionControlNode(Node):
         # 이동 중인 모터들의 위치를 읽기 위해 0x92 명령 전송
         # 단, 위치 읽기 주기를 제한하여 과부하 방지 (50Hz -> 10Hz, 100ms 간격)
         multi_turn_cmd = self.protocol.create_system_command(CommandType.READ_MULTI_TURN_ANGLE)
-        position_read_interval = 0.1  # 100ms 간격 (10Hz)
+        # 타이머와 같은 주기를 쓴다. 예전에는 둘 다 0.1 로 **이중 제한**이라
+        #   타이머만 올려도 효과가 없었다. 2% 빼서 경계에서 한 틱씩
+        #   건너뛰지 않게 한다.
+        position_read_interval = 0.98 / self._poll_hz
 
         # 위치 제어 모터들 위치 읽기 (모든 motor_ids: 0x141~0x147)
         # 0x141, 0x142도 이제 motor_ids에 포함되어 있음
@@ -2001,9 +2014,19 @@ class PositionControlNode(Node):
                     self.motor_states[motor_id]['position'] = float(angle_degrees)
                     self.current_positions[motor_id] = float(angle_degrees)
 
-                    # 0x141, 0x142 위치 정보 발행 (S20 모드용)
-                    if motor_id in [self.left_motor_id, self.right_motor_id]:
-                        if motor_id in self.motor_position_publishers:
+                    # ⚠⚠ [2026-11-06] **응답이 올 때마다 발행한다 (전 축).**
+                    #   예전에는 주행모터(0x141/0x142)만 여기서 발행하고 상부축은
+                    #   `publish_status` 의 **10Hz 타이머로만** 나갔다. 그래서
+                    #   `position_poll_hz` 를 50 으로 올려도 토픽은 10Hz 에 머물렀고,
+                    #   `stage_node` 가 보는 위치도 10Hz 였다 (표본당 0.1초 =
+                    #   60mm/s 에서 6mm).
+                    #   하강 중 배근 충돌을 **"안 내려간다"로 즉시 잡으려면**
+                    #   위치가 폴링만큼 빨라야 한다 — 전류는 힘이 쌓여야 보이지만
+                    #   위치는 접촉하는 순간부터 어긋난다.
+                    #   사용자: "배근 충돌시 스테이지가 휘고 장비가 들리는 게
+                    #   눈으로 확인될 정도" (2026-11-06).
+                    if motor_id in self.motor_position_publishers:
+                        if True:
                             try:
                                 position_msg = Float32()
                                 position_msg.data = float(angle_degrees)

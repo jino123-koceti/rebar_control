@@ -723,6 +723,10 @@ def load_stage_axes(names=('x', 'y', 'z')):
             joint=int(joint.split('_')[-1]) if '_' in joint else None,
             motor=f"0x{int(cid):03x}" if cid is not None else None,
             mm_per_deg=cfg.get('mm_per_deg'),
+            # ⚠ 감속비. 가감속 설정은 **모터축 기준**이라 출력축으로 쓰려면
+            #   이 값으로 나눠야 한다 (X 만 X4-36/36, Y·Z·yaw 는 X4-10/12.5).
+            #   `stage_node._accel_mm_s2` 가 정체 감지의 감속 구간 계산에 쓴다.
+            gear=float(cfg.get('gear') or (_stage() or {}).get('gear') or 0.0),
             home_dir=int(cfg.get('home_dir', 1)),
             brake=bool(cfg.get('brake', False)),
             gravity=bool(cfg.get('gravity_load', False)),
