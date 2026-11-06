@@ -208,7 +208,14 @@ class StageNode(Node):
         self.declare_parameter('collide_axes', 'z')
         self.declare_parameter('collide_backoff_mm', 15.0)
         # 기동 직후에는 가속 전류가 뜬다 — 그 구간은 보지 않는다
-        self.declare_parameter('collide_grace_sec', 0.7)
+        # ⚠⚠ [2026-11-06 실측] 0.7 → **0.4**. 기동 과도가 실제로 얼마나
+        #   가는지 재보니 **0.28초**면 끝난다 (브레이크 해제 0.141s →
+        #   피크 1.13A@0.148s → 0.8A 미만 0.275s). 0.7 은 근거 없는 값이었다.
+        #   `_hit` 이 이제 **움직이기 시작한 시점**부터 세므로 눈 감는 창이
+        #   1.70초 → **0.54초**(브레이크 0.14 + 0.4)가 된다.
+        #   Z 를 60mm/s 로 올렸으므로 그 창에 내려가는 깊이는 32mm —
+        #   예전 설정(1.7초 × 40.8mm/s = 69mm)의 절반 이하다.
+        self.declare_parameter('collide_grace_sec', 0.4)
         self.declare_parameter('tolerance_mm', 1.0)
         self.declare_parameter('move_timeout_sec', 30.0)
         # ⚠ **브레이크 해제 확인이 오면 바로 출발한다.** 이 값은 확인이 안 올 때의
@@ -261,7 +268,9 @@ class StageNode(Node):
         #   전류를 보며 단계적으로 — `tools/` 의 가속 시험 방식대로.
         self.declare_parameter('accel_dpss_x', 12000.0)
         self.declare_parameter('accel_dpss_y', 12000.0)
-        self.declare_parameter('accel_dpss_z', 12000.0)
+        # [2026-11-06] 12000 → 20000. 출력축 87 → **145 mm/s²**
+        #   (Z 는 X4-10 / 12.5:1). 전류 피크 1.08A, 정격 7.8A 대비 7배 여유.
+        self.declare_parameter('accel_dpss_z', 20000.0)
         self.declare_parameter('accel_dpss_yaw', 0.0)   # 가속에 둔감 — 손대지 않는다
         # 중재기에서 권한을 받기까지 기다리는 시간. ⚠ 0 이면 **요청 직후 50ms 에**
         # "권한 없음" 으로 판단해 중단한다 — 리모콘을 쓴 뒤에는 모드가 manual 로
