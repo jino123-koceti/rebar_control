@@ -290,6 +290,7 @@ class DriveAutonomyNode(Node):
             self.get_logger().info(f'[{state}] {why}')
         if state in (DONE, FAILED) and self.exit_done:
             self.get_logger().info('노드를 내린다 (exit_when_done)')
+            self.log.write_map(self.map.snapshot())   # 마지막 상태
             self.log.close()
             raise SystemExit(0 if state == DONE else 1)
 
@@ -629,6 +630,11 @@ class DriveAutonomyNode(Node):
             f'도착 (u={self.map.ru:.0f} v={self.map.rv:.0f}) — 다시 검출한다')
         c = self.map.counts()
         now = time.time()
+        # ⚠ 지도를 **정차마다** 덮어쓴다. CSV 는 개수만 남기므로 셀 좌표·
+        #   상태를 복원할 수 없고, estop/종료로 노드가 내려가면 메모리의
+        #   지도가 통째로 사라진다 — "지도는 주행의 산출물" 이 전제인데
+        #   산출물이 안 남으면 전제가 성립하지 않는다.
+        self.log.write_map(self.map.snapshot())
         self.log.stop(
             stop=self.stops, pose_u=round(self.map.ru, 1),
             pose_v=round(self.map.rv, 1),

@@ -25,6 +25,7 @@ CSV 를 쓰는 이유는 **아무 도구로나 열리기 때문**이다. 분석�
 """
 
 import csv
+import json
 import os
 import time
 
@@ -67,6 +68,8 @@ class RunLog:
         self.run = time.strftime('%Y%m%d_%H%M%S') + (f'_{tag}' if tag else '')
         self._f = {}
         self._w = {}
+        self._map_path = (os.path.join(directory, f'{self.run}_map.json')
+                          if directory else '')
         if not directory:
             return
         try:
@@ -99,6 +102,28 @@ class RunLog:
     def point(self, **fields):
         self._row('points', fields)
 
+    def write_map(self, snapshot):
+        """지도 **전체**를 덮어쓴다 — 중단돼도 마지막 상태가 남는다.
+
+        ⚠ 왜 매 정차마다 쓰나 — `coverage_map` 은 메모리에만 있고
+          `exit_when_done` 이나 estop 으로 노드가 내려가면 **통째로
+          사라진다.** "지도는 주행의 산출물" 이 반응형 설계의 전제인데
+          산출물이 남지 않으면 전제가 성립하지 않는다. CSV 는 정차별
+          **개수**만 남기므로 셀 좌표·상태를 복원할 수 없다.
+
+        ⚠ 임시파일 + `os.replace` 로 바꾼다. 쓰는 중에 죽어도 **이전 판이
+          멀쩡하게 남는다** — 덮어쓰기 중 중단이 가장 위험한 경우다.
+        """
+        if not self._map_path:
+            return
+        try:
+            tmp = self._map_path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(snapshot, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, self._map_path)
+        except (OSError, TypeError, ValueError):
+            pass            # 기록이 주행을 막지 않는다 (CSV 와 같은 규칙)
+
     def close(self):
         for f in self._f.values():
             try:
@@ -108,5 +133,8 @@ class RunLog:
         self._f, self._w = {}, {}
 
     def paths(self, directory):
-        return [os.path.join(directory, f'{self.run}_{n}.csv')
-                for n in ('stops', 'points')]
+        out = [os.path.join(directory, f'{self.run}_{n}.csv')
+               for n in ('stops', 'points')]
+        if os.path.exists(self._map_path):
+            out.append(self._map_path)
+        return out
