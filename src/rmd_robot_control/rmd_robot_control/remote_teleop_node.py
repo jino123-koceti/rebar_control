@@ -91,7 +91,7 @@ from geometry_msgs.msg import Twist
 from std_msgs.msg import Empty, Float32, Int32, String
 from rebar_base_interfaces.msg import RemoteControl, SafetyState
 
-from .axis_config import load_pose_id, load_stage_axes, pose_label
+from .axis_config import load_pose_id, load_stage_axes, mm_dir_of, pose_label
 
 # RemoteControl.buttons 순서 — remote_bridge 와 같아야 한다
 BUTTON_ORDER = ('S13', 'S14', 'S17', 'S18', 'S21', 'S22', 'S23', 'S24')

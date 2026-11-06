@@ -250,6 +250,16 @@ class StageNode(Node):
         self.declare_parameter('hybrid_rise_a', 0.25)        # 전류가 이만큼 오르면
         self.declare_parameter('hybrid_samples', 2)          # 2표본 연속이면 충돌
         self.declare_parameter('collide_grace_sec', 0.2)
+        # 기준선을 '시간' 이 아니라 '전류가 평탄해질 때까지' 쌓는다 (아래 _hit 참고)
+        self.declare_parameter('collide_settle_a', 0.15)
+        # 위치 표본이 이 시간 안에 안 바뀐 것은 '정체' 가 아니라 '미도착' 이다.
+        # ⚠ **크게 잡으면 진짜 접촉을 그만큼 눈감는다** (45mm/s 에서 0.35초 = 15mm).
+        #   tick(20~50ms)이 만드는 허상만 걷어내면 되므로 한 표본 주기(7Hz ≒ 143ms)
+        #   바로 아래로 둔다. 사용자 지적: 공구 끝단은 **앞부분이 더 길어서**
+        #   2번 자세에서는 얕은 z 에서 먼저 닿는다 — 그 접촉은 헛감지가 아니다.
+        self.declare_parameter('collide_pos_stale_sec', 0.12)
+        self.declare_parameter('collide_settle_n', 3)
+        self.declare_parameter('collide_grace_max_sec', 1.5)
         self.declare_parameter('tolerance_mm', 1.0)
         self.declare_parameter('move_timeout_sec', 30.0)
         # ⚠ **브레이크 해제 확인이 오면 바로 출발한다.** 이 값은 확인이 안 올 때의
@@ -263,6 +273,8 @@ class StageNode(Node):
         # ⚠ 리스트가 아니라 **문자열**이다 — 이유는 `_axis_list` 주석 참조
         self.declare_parameter('brake_hold_axes', 'x,y')
         self.declare_parameter('brake_hold_sec', 2.5)
+        # yaw 주차(0x80)를 미루는 시간. 0 이면 옛 동작(즉시 주차)으로 되돌린다.
+        self.declare_parameter('yaw_park_sec', 20.0)
         # ── 축별 가감속 (모터축 dps/s, 0x43) ───────────────────────────────
         # ⚠⚠ **축마다 최적값이 다르다.** 2026-10-04 에 전 축에 12000 을 넣었더니
         #   X 가 망가졌다 — 감속 구간 전류가 10.66A 까지 뛰어 **충돌 감지가
@@ -377,8 +389,11 @@ class StageNode(Node):
         self.base_a = {}           # 축 → 전류 기준선(A). 이동 중에만 갱신한다
         self.rise_cnt = {}         # 축 → 상승분 초과 연속 횟수
         self._base_t = {}          # 축 → 기준선 갱신 시각
+        self._base_ok = {}         # 축 → 기준선이 확정됐는가(무장)
+        self._settle_cnt = {}      # 축 → 전류가 평탄한 연속 표본 수
         self.hit_back = float(g('collide_backoff_mm').value)
         self.stall_on = bool(g('stall_detect').value)
+        self.pos_stale = float(g('collide_pos_stale_sec').value)
         self.stall_ratio = float(g('stall_ratio').value)
         self.stall_n = int(g('stall_samples').value)
         self.stall_margin = float(g('stall_decel_margin').value)
@@ -388,8 +403,12 @@ class StageNode(Node):
         self._hyb_cnt = {}
         self._stall_cnt = {}
         self._stall_last = {}      # 축 → (시각, mm)
+        self._pos_chg = {}         # 축 → (위치값이 **바뀐** 시각, mm)
         self._stall_moved = {}     # 축 → 이번 이동에서 제대로 움직인 적 있나
         self.hit_grace = float(g('collide_grace_sec').value)
+        self.settle_a = float(g('collide_settle_a').value)
+        self.settle_n = int(g('collide_settle_n').value)
+        self.grace_max = float(g('collide_grace_max_sec').value)
         self.cur_a = {}            # 축 → 최근 전류(A). 표본이 없으면 키가 없다
         self.hit_cnt = {}          # 축 → 문턱 초과 연속 횟수
         self.retreating = None     # 후퇴 중인 축 (그 동안 다시 판정하지 않는다)
@@ -398,6 +417,8 @@ class StageNode(Node):
         self.arm_sec = float(g('arm_sec').value)
         self.hold_axes = _axis_list(g('brake_hold_axes').value)
         self.hold_sec = float(g('brake_hold_sec').value)
+        self.yaw_park_sec = float(g('yaw_park_sec').value)
+        self._yaw_park_at = None   # yaw 지연 주차 예약 시각 (None = 예약 없음)
         self.brake_rel = {}        # 축 → 브레이크 해제 확인 (None = 모름)
         self._brake_ok_t = {}      # 축 → **해제가 확인된 시각** (충돌 유예 기준)
         self._lock_at = {}         # 축 → 이 시각 뒤에 잠근다 (유예 중)
@@ -465,6 +486,7 @@ class StageNode(Node):
         self.yaw_multi = None           # yaw 멀티턴 (기준점과의 차이로 각도를 낸다)
         self.yaw_anchor = None          # (멀티턴, 건각) — 각도를 아는 순간에 잡는다
         self.yaw_anchor_src = ''
+        self._anchor_tried = False
         self._homing_state = None       # 전이 판정용 (None = 아직 못 봤다)
         self.ready_pose = load_ready_yaw_pose()
         self.yaw_brake = None           # 0x9A DATA[3] — 해제 확인 전엔 안 움직인다
@@ -481,7 +503,7 @@ class StageNode(Node):
                 lambda m: setattr(self, 'yaw_single', m.data), 10)
             self.create_subscription(
                 Int32, f"/motor_{yaw_mid}/encoder_multi",
-                lambda m: setattr(self, 'yaw_multi', m.data), 10)
+                self._on_yaw_multi, 10)
             self.create_subscription(
                 Bool, f"/motor_{yaw_mid}/brake",
                 lambda m: setattr(self, 'yaw_brake', m.data), 10)
@@ -599,6 +621,7 @@ class StageNode(Node):
                 and abs(self.yaw_anchor[1] - g) < 0.01)
         self.yaw_anchor = (self.yaw_multi, float(g))
         self.yaw_anchor_src = why
+        self._save_yaw_anchor()
         if not same:
             self.get_logger().info(
                 f"yaw 기준점 — {pose_label(pose)} (건 {g:+.2f}°, "
@@ -779,6 +802,7 @@ class StageNode(Node):
         #   회전 시작 즉시 "제어 권한 없음" 으로 멈춘다 (2026-10-04, 권한 판정을
         #   '잃은 지 얼마나 됐는가' 로 바꿀 때 이 경로를 빼먹었다).
         self.t_start = self.t_arm = self.t_grant_lost = time.time()
+        self._yaw_park_at = None        # 다시 쓰므로 지연 주차 취소
         self._yaw_sent = 0.0
         self.detail = f'{pose_label(cur)} → {pose_label(want)} — 브레이크 해제 대기'
         self._brake('release', 'yaw')
@@ -863,6 +887,7 @@ class StageNode(Node):
                         + (now_gun - want_gun) * info['gear'])
         self.yaw_moving = True
         self.t_start = self.t_arm = self.t_grant_lost = time.time()
+        self._yaw_park_at = None        # 다시 쓰므로 지연 주차 취소
         self._yaw_sent = 0.0
         self.detail = f'건 {now_gun:+.2f}° → {want_gun:+.2f}° — 브레이크 해제 대기'
         self._brake('release', 'yaw')
@@ -918,7 +943,14 @@ class StageNode(Node):
             return self._yaw_done(f'타임아웃 {self.timeout:.0f}s')
         # 해제가 명령보다 **먼저 도착해야** 한다. DATA[3] 로 확인한다 —
         # 안 풀린 채로 명령하면 전류만 오른다 (0.4초로는 부족한 적이 있다)
-        if not self.yaw_brake or time.time() - self.t_arm < self.arm_sec:
+        # ⚠⚠ [2026-11-06 실측] **확인이 오면 즉시 통과한다.** 예전에는 `yaw_brake`
+        #   가 이미 True 여도 `arm_sec`(1.0초)를 **무조건** 기다렸다. 선형축의
+        #   `_axis_armed` 는 이미 "확인이 오면 즉시, 안 오면 arm_sec 뒤" 로
+        #   고쳐져 있는데 yaw 만 옛 방식으로 남아 있었다.
+        #   자세변경 한 번에 yaw 이동이 두 번(회전 + 정착 재보정)이라 **최대 2초**가
+        #   여기서 갔다. yaw CAN 실측: 전체 6.33초 중 **5.10초가 정지 상태**였고,
+        #   실제 회전은 0.82초 + 재보정 0.56초뿐이다.
+        if not (self.yaw_brake or time.time() - self.t_arm >= self.arm_sec):
             self._brake('release', 'yaw')
             return
         self._request_control('auto')
@@ -953,11 +985,77 @@ class StageNode(Node):
 
     def _yaw_park(self, reason):
         """멈추고 잠그고 차단한 뒤 **정착 확인 단계로 넘긴다** (끝내지 않는다)."""
+        # ⚠⚠ [2026-11-06 실측] **여기서 잠그거나 0x80 을 보내지 않는다.**
+        #   0x80 차단이 바로 그 "스프링백"(진행 방향으로 2~4°)을 만든다 — 아래
+        #   정착 재보정은 **자기가 만든 오차를 자기가 고치는 중**이었다. 게다가
+        #   0.3초 뒤에 재보정하려고 다시 풀고 여자하느라 2초가 더 갔다.
+        #   실측(yaw CAN): 자세변경 전체 4.3~4.8초 중 움직임은 1.1~1.2초뿐.
+        #   서보를 켠 채 두면 위치 루프가 잡는다 (유지 전류 실측 0.65A, 최대 1.26A).
+        #   최종 주차는 `_yaw_done` 이 `yaw_park_sec` 만큼 **미뤄서** 한다.
         self.spd_pubs['yaw'].publish(Float32(data=0.0))
-        self._brake('lock', 'yaw')
-        self._brake('shutdown', 'yaw')
         self._yaw_settle = (time.time(), reason)
         self.detail = f'{pose_label(self.yaw_want)} 정착 대기'
+
+    def _on_yaw_multi(self, msg):
+        """yaw 멀티턴 수신. 처음 받을 때 **저장된 기준점 복원**을 한 번 시도한다."""
+        self.yaw_multi = msg.data
+        if not self._anchor_tried:
+            self._try_restore_yaw_anchor()
+
+    # ---- yaw 기준점 보존 --------------------------------------------------
+    #
+    # ⚠⚠ [2026-11-06] **노드만 재시작해도 기준점이 날아가 매번 호밍했다.**
+    #   하루에 네 번 반복됐다 — 파라미터 하나 고치려 `stage_node` 를 바꾸면
+    #   yaw 자세를 못 가려(1·4번은 단회전 별칭) 결속이 시작도 못 한다.
+    #
+    #   멀티턴은 **전원**이 끊길 때 날아가지, 노드 재시작으로 날아가지 않는다.
+    #   그 둘을 구분하면 재시작은 복원할 수 있다. 0xB1(전원 재투입 감지) 대신
+    #   **더 단순하고 보수적인 판정**을 쓴다 — 저장 시점의 멀티턴을 같이 적어
+    #   두고, 기동 때 그 값이 **그대로면** 복원한다:
+    #       노드만 재시작   모터는 계속 돌았고 yaw 는 안 움직였다 → 값 동일 → 복원
+    #       전원 재투입     멀티턴이 리셋된다 → 값이 크게 다르다 → 복원 안 함
+    #       yaw 가 움직였다 → 값이 다르다 → **복원 안 함** (의심스러우면 포기)
+    #   틀리면 엉뚱하게 돌아 프레임을 치므로, 애매하면 버리는 쪽이다.
+    ANCHOR_PATH = os.path.expanduser('~/.ros/rebar_yaw_anchor.json')
+
+    def _save_yaw_anchor(self):
+        if self.yaw_anchor is None or self.yaw_multi is None:
+            return
+        try:
+            with open(self.ANCHOR_PATH, 'w') as f:
+                json.dump({'anchor_multi': int(self.yaw_anchor[0]),
+                           'anchor_gun': float(self.yaw_anchor[1]),
+                           'multi_at_save': int(self.yaw_multi),
+                           'src': self.yaw_anchor_src,
+                           't': time.time()}, f)
+        except OSError:
+            pass          # 보존 실패가 동작을 막지는 않는다
+
+    def _try_restore_yaw_anchor(self):
+        """기동 뒤 멀티턴을 처음 받았을 때 한 번 시도한다."""
+        if self._anchor_tried or self.yaw_anchor is not None or self.yaw_multi is None:
+            return
+        self._anchor_tried = True
+        try:
+            with open(self.ANCHOR_PATH) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return
+        cpg = float((self.pose_id or {}).get('cpg') or 0.0)
+        if cpg <= 0:
+            return
+        tol = cpg * 0.5                      # 건 0.5° 어치. 그 이상 움직였으면 포기
+        moved = abs(int(d.get('multi_at_save', 0)) - self.yaw_multi)
+        if moved > tol:
+            self.get_logger().warning(
+                f"yaw 기준점 복원 안 함 — 저장 뒤 멀티턴이 {moved} "
+                f"움직였다 (허용 {tol:.0f}). 전원이 끊겼거나 yaw 가 돌았다 → 호밍 필요")
+            return
+        self.yaw_anchor = (int(d['anchor_multi']), float(d['anchor_gun']))
+        self.yaw_anchor_src = f"복원({d.get('src', '')})"
+        self.get_logger().info(
+            f"yaw 기준점 **복원** — 건 {self.yaw_anchor[1]:+.2f}° "
+            f"(멀티턴 {self.yaw_anchor[0]}, 저장 뒤 이동 {moved} ≤ {tol:.0f})")
 
     def _yaw_settle_tick(self):
         """차단 뒤 정착을 기다려 재측정하고, 벗어나 있으면 재회전한다.
@@ -1008,6 +1106,7 @@ class StageNode(Node):
         # ⚠ 부호 규약: `+모터 → −건` 이므로 −gerr 를 더한다
         self.yaw_tgt = self.deg['yaw'] - gerr * float(info['gear'])
         self.t_start = self.t_arm = self.t_grant_lost = time.time()
+        self._yaw_park_at = None        # 다시 쓰므로 지연 주차 취소
         self._yaw_sent = 0.0
         self.detail = (f'{pose_label(self.yaw_want)} 재보정 '
                        f'{self._yaw_pass}/{self.yaw_max_pass}회차')
@@ -1017,8 +1116,18 @@ class StageNode(Node):
     def _yaw_done(self, reason):
         """멈추고 **잠그고 0x80 까지** 보낸다 — 0x78 만으로는 전류가 계속 흐른다."""
         self.spd_pubs['yaw'].publish(Float32(data=0.0))
-        self._brake('lock', 'yaw')
-        self._brake('shutdown', 'yaw')
+        # ⚠⚠ [2026-11-06] **주차(잠금+0x80)를 미룬다.** 여기서 바로 끊으면
+        #   자세를 "도달" 로 선언한 **직후에** 스프링백이 일어나 결속 내내 어긋난
+        #   자세로 간다. `yaw_park_sec` 뒤에도 yaw 를 안 쓰면 그때 주차한다
+        #   (`_lock_tick`). 새 yaw 이동이 시작되면 예약은 취소된다.
+        #   0 으로 두면 옛 동작(즉시 주차)으로 되돌아간다.
+        self.yaw_park_sec = float(self.get_parameter('yaw_park_sec').value)
+        if self.yaw_park_sec <= 0:
+            self._brake('lock', 'yaw')
+            self._brake('shutdown', 'yaw')
+            self._yaw_park_at = None
+        else:
+            self._yaw_park_at = time.time() + self.yaw_park_sec
         # 도달했으면 거기가 곧 기준점이다 — 누적 오차를 끊는다
         if self.yaw_tgt is not None and self.deg.get('yaw') is not None \
                 and abs(self.yaw_tgt - self.deg['yaw']) <= self.yaw_tol:
@@ -1198,7 +1307,11 @@ class StageNode(Node):
             self._arm_t[name] = now
             self._brake('release', name)
             # 붙인 축은 **충돌 판정 유예를 새로** 받는다 (기동 전류가 뜬다)
+            #   ⚠ 기준선 확정 상태도 같이 비운다 — 안 비우면 같은 축이 다시 붙을 때
+            #     `_base_ok` 만 True 로 남아 기준선을 **그 순간 전류로** 덮어쓴다.
             self.base_a.pop(name, None)
+            self._base_ok.pop(name, None)
+            self._settle_cnt.pop(name, None)
             self.hit_cnt[name] = 0
             self.rise_cnt[name] = 0
         self.detail = ('합침 ' + ', '.join(f'{k}={v:+.1f}mm'
@@ -1221,6 +1334,10 @@ class StageNode(Node):
                          for ax in ('x', 'y', 'z')}
         self.max_dps = float(g('max_speed_dps').value)
         self.timeout = float(g('move_timeout_sec').value)
+        # ⚠⚠ [2026-11-06] 브레이크 유예도 **이동마다 다시 읽는다.** 기동 때 한 번만
+        #   읽으면 `ros2 param set` 이 안 먹어 조절할 때마다 재기동(=재호밍)이었다.
+        self.hold_axes = _axis_list(g('brake_hold_axes').value)
+        self.hold_sec = float(g('brake_hold_sec').value)
         self.hit_on = bool(g('collide_detect').value)
         self.hit_a = float(g('collide_current_a').value)
         self.hit_a_ax = {ax: float(g(f'collide_current_a_{ax}').value)
@@ -1310,6 +1427,34 @@ class StageNode(Node):
             self.rise_cnt[name] = 0
             self.hit_cnt[name] = 0
             return False
+        # ⚠⚠ [2026-11-06 실측] **기준선은 '시간' 이 아니라 '전류가 평탄해질 때'
+        #   확정한다.** 고정 유예(0.2초)는 아직 **가속 중**이라 기준선이 0.30~0.39A
+        #   로 잡히는데 실제 하강 운전 전류는 1.16~1.42A 다. 차이가 임계(+0.45A)를
+        #   그냥 넘어 **배근에 닿기도 전에 매번 충돌로 멈췄다**(실측: z=-25.0mm,
+        #   -37.5mm 에서 오검출). 유예를 0.7초로 되돌리면 오검출은 줄지만 그만큼
+        #   무방비로 내려간다 — 둘 다 피하려면 가속이 끝난 것을 **관측**해야 한다.
+        #   전류가 `settle_a` 안에서 `settle_n` 번 연속 평탄하면 그때가 정상
+        #   운전이다. 그 전까지는 판정하지 않고 기준선만 쌓는다.
+        if not self._base_ok.get(name):
+            base0 = self.base_a.get(name)
+            if a > 0.02:
+                if base0 is not None and abs(a - base0) <= self.settle_a:
+                    self._settle_cnt[name] = self._settle_cnt.get(name, 0) + 1
+                else:
+                    self._settle_cnt[name] = 0
+                self.base_a[name] = a if base0 is None else (base0 + a) * 0.5
+                self._base_t[name] = time.time()
+            waited = time.time() - t_start
+            if (self._settle_cnt.get(name, 0) >= self.settle_n
+                    or waited >= self.grace_max):
+                self._base_ok[name] = True
+                self.get_logger().info(
+                    f"{name}: 충돌 기준선 확정 {self.base_a.get(name, 0.0):.2f}A "
+                    f"({waited:.2f}초, 평탄 {self._settle_cnt.get(name, 0)}회)")
+            else:
+                self.rise_cnt[name] = 0
+                self.hit_cnt[name] = 0
+                return False
         rise = self._rise_limit(name)
         base = self.base_a.get(name)
         # 기준선은 **튀지 않는 동안만** 갱신한다 — 접촉을 따라가면 감지가 죽는다
@@ -1366,6 +1511,7 @@ class StageNode(Node):
             self._stall_cnt[name] = 0
             self._hyb_cnt[name] = 0
             self._stall_last.pop(name, None)
+            self._pos_chg.pop(name, None)
             self._stall_moved[name] = False
             return False
         return self._stalled(name, err)
@@ -1392,12 +1538,25 @@ class StageNode(Node):
             self._stall_cnt[name] = 0
             self._hyb_cnt[name] = 0
             self._stall_last.pop(name, None)
+            self._pos_chg.pop(name, None)
             self._stall_moved[name] = False
             return False
         cur = self.mm_of(name)
         if cur is None:
             return False
         now = time.time()
+        # ⚠⚠ [2026-11-06 실측] **"값이 같다" 를 "안 움직인다" 로 읽으면 안 된다.**
+        #   `tick` 은 20~50ms 마다 도는데 Z 위치 토픽은 **약 7Hz(140ms)** 로만
+        #   갱신된다. 그 사이 `mm_of` 는 직전과 **완전히 같은 값**을 돌려주므로
+        #   v_act 가 0 으로 계산되고, 하이브리드가 "속도 0%" 로 발동했다.
+        #   실측: 배근 근처도 아닌 z=-20.6mm / -25.0mm / -37.5mm 에서 오검출.
+        #   값이 마지막으로 **바뀐** 시각을 따로 들고, 아직 한 표본 주기도 안
+        #   지났으면 판정하지 않는다. 그보다 오래 안 바뀌었다면 그건 진짜 정체다.
+        chg = self._pos_chg.get(name)
+        if chg is None or abs(cur - chg[1]) > 1e-9:
+            self._pos_chg[name] = (now, cur)
+        elif now - chg[0] < self.pos_stale:
+            return False
         prev = self._stall_last.get(name)
         self._stall_last[name] = (now, cur)
         if prev is None:
@@ -1514,12 +1673,24 @@ class StageNode(Node):
         if r and name in r:
             lo, hi = r[name]
             back = min(max(back, lo), hi)
+        # ⚠⚠ [2026-11-06 실측] **후퇴 전에 축을 먼저 세운다.**
+        #   후퇴는 `_begin()` 을 거치는데 `_begin` 은 목표만 세우고 브레이크 해제
+        #   확인(`_axis_armed`)을 기다린 뒤에야 명령을 내보낸다. 그동안 모터는
+        #   **직전 목표(결속 깊이 -96mm)를 계속 수행한다** — 충돌을 감지해도
+        #   정지가 모터까지 한 번도 가지 않는다.
+        #   실측(2L 캡쳐 + Z 궤적): 하이브리드 감지 z=-37.5mm → 실제 정지
+        #   z=-84.74mm = **47mm / 1.7초 더 들어갔다.** 같은 날 전류 규칙이 걸린
+        #   회차는 -45.5 → -52.47mm 로 **7mm**(v²/2a 로 계산한 정상 감속)에서
+        #   끝났다. 즉 사용자가 말한 "장비가 들린다" 의 주원인은 **감지 지연이
+        #   아니라 정지 지연**이다. 감지를 빠르게 해도 정지가 47mm 면 무의미하다.
+        #   속도 0 은 어떤 상황에서도 안전한 방향이라 조건 없이 먼저 보낸다.
+        self.spd_pubs[name].publish(Float32(data=0.0))
         self.hit_cnt[name] = 0
         self.rise_cnt[name] = 0
         self.retreating = name
         self.get_logger().error(
             f"충돌 감지 — {name} {getattr(self, 'hit_why', f'{a:.2f}A')}. "
-            f"이동 취소하고 {cur:.1f} → {back:.1f}mm 로 후퇴")
+            f"즉시 정지 + {cur:.1f} → {back:.1f}mm 로 후퇴")
         self._begin({name: back}, 'mm')
         self.detail = f'충돌 후퇴 — {name} {back:.1f}mm (전류 {a:.2f}A)'
 
@@ -1584,6 +1755,13 @@ class StageNode(Node):
             if now >= t:
                 self._lock_at.pop(name, None)
                 self._brake('lock', name)
+        # yaw 지연 주차 — 회전 중이 아니고 예약 시각이 지났으면 잠그고 끊는다
+        if (self._yaw_park_at is not None and not self.yaw_moving
+                and now >= self._yaw_park_at):
+            self._yaw_park_at = None
+            self._brake('lock', 'yaw')
+            self._brake('shutdown', 'yaw')
+            self.get_logger().info('yaw 주차 (지연) — 잠금 + 0x80')
 
     def _speed_for(self, name):
         """그 축에 보낼 최대속도(모터축 dps).
@@ -1637,17 +1815,50 @@ class StageNode(Node):
         return (time.time() - self.t_grant_lost) < self.grant_wait
 
     def _stop(self, reason):
+        # ⚠⚠ [2026-11-06 실측] **충돌 후퇴 중이면 브레이크를 잠그지 않는다.**
+        #   잠그면 바로 뒤따르는 후퇴가 0x77 을 다시 보내고 **확인까지 1.3~1.5초**를
+        #   기다린다 (465행 주석: "0x77 이 먹기까지 1.50초"). 실측으로 충돌 뒤
+        #   제자리에 **1.10~1.70초** 멈춰 있다가 되돌아갔고, 그 대부분이 이것이다.
+        #   그동안 모터는 제자리 유지(0xA4) + 속도 0 으로 **여자 상태**라(0x80 을
+        #   보내지 않는다) Z 자중 낙하도 받지 않는다 — 브레이크가 필요 없다.
+        #   비상정지·STOP 스위치일 때는 그대로 잠근다 (안전한 방향이 우선).
+        skip_lock = (self.retreating is not None and self._safety_stop() is None)
         self.retreating = None
         self.hit_cnt.clear()
         self.rise_cnt.clear()
         # 기준선은 이동마다 새로 잡는다 — 축마다·방향마다 정상 전류가 다르다
         self.base_a.clear()
         self._base_t.clear()
+        self._base_ok.clear()
+        self._settle_cnt.clear()
         if self.yaw_moving:
             return self._yaw_done(reason)
+        # ⚠⚠ [2026-11-06 실측] **정지는 "지금 위치를 새 목표로 주는 것" 이다.**
+        #   이동은 매 tick `pos_pubs`(0xA4)로 목표를 다시 보내는 방식이고, 아래에서
+        #   `self.target` 을 비우면 tick 이 **아무 명령도 안 보낸다**. 그러면 모터는
+        #   마지막 0xA4(결속 깊이 -96mm)를 끝까지 수행한다 — 속도 0(0xA2)으로는
+        #   이미 걸린 0xA4 가 안 끊긴다 (이 파일 225행: "send_motor_stop 이
+        #   0xA2 speed=0 이라 모터가 꺼지지 않는다", 실측).
+        #   실측: 충돌을 z=-25.0mm 에서 감지했는데 **-68.6mm 까지 내려가서
+        #   배근이 세웠다**(43.6mm). 같은 회차에 z=-63.3mm 에서 감지한 건
+        #   5.3mm 만에 섰는데, 그건 정지가 들어서가 아니라 **배근이 5.3mm 앞에
+        #   있었기 때문**이다. 두 번 다 최저점이 -68.6mm 로 같은 것이 증거다.
+        #   그래서 목표를 비우기 전에 **현재 위치를 목표로 한 번 쏜다.** 모터가
+        #   감속·정지하고 그 자리를 유지한다.
         for name in list(self.target):
+            d = self.deg.get(name)
+            if d is not None:
+                try:
+                    self.pos_pubs[name].publish(
+                        Float64MultiArray(data=[float(d), self._speed_for(name)]))
+                except Exception as e:
+                    self.get_logger().warning(f"{name}: 제자리 정지 명령 실패 — {e}")
             self.spd_pubs[name].publish(Float32(data=0.0))
         for name in list(self.target):
+            if skip_lock:
+                self.get_logger().info(
+                    f"{name}: 충돌 후퇴 중 — 브레이크 잠금 생략 (재해제 대기 1.3초 절약)")
+                continue
             self._lock_later(name)
         if self.moving:
             self.get_logger().info(f"이동 종료 — {reason}")

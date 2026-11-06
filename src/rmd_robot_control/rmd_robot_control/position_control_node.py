@@ -7,7 +7,7 @@
 
 import rclpy
 from rclpy.node import Node
-from .axis_config import load_stage_axes
+from .axis_config import load_stage_axes, mm_dir_of
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray, Float32, Int32, Empty, String, Bool
@@ -370,11 +370,16 @@ class PositionControlNode(Node):
         self.joint_position_subscriptions = []
         for i, joint_name in enumerate(self.joint_names):
             topic_name = f'{joint_name}/position'
+            # ⚠⚠ [2026-11-06] **큐 깊이는 1 이다.** 위치 명령은 **최신 것만**
+            #   의미가 있다 — stage_node 가 매 tick 같은 목표를 다시 보내므로
+            #   낡은 목표를 뒤늦게 처리하면 해롭기만 하다. 깊이 10 이던 탓에
+            #   충돌 정지가 **큐에 밀린 하강 목표 9개 뒤**에서 1.04초 늦게
+            #   처리됐고, 그 사이 Z 가 52mm 더 내려갔다 (실측).
             subscription = self.create_subscription(
                 Float64MultiArray,
                 topic_name,
                 lambda msg, idx=i: self.single_joint_callback(msg, idx),
-                10
+                1
             )
             self.joint_position_subscriptions.append(subscription)
         
@@ -1065,28 +1070,42 @@ class PositionControlNode(Node):
         if len(msg.data) > 1:
             custom_speed = int(msg.data[1])  # dps 단위
         
-        self.get_logger().info(
-            f'📥 [ROS2] /joint_{joint_index+1}/position 수신: {received_position:.2f}° (motor 0x{motor_id:03X})'
-            + (f', speed={custom_speed}dps' if custom_speed else '')
-        )
-        
+        # ⚠⚠ [2026-11-06 실측] **메시지마다 로그를 쓰지 않는다.** 아래 속도 콜백에
+        #   같은 사고가 적혀 있는데(2026-09-30, INFO 2줄 → 19Hz 로 묶임) **위치
+        #   콜백만 고치지 않고 남아 있었다.** stage_node 는 이동 중 매 tick(약
+        #   20Hz) 같은 목표를 다시 보내는데 이 콜백이 INFO 2줄 때문에 **9Hz** 로
+        #   묶여, 깊이 10 짜리 구독 큐가 차고 **명령이 약 1초 늦게 먹었다.**
+        #   실측: 충돌을 z=-26.0mm 에서 감지하고 정지를 보냈는데, 큐에 밀린
+        #   하강 목표(-96mm)가 9개 더 처리된 뒤 **1.04초 만에** 정지가 들었다.
+        #   그 사이 Z 는 -78.3mm 까지 내려갔다(52mm). "충돌을 감지해도 밀고
+        #   내려간다" 의 진짜 원인이 이것이다 — 감지도 정지 로직도 아니었다.
+        #   값이 바뀔 때만 남긴다. 같은 목표 재송신은 조용히 보낸다.
+        changed_tgt = (abs(self.target_positions.get(motor_id, 1e9) - received_position)
+                       > 0.01)
+        if changed_tgt:
+            self.get_logger().info(
+                f'📥 [ROS2] /joint_{joint_index+1}/position 수신: {received_position:.2f}° (motor 0x{motor_id:03X})'
+                + (f', speed={custom_speed}dps' if custom_speed else '')
+            )
+
         # degree 단위 그대로 사용 (라디안 변환 제거)
         target_position = received_position
-        
+
         # 위치 제한
         target_position = max(self.min_position, min(self.max_position, target_position))
-        
+
         self.target_positions[motor_id] = target_position
         self.motor_states[motor_id]['target_position'] = target_position
         self.motor_states[motor_id]['is_moving'] = True
-        
+
         # 주행 모터(0x141, 0x142)의 경우 motor_states에 is_moving 키가 없을 수 있으므로 확인
         if 'is_moving' not in self.motor_states[motor_id]:
             self.motor_states[motor_id]['is_moving'] = True
-        
-        self.get_logger().info(
-            f'🎯 [목표설정] {self.joint_names[joint_index]} (0x{motor_id:03X}): {target_position:.1f}°'
-        )
+
+        if changed_tgt:
+            self.get_logger().info(
+                f'🎯 [목표설정] {self.joint_names[joint_index]} (0x{motor_id:03X}): {target_position:.1f}°'
+            )
         
         # 위치 명령 전송 (속도 옵션 포함)
         self.send_position_command(motor_id, target_position, custom_speed)
@@ -1207,8 +1226,15 @@ class PositionControlNode(Node):
             self.motor_states[motor_id]['last_position_read_time'] = current_time
             self.debug_logger.debug(f"📤 [0x92] 0x{motor_id:03X} 멀티턴 각도 읽기 명령 전송")
 
-        # CAN 응답을 위한 짧은 대기 (응답은 motor_response_callback에서 비동기 처리)
-        time.sleep(0.005)  # 5ms 대기
+        # ⚠⚠ [2026-11-06] **여기에 time.sleep 을 두지 않는다.** 이 루프는
+        #   `position_poll_hz` 타이머로 돌고 **단일 스레드 실행기**(main 의
+        #   rclpy.spin)를 공유한다. 5ms 를 자면 poll_hz 10 에서는 5% 점유였지만
+        #   poll_hz 50 에서는 **25% 점유**가 되어 `/joint_N/speed` 콜백이 굶는다.
+        #   굶으면 `joint_speed_timeout`(0.3s) 워치독이 모터를 세운다 — 실측으로
+        #   리모콘 Y 가 뚝뚝 끊기고(216건/일), **호밍 Y 정밀 재접근이 0.5초마다
+        #   정지당해 "스톨" 로 오진되어 실패**했다 (13:52 Y축 51건 직후 실패).
+        #   응답은 `motor_response_callback` 이 비동기로 받으므로 대기는 불필요하다
+        #   (2449행에 같은 취지의 선례가 있다).
 
         # 목표 도달 확인 (모든 위치 제어 모터들)
         # 단, 주행 모터(0x141, 0x142)는 동기화 모드일 때 별도 처리
