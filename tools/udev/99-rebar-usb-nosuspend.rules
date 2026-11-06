@@ -37,20 +37,19 @@
 #   sudo udevadm trigger --subsystem-match=usb
 #   확인: tools/usb_suspend_check.sh
 
-# ── Orbbec 카메라 (2L 0673 · 305 0840, 벤더 전체) ───────────────────────
-ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2bc5", \
+# ⚠⚠ [2026-11-06 2차] **`ACTION=="add"` 를 쓰면 안 된다.**
+#   `udevadm trigger` 는 **change** 이벤트를 보낸다. add 로 제한했더니 설치 직후
+#   trigger 에 아무것도 안 걸리고, 전원 재투입으로 새로 붙은 장치만 적용됐다
+#   (허브 5개가 `auto` 로 남았다). ACTION 을 안 쓰면 add·change 둘 다 걸린다.
+#
+# ⚠ 허브는 **ID 가 아니라 클래스(09)** 로 잡는다. ID 를 하나씩 적으면 빠진다 —
+#   실제로 `05e3:0610`(1-4.2.4), `05e3:0626`(2-3.2.4)를 놓쳤다. 이 기계의
+#   허브는 전부 깨어 있는 편이 낫다 (PCAN·Pololu·WiFi 동글도 같은 가지다).
+
+# ── USB 허브 전부 (bDeviceClass 09) ─────────────────────────────────────
+SUBSYSTEM=="usb", ATTR{bDeviceClass}=="09", \
   TEST=="power/control", ATTR{power/control}="on"
 
-# ── 카메라가 달린 허브들 ────────────────────────────────────────────────
-# 0bda:0420 4-Port USB 3.0 Hub   (2-3,  305 두 대의 상위)
-# 0bda:5420 4-Port USB 2.0 Hub   (1-4,  2L·PCAN·Pololu 의 상위)
-# 110a:0414 USB5804/USB2804 Hub  (2-3.2 / 1-4.2)
-# 110a:0417 USB5807/USB2807 Hub  (2-3.1 / 1-4.1)
-ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="0420", \
-  TEST=="power/control", ATTR{power/control}="on"
-ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="5420", \
-  TEST=="power/control", ATTR{power/control}="on"
-ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="110a", ATTR{idProduct}=="0414", \
-  TEST=="power/control", ATTR{power/control}="on"
-ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="110a", ATTR{idProduct}=="0417", \
+# ── Orbbec 카메라 (2L 0673 · 305 0840, 벤더 전체) ───────────────────────
+SUBSYSTEM=="usb", ATTR{idVendor}=="2bc5", \
   TEST=="power/control", ATTR{power/control}="on"
