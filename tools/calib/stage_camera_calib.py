@@ -137,7 +137,9 @@ PLANE_SINCE = '2026-11-06 00:00:00'   # [2026-11-06] 10-20 USB3 작업으로 카
 #   바꾸지 않으므로 자세별로 달라질 이유가 없다. 노이즈를 모델에 굳히는 셈이다.
 #   잔차는 그대로 보고한다(상수가 실측과 얼마나 다른지 봐야 하므로).
 #   ⚠ 데크플레이트를 치우거나 배근 높이가 바뀌면 **이 값부터 다시 잡아야 한다.**
-Z_CONST = -85.9   # [실측 2026-11-06] **사람이 맞춘 결속 위치 16점의 평균**이다.
+Z_CONST = -85.9   # ⚠ [2026-11-09] 이제 **폴백**이다 — Z 는 자세별 상수로 풀고,
+#   짝이 하나도 없는 자세에만 이 값이 쓰인다 (`_solve` 의 k==2 분기 참고).
+# [실측 2026-11-06] **사람이 맞춘 결속 위치 16점의 평균**이다.
 #   범위 -79.1 ~ -98.3mm, 표준편차 6.1mm. 상수 하나로는 잔차 RMS 6.05mm 가 남는다.
 #   ⚠ 옛 값 -96.0 은 2026-10-17 에 **1번 자세 한 점**에서 접촉을 재서 잡은 것인데,
 #     오늘 16점 평균보다 10.1mm 깊었다 (그 상수로는 잔차 RMS 11.82mm). 그 사이
@@ -613,14 +615,30 @@ class Calib(Node):
         # ⚠ **yaml 스키마는 그대로다** — X·Y 행의 깊이 열을 0, Z 행을 전부 0 으로
         #   두고 b[2] 에 상수를 넣는다. 그래서 `tying_planner` 는 고칠 것이 없다.
         if k == 2:
-            # Z 는 풀지 않는다 (위 `Z_CONST` 주석). 잔차만 재서 보고한다
-            e = [q['stage'][2] - Z_CONST
+            # ⚠⚠ [2026-11-09] **Z 는 자세마다 다른 상수로 둔다.** 카메라 좌표로는
+            #   풀지 않는다(깊이와의 상관이 -0.37 로 약하다 — 2026-11-06 실측).
+            #   대신 **그 자세 짝들의 평균**을 쓴다. 공구 끝단이 앞뒤로 길이가 달라
+            #   yaw 가 돌면 닿는 깊이가 바뀌기 때문이다(사용자 지적). 같은 교차점을
+            #   두 자세에서 재면 4~7mm 차이가 난다.
+            #   실측 비교(16점): 상수 -96.0 → 잔차 11.82mm · 평균 상수 -85.9 →
+            #   6.05mm · **자세별 상수 → 4.73mm**.
+            #   짝이 없는 자세는 오프셋 0 으로 두어 공통 상수를 그대로 쓴다.
+            zs = {}
+            for p in poses:
+                bad = self.skip_idx(p)
+                v = [q['stage'][2]
+                     for i, q in enumerate(self.pairs.get(p, []))
+                     if i not in bad and 2 in self._axes_of(q)]
+                if v:
+                    zs[p] = float(np.mean(v))
+            base = float(np.mean(list(zs.values()))) if zs else float(Z_CONST)
+            off = {p: (zs[p] - base if p in zs else 0.0) for p in poses}
+            e = [q['stage'][2] - (base + off[p])
                  for p in poses
                  for i, q in enumerate(self.pairs.get(p, []))
                  if i not in self.skip_idx(p) and 2 in self._axes_of(q)]
-            return dict(a=np.zeros(3), b=float(Z_CONST),
-                        off={p: 0.0 for p in poses}, n=len(e),
-                        e=np.array(e, dtype=float), dof=len(e))
+            return dict(a=np.zeros(3), b=base, off=off, n=len(e),
+                        e=np.array(e, dtype=float), dof=max(0, len(e) - len(zs)))
         ncam = 3 if USE_DEPTH else 2
         U = ncam + 1 + len(extra)
         M, y = [], []
@@ -818,7 +836,9 @@ class Calib(Node):
             f.write("# ⚠⚠ **이 모델은 \"그 평면\" 전용이다.** 데크플레이트 유무나 배근\n")
             f.write(f"#   높이가 바뀌면 다시 받아야 한다. 그래서 {PLANE_SINCE[:10]} 이전\n")
             f.write("#   짝은 적합에서 제외한다 (`PLANE_SINCE`) — 파일에는 남아 있다.\n")
-            f.write(f"# ⚠ Z 는 자세와 무관하게 {Z_CONST}mm 고정 (사용자 결정, 적합 안 함).\n")
+            f.write("# ⚠ Z 는 **자세별 상수**다 — 그 자세 짝들의 평균이고 카메라\n")
+            f.write("#   좌표로 풀지 않는다(깊이와의 상관 -0.37). 공구 끝단 앞뒤 길이가\n")
+            f.write("#   달라 자세마다 닿는 깊이가 다르다. 각 자세의 b[2] 가 그 값이다.\n")
             if any(XY_OFFSET_MM):
                 f.write(f"# ⚠⚠ **손으로 넣은 치우침이 b 에 더해져 있다**: "
                         f"X {XY_OFFSET_MM[0]:+.1f} · Y {XY_OFFSET_MM[1]:+.1f}mm "
