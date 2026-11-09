@@ -521,21 +521,58 @@ def generate_launch_description():
         respawn=True, respawn_delay=2.0,
     )
 
-    # ── 작업영역 카메라 (Gemini 2L) ──────────────────────────────────────
+    # ── 작업영역 카메라 (Gemini 336L) ────────────────────────────────────
+    # ⚠⚠ [2026-11-09] **Gemini 2L → 336L 로 교체했다.** 336L 은 액티브+패시브
+    #   스테레오에 IR 패스 필터가 있어 밝은 환경·반사면에서 깊이가 안정적이고,
+    #   2L 로는 잘 안 잡히던 얇은 배근이 보인다고 한다(사용자).
+    #   교체하며 **serial_number 를 같이 바꿔야 한다** — 안 바꾸면 드라이버가
+    #   그 시리얼 장치를 못 찾아 **아무 스트림도 안 열고 조용히 끝난다.**
+    #   실제로 그랬다: USB 에는 336L(2bc5:0807)이 보이고 토픽도 떠 있는데
+    #   발행이 0 이었다. 2L 백업: data/calibration/gemini2l_20261109/
+    #     2L  CPAV563008Y (2bc5:0673)
+    #     336L CPC8563000RF (2bc5:0807)
+    #   ⚠ 아래 해상도·fps 는 **2L 에서 잡은 값**이다. 336L 이 같은 조합을
+    #     지원하는지 확인되지 않았다 — 안 열리면 드라이버 로그의 지원 목록을 볼 것.
     # ⚠⚠ **serial_number 가 없으면 안 된다.** Orbbec 305 두 대도 같은 벤더라
     #   serial 없이 띄우면 SDK 가 305 를 열고, 305 에는 이 프로파일이 없어
     #   거부한다. 그때 메시지가 "USB 2.0 으로 연결된 것 같다" 라서 대역폭 문제로
     #   오진하기 쉽다 (2026-10-04 에 그렇게 두 번 헛짚었다 — 허브는 멀쩡했다).
     # ⚠ 해상도·fps 는 USB 2.0 에서 **둘 다 흐르는** 조합이다. 모자라면 fps 가
     #   떨어지는 게 아니라 **스트림이 아예 안 열린다** (UVC 가 대역폭을 미리
-    #   예약한다). depth 640x400@10 + color 1280x800@10 → 둘 다 약 9.9fps.
+    #   예약한다). depth 640x400@10 + color 1280x720@10 MJPG 조합이다.
     # ⚠ 인자는 **여기 한 곳에만** 둔다 — 아래 워치독의 복구 명령을 이 dict 로
     #   만들기 때문이다. 두 군데에 적으면 되살릴 때 다른 설정으로 뜬다.
     CAM_ARGS = {
-        'serial_number': 'CPAV563008Y',
+        'serial_number': 'CPC8563000RF',
         'depth_registration': 'true',
-        'depth_width': '640', 'depth_height': '400', 'depth_fps': '10',
+        # ⚠ 336L + **USB 3.0** 조합이다 (2026-11-09). 아래 이력을 꼭 읽어라.
+        #   1) 2L 값(color 1280x800 / depth 640x400)을 그대로 쓰면 336L 이
+        #      USB 2.0 에 물려 있을 때 1280x800 프로파일이 아예 없어서
+        #      "Failed to configure the requested stream profile" 로 죽는다.
+        #   2) 그래서 1280x720 **MJPG** 로 내렸더니 뜨기는 하는데, 2~3 프레임
+        #      묶음 뒤 **정확히 3.75초 공백**이 반복돼 실효 0.4fps 였다.
+        #      USB 2.0 에서도, 3.0 으로 옮긴 뒤에도 같은 주기였다 — 즉
+        #      대역폭이 아니라 **MJPG 디코드**가 범인이다. format 강제 금지.
+        #   3) USB 3.0 (2-3.2.x, 5Gbps) 에서는 1280x800 네이티브가 살아난다.
+        #      depth 도 640x400 → 1280x800 로 올린다: ~500mm 에서 깊이 1픽셀
+        #      풋프린트가 1mm → 0.5mm 가 되어 지름 10~13mm 철근을 10여 px
+        #      대신 20여 px 로 덮는다. 층 구분(진짜/가짜 교차점)이 여기 걸려 있다.
+        #   4) color 1280x800 은 RF-DETR 학습 데이터(2L, 16:10)와 종횡비가
+        #      같다. 1280x720 은 화각이 잘려 모델에 불리하다.
+        'depth_width': '1280', 'depth_height': '800', 'depth_fps': '10',
         'color_width': '1280', 'color_height': '800', 'color_fps': '10',
+        #   5) ⚠ align_mode 는 **건드리지 마라** (기본값 SW 가 맞다).
+        #      HW 로 주면 "Current stream profile is not support hardware d2c
+        #      process" 로 파이프라인이 아예 안 뜬다 — 336L 의 HW D2C 표에
+        #      1280x800+1280x800 조합이 없다.
+        #   6) ⚠⚠ **이 해상도는 `usbfs_memory_mb` 를 올려놔야 흐른다.**
+        #      커널 기본값 16MB 로는 libuvc 가 전송 버퍼를 못 잡아서
+        #      "2~4 프레임 묶음 → 3.7초 공백" 이 반복되고 실효 0.3fps 가 된다.
+        #      USB 2.0→3.0, MJPG→raw, 720→800 을 다 바꿔도 주기가 안 변했고,
+        #      305 두 대만 멀쩡했던 건 먼저 떠서 버퍼를 선점했기 때문이다.
+        #      확인:  cat /sys/module/usbcore/parameters/usbfs_memory_mb   → 1000
+        #      (대역폭이 아니라 **호스트 메모리** 문제다. 전에 "USB 2.0 천장"
+        #       으로 진단했던 2L depth 0fps 도 실은 이것일 수 있다.)
         'enable_ir': 'false',
         'enable_left_ir': 'false', 'enable_right_ir': 'false',
         'enable_point_cloud': 'false',
@@ -544,7 +581,7 @@ def generate_launch_description():
     camera = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             PathJoinSubstitution([FindPackageShare('orbbec_camera'),
-                                  'launch', 'gemini2L.launch.py'])
+                                  'launch', 'gemini_330_series.launch.py'])
         ]),
         launch_arguments=CAM_ARGS.items(),
         condition=IfCondition(LaunchConfiguration('use_camera')),
@@ -577,7 +614,7 @@ def generate_launch_description():
             #   영구 정지다.
             'match': '__node:=camera_container __ns:=/camera',
             'usb_serials': CAM_ARGS.get('serial_number', ''),
-            'relaunch': 'ros2 launch orbbec_camera gemini2L.launch.py '
+            'relaunch': 'ros2 launch orbbec_camera gemini_330_series.launch.py '
                         + ' '.join(f'{k}:={v}' for k, v in CAM_ARGS.items()),
             # ⚠ 되살리기 **전에** USB 권한을 고친다 — udev 가 빠른 재열거에서
             #   이벤트를 흘리면 노드가 0600 root:root 로 남아 SDK 가 못 연다.
