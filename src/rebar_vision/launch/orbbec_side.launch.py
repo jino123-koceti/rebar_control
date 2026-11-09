@@ -40,9 +40,15 @@ RIGHT_SN = 'CV2856D000D0'     # 우측
 # 아낀다 — 교차점 검출과 ZED depth 가 같은 젯슨을 쓴다.
 COMMON = {
     'enable_color': 'true', 'color_width': '640', 'color_height': '480',
-    'color_fps': '15',
+    # ⚠ fps 를 15 → 5 로 내렸다 (2026-11-09). 측면·데크끝 판정은 횡이동 때
+    #   한두 장만 보면 되는데, 336L 이 1280x800 으로 올라가면서 같은 젯슨에서
+    #   DDS·USB 를 같이 쓰다 보니 15fps 는 그냥 낭비였다. 교차점 카메라가
+    #   프레임을 잃는 상황이라 여기서 먼저 양보한다.
+    # ⚠ depth 는 **끄지 마라.** deck_edge_node 가 깊이로 데크끝 거리를 잰다
+    #   (평면 투영으로 바꾸면 35% 멀게 나온다). 쓰는 데가 없어 보여도 쓴다.
+    'color_fps': '5',
     'enable_depth': 'true', 'depth_width': '640', 'depth_height': '480',
-    'depth_fps': '15',
+    'depth_fps': '5',
     'depth_registration': 'true',     # 컬러 화소에서 바로 깊이를 읽기 위해
     'enable_point_cloud': 'false',    # 쓰는 데가 아직 없다
     'enable_colored_point_cloud': 'false',
