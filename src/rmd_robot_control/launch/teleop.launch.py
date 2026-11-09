@@ -193,21 +193,13 @@ def generate_launch_description():
             #   타임아웃은 중복 안전망이고, 늘려도 잼 보호는 그대로다. 반대로 탐색
             #   속도를 올리면 리미트를 더 세게 지나친다 (X 는 감속이 139dps/s 라
             #   90dps 에서 8.4mm 오버슈트 — 가속을 올린 뒤에 손대야 한다).
-            # ⚠⚠ **[2026-11-09 임시] yaw 비전 교차검증을 중립화했다.**
-            #   교차점 카메라를 Gemini 2L → 336L 로 바꾸면서 `yaw_pose_vision`
-            #   의 상수가 전부 무효가 됐다 (CROP·DARK·ANG_NEG/POS·AREA_NEAR·
-            #   rail_mask 가 2L 화소·노출 기준이다 — 그 모듈 머리말에도
-            #   "바뀌면 다시 재야 하는 것: 조명, 카메라 위치, CROP" 이라 적혀 있다).
-            #   같은 자세에서 연속 두 프레임의 주축각이 +80.8° → -161.4° 로 뛰고,
-            #   DARK<75 최대 덩어리가 화면 절반(면적 110748)을 덮는다. 즉 판정이
-            #   정보값 0 인데 `_vision_check` 가 **불일치**로 호밍을 거부한다.
-            #   `_frame is None` 이면 점검이 None 을 반환하고 거부는 False 에서만
-            #   걸리므로, 없는 토픽을 가리켜 엔코더만으로 진행시킨다.
-            # ⚠ **되돌릴 것.** 336L 로 상수를 재측정하면 즉시 원복한다:
-            #     'vision_topic': '/camera/color/image_raw'
-            #   이 게이트는 전원 차단 중 기준점이 7° 밀린 것을 잡아낸 유일한
-            #   장치다. 끈 동안에는 yaw 호밍을 사람이 지켜봐야 한다.
-            'vision_topic': '/__yaw_vision_disabled_336l_swap',
+            # ⚠ [2026-11-09] 336L 교체로 `yaw_pose_vision` 상수가 무효가 돼
+            #   한때 이 토픽을 없는 이름으로 돌려 게이트를 꺼뒀다. 상수를 336L 로
+            #   재측정해 **되살렸다** (DARK 75→60, ANG_NEG 20→65, ANG_POS -15→-30,
+            #   MIN_AREA 2500→8000, rail_mask 재생성). 자세별 14장 ×4자세 검증에서
+            #   판정 대상 42장 중 **틀림 0 · 거부 1**. 끄는 방법은 이 값을 없는
+            #   토픽으로 바꾸는 것이다 (`_frame is None` → 점검이 None 을 반환).
+            'vision_topic': '/camera/color/image_raw',
             'axis_timeout_sec': 90.0,
         }],
         respawn=True, respawn_delay=2.0,
