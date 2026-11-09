@@ -195,14 +195,29 @@ class HomingNode(Node):
         #   생겼을 때만 부르는 보조 수단이고, 없으면 기존 거부 경로로 간다.
         #   그래서 import 실패·토픽 없음을 전부 흡수한다.
         self._frame = None
+        self._frame_ok_logged = False
+        self._frame_err_logged = False
         self.declare_parameter('vision_topic', '/camera/color/image_raw')
         try:
             from cv_bridge import CvBridge
             from sensor_msgs.msg import Image
+            from rclpy.qos import (QoSProfile, QoSReliabilityPolicy,
+                                   QoSHistoryPolicy)
             self._bridge = CvBridge()
+            # ⚠⚠ [2026-11-09] **BEST_EFFORT 여야 한다.** 전에는 `qos=1`(기본값
+            #   RELIABLE)이었는데, 교차점 카메라가 1280x800 으로 올라가면서
+            #   한 장이 2.93MB 가 되자 **한 장도 못 받게 됐다.** 구독자는 잡히는데
+            #   (`ros2 topic info -v` 에 나온다) 데이터가 0이라, 호밍이
+            #   "yaw 자세가 모호한데 카메라 영상이 없다" 로 실패했다.
+            #   같은 토픽을 BEST_EFFORT 로 받는 crossing_detector·camera_watchdog
+            #   은 같은 순간 8.5fps 로 멀쩡히 받고 있었다 — 큰 샘플을 조각내어
+            #   **신뢰 전송**하는 쪽만 막힌 것이다.
+            #   depth=1 은 유지한다. 비전 점검은 **가장 최근 한 장**만 쓴다.
             self.create_subscription(
                 Image, str(self.get_parameter('vision_topic').value),
-                self._on_frame, 1)
+                self._on_frame,
+                QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                           history=QoSHistoryPolicy.KEEP_LAST, depth=1))
         except ImportError as exc:
             self._bridge = None
             self.get_logger().warning(
@@ -479,12 +494,30 @@ class HomingNode(Node):
             self.axis = None
 
     def _on_frame(self, msg):
-        """마지막 영상 한 장만 들고 있는다. 변환 실패는 조용히 버린다 —
-        카메라 문제로 호밍 노드가 죽으면 안 된다."""
+        """마지막 영상 한 장만 들고 있는다.
+
+        ⚠⚠ [2026-11-09] **예외를 조용히 삼키지 않는다.** 전에는 모든 예외를
+          먹고 `_frame = None` 으로 돌려놨는데, 그 때문에 "카메라 영상이 없다" 가
+          ① 콜백이 아예 안 돈 것인지 ② 변환이 실패한 것인지 구분이 안 돼
+          원인 추적에 한참 걸렸다. 첫 수신과 첫 실패를 각각 한 번씩 남긴다.
+        ⚠ 실패해도 **직전 영상을 지우지 않는다.** 한 장 깨졌다고 멀쩡한
+          영상을 버리면 판정 기회만 잃는다."""
         try:
             self._frame = self._bridge.imgmsg_to_cv2(msg, 'bgr8')
-        except Exception:
-            self._frame = None
+        except Exception as exc:                    # noqa: BLE001
+            if not self._frame_err_logged:
+                self._frame_err_logged = True
+                self.get_logger().error(
+                    f"영상 변환 실패 ({type(exc).__name__}: {exc}) — "
+                    f"encoding={getattr(msg, 'encoding', '?')} "
+                    f"{getattr(msg, 'width', '?')}x{getattr(msg, 'height', '?')}. "
+                    f"yaw 별칭 비전 판정은 못 쓴다")
+            return
+        if not self._frame_ok_logged:
+            self._frame_ok_logged = True
+            self.get_logger().info(
+                f"영상 첫 수신 — {msg.width}x{msg.height} {msg.encoding} "
+                f"(yaw 별칭 비전 판정 준비됨)")
 
     def _dir_ok(self, detail):
         """자세 사이일 때 **탐색 방향이 한 쪽으로 갈리는가** → 건 각도 또는 None.
