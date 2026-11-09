@@ -520,6 +520,11 @@ class PositionControlNode(Node):
         #   한 축 11 kbit/s · 8축 전부라도 88 kbit/s — CAN 1Mbps 의 8.8% 다.
         self.declare_parameter('position_poll_hz', 50.0)
         self._poll_hz = max(1.0, float(self.get_parameter('position_poll_hz').value))
+        # 이동 중인 상부축의 0x9C(상태) 폴링 주기. 0 이면 끈다 (옛 동작).
+        # 전류 표본을 빠르게 해 충돌 기준선 확정을 앞당기는 것이 목적이다.
+        self.declare_parameter('stage_status_poll_hz', 50.0)
+        self._status_hz = max(0.0, float(
+            self.get_parameter('stage_status_poll_hz').value))
         self.position_control_timer = self.create_timer(
             1.0 / self._poll_hz, self.position_control_loop)
         # cmd_vel 끊김 감시 (10Hz) 와 보호 래치 해제 구동 (2Hz)
@@ -1225,6 +1230,30 @@ class PositionControlNode(Node):
             self.can_manager.send_frame(motor_id, multi_turn_cmd)
             self.motor_states[motor_id]['last_position_read_time'] = current_time
             self.debug_logger.debug(f"📤 [0x92] 0x{motor_id:03X} 멀티턴 각도 읽기 명령 전송")
+
+        # ⚠⚠ [2026-11-09] **이동 중인 상부축에만 0x9C(상태)를 같이 읽는다.**
+        #   왜: 전류가 0xA4/0xA2 응답에만 얹혀 와서 구간에 따라 4.6~15.2Hz 로
+        #   들쭉날쭉했다. 충돌 기준선이 "전류 3표본 연속 평탄" 으로 확정되므로
+        #   표본이 느리면 그만큼 눈을 감는다 (실측 0.30~1.11초 = 하강 30mm 무방비).
+        #   ⚠ **옛 `read_motor_status` 를 되살리면 안 된다** — 모터마다
+        #     `time.sleep(0.05)` 이 있어 단일 스레드 실행기를 굶긴다. 여기는
+        #     이미 50Hz 로 도는 루프이고 sleep 이 없다.
+        #   ⚠ **주행 모터는 제외한다** — 전용 경로(drive_protect)가 이미 적산
+        #     중이고 중복 집계가 된다.
+        #   CAN 비용: 이동 축 1개 50Hz = 100프레임/s ≒ 1Mbps 의 1.3%
+        #   (측정 당시 can2 사용률 3.8% — 여유가 26배다).
+        if self._status_hz > 0.0 and motors_to_read:
+            status_interval = 0.98 / self._status_hz
+            status_cmd = self.protocol.create_system_command(
+                CommandType.READ_MOTOR_STATUS)
+            for motor_id in motors_to_read:
+                if motor_id in (self.left_motor_id, self.right_motor_id):
+                    continue
+                last = self.motor_states[motor_id].get('last_status_read_time', 0.0)
+                if current_time - last < status_interval:
+                    continue
+                self.can_manager.send_frame(motor_id, status_cmd)
+                self.motor_states[motor_id]['last_status_read_time'] = current_time
 
         # ⚠⚠ [2026-11-06] **여기에 time.sleep 을 두지 않는다.** 이 루프는
         #   `position_poll_hz` 타이머로 돌고 **단일 스레드 실행기**(main 의
@@ -2081,6 +2110,21 @@ class PositionControlNode(Node):
                     # 0x9C는 단일 회전 각도이므로 위치 업데이트 안 함
                     self.motor_states[motor_id]['velocity'] = float(speed)
                     self.motor_states[motor_id]['torque'] = current
+                    # ⚠⚠ [2026-11-09] **전류를 여기서도 발행한다.** 예전에는
+                    #   0xA4/0xA2 응답만 `motor_{id}/current` 로 나갔는데, 그건
+                    #   명령이 나갈 때만 오므로 **구간에 따라 4.6~15.2Hz 로 들쭉**
+                    #   날쭉했다. 충돌 기준선은 "전류가 3표본 연속 평탄" 으로
+                    #   확정되므로 표본이 느리면 그만큼 눈을 감는다 (실측 확정
+                    #   0.30~1.11초 = 하강 30mm 가 무방비). 0x9C 를 이동 축에만
+                    #   50Hz 로 돌리면 기준선이 ~100ms 에 잡힌다.
+                    cpub = self.current_pubs.get(motor_id)
+                    if cpub is not None:
+                        try:
+                            cm = Float32()
+                            cm.data = float(current)
+                            cpub.publish(cm)
+                        except Exception:
+                            pass
 
                     # 전류 보호 체크
                     safety_level = self.check_motor_current_safety(motor_id, current, temperature)

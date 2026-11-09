@@ -122,7 +122,16 @@ class TyingSequence(Node):
         #   1mm 이상 여유를 둔 값이다.
         # ⚠ **회전에는 쓰지 않는다** — yaw 는 건이 원을 그리며 돌아서 평행이동보다
         #   여유가 더 필요하다. 회전 전에는 `z_safe_mm` 까지 올린다.
-        self.declare_parameter('z_clear_mm', -12.0)
+        # ⚠⚠ [2026-11-09 실측] -12.0 → **-5.0**. 사용자가 직접 확인했다:
+        #   **Z -30mm 에서 공구가 배근에 닿아 있었고, -8.5mm 에서 빠져나왔다.**
+        #   -12 는 여유가 3.5mm 뿐이다. 겹침 트리거가 `z >= z_clear` 에서 걸려
+        #   그 순간 XY 목표가 합쳐지므로, 기준이 낮으면 긁는다. 그날 4/4 가
+        #   무사했던 것은 트리거 뒤에도 Z 가 계속 올라가 **실제 이동 시점엔 더
+        #   높았기 때문**이지 기준이 안전해서가 아니다.
+        #   ⚠ 배근 높이가 바뀌면 이 값도 바뀐다. **자세마다 다를 수 있다** —
+        #     공구 끝단 앞부분이 더 깊게 내려온다. 1번 자세에서만 쟀다.
+        #   대가: 점당 약 0.15초. 안전 쪽으로 쓴다.
+        self.declare_parameter('z_clear_mm', -5.0)
         # XY 가 목표에서 이만큼 안으로 들어오면 **Z 하강을 미리 시작**한다.
         # 건이 아직 결속깊이보다 한참 위에 있어 안전하고, 비스듬히 접근한다.
         self.declare_parameter('xy_blend_mm', 40.0)
@@ -266,6 +275,11 @@ class TyingSequence(Node):
         self.z_lo = float(g('z_tie_min_mm').value)
         self.z_hi = float(g('z_tie_max_mm').value)
         self.gun_on = bool(g('gun_enabled').value)
+        # ⚠⚠ [2026-11-09] **Z 여유 높이도 결속마다 다시 읽는다.** 위 주석과 같은
+        #   이유다 — 기동 때만 읽어서 `ros2 param set` 이 조용히 안 먹었다.
+        #   이 값은 **배근 높이가 바뀌면 같이 바뀐다.** 현장에서 맞춰야 한다.
+        self.z_clear = float(g('z_clear_mm').value)
+        self.z_safe = float(g('z_safe_mm').value)
         if math.isnan(msg.x) or math.isnan(msg.y):
             return self._reject('결속 지점은 X·Y 가 둘 다 있어야 한다')
         z = float(msg.z) if not math.isnan(msg.z) else self.z_tie_default
